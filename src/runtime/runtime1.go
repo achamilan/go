@@ -316,6 +316,8 @@ var debug struct {
 	gcshrinkstackoff         int32
 	gcstoptheworld           int32
 	gctrace                  int32
+	gcdeadtrace              int32
+	gcdeadtracefile          string
 	invalidptr               int32
 	madvdontneed             int32 // for Linux; issue 28466
 	scavtrace                int32
@@ -384,6 +386,7 @@ var dbgvars = []*dbgVar{
 	{name: "gcshrinkstackoff", value: &debug.gcshrinkstackoff},
 	{name: "gcstoptheworld", value: &debug.gcstoptheworld},
 	{name: "gctrace", value: &debug.gctrace},
+	{name: "gcdeadtrace", value: &debug.gcdeadtrace},
 	{name: "harddecommit", value: &debug.harddecommit},
 	{name: "inittrace", value: &debug.inittrace},
 	{name: "invalidptr", value: &debug.invalidptr},
@@ -437,6 +440,28 @@ func parseRuntimeDebugVars(godebug string) {
 
 	// apply environment settings
 	parsegodebug(godebug, nil)
+
+	// Parse gcdeadtracefile from GODEBUG string (string-valued, not handled by parsegodebug).
+	// Format: gcdeadtracefile=/path/to/file
+	{
+		const prefix = "gcdeadtracefile="
+		for p := godebug; p != ""; {
+			if len(p) >= len(prefix) && p[:len(prefix)] == prefix {
+				p = p[len(prefix):]
+				end := bytealg.IndexByteString(p, ',')
+				if end < 0 {
+					end = len(p)
+				}
+				debug.gcdeadtracefile = p[:end]
+				break
+			}
+			i := bytealg.IndexByteString(p, ',')
+			if i < 0 {
+				break
+			}
+			p = p[i+1:]
+		}
+	}
 
 	debug.malloc = (debug.inittrace | debug.sbrk | debug.checkfinalizers) != 0
 	debug.profstackdepth = min(debug.profstackdepth, maxProfStackDepth)

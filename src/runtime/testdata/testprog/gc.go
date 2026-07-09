@@ -26,6 +26,10 @@ func init() {
 	register("GCZombie", GCZombie)
 	register("GCMemoryLimit", GCMemoryLimit)
 	register("GCMemoryLimitNoGCPercent", GCMemoryLimitNoGCPercent)
+	register("GCDeadTrace", GCDeadTrace)
+	register("GCDeadTraceComplex", GCDeadTraceComplex)
+	register("GCDeadTraceSession", GCDeadTraceSession)
+	register("GCDeadTraceFullyDead", GCDeadTraceFullyDead)
 }
 
 func GCSys() {
@@ -315,6 +319,256 @@ func GCMemoryLimit() {
 
 func GCMemoryLimitNoGCPercent() {
 	gcMemoryLimit(-1)
+}
+
+var deadSink []byte
+
+// gcDeadSession sinks for GCDeadTraceSession test.
+// Package-level to ensure heap allocation via escape analysis.
+var (
+	gcDeadPreSink     []byte // alloc on main goroutine, NOT in session, will die
+	gcDeadSessionSink []byte // alloc on goroutine A, WITH session, will die
+	gcDeadOtherSink   []byte // alloc on goroutine B, NOT in session, will die
+	gcDeadAliveSink   []byte // alloc on goroutine A, WITH session, stays alive
+)
+
+func GCDeadTrace() {
+	runtime.MemProfileRate = 1 // profile every allocation
+
+	// Allocate garbage that escapes to the heap via the global deadSink.
+	// Previous iteration's value becomes unreferenced and dies.
+	for i := 0; i < 500; i++ {
+		deadSink = make([]byte, 256)
+	}
+	deadSink = nil // last iteration's allocation also dies
+
+	live := make([]byte, 1024) // keep one allocation live
+	runtime.GC()               // force GC (sync sweep)
+	_ = live
+
+	fmt.Println("OK")
+}
+
+// --- Realistic allocation test with actual object usage ---
+
+// DataBlock is a linked-list node with a byte buffer payload.
+// Its fields are actually read and written during processing.
+type DataBlock struct {
+	id   uint64
+	_    [4]byte // padding
+	size int
+	buf  []byte
+	next *DataBlock
+}
+
+var globalLiveBlocks *DataBlock
+var globalLiveCache []byte
+
+//go:noinline
+func createDataBlock(id uint64, size int) *DataBlock {
+	b := new(DataBlock)
+	b.id = id
+	b.size = size
+	b.buf = make([]byte, size)
+	// Write data into the buffer — actual use of the allocation.
+	for i := range b.buf {
+		b.buf[i] = byte(id) ^ byte(i)
+	}
+	return b
+}
+
+//go:noinline
+func buildBlockList(n int, size int) *DataBlock {
+	var head *DataBlock
+	for i := 0; i < n; i++ {
+		b := createDataBlock(uint64(i), size)
+		b.next = head
+		head = b
+	}
+	return head // returns list to caller (escape)
+}
+
+//go:noinline
+func checksumBlockList(head *DataBlock) uint64 {
+	var sum uint64
+	for b := head; b != nil; b = b.next {
+		// Read from the buffer — actual use of allocated memory.
+		for _, v := range b.buf {
+			sum += uint64(v)
+		}
+	}
+	return sum
+}
+
+//go:noinline
+func processTempBuffer(size int) uint64 {
+	buf := make([]byte, size)
+	// Fill with data.
+	for i := range buf {
+		buf[i] = byte(i*7 + 3)
+	}
+	// Read back and compute checksum.
+	var sum uint64
+	for _, v := range buf {
+		sum += uint64(v)
+	}
+	return sum
+}
+
+// Helper functions that call buildBlockList from different callers,
+// so gcdeadtrace can distinguish which caller produced the dead objects.
+
+//go:noinline
+func makeDeadSmallBlocks() *DataBlock {
+	return buildBlockList(150, 64) // 150 nodes × 64-byte buffers → dies
+}
+
+//go:noinline
+func makeDeadLargeBlocks() *DataBlock {
+	return buildBlockList(80, 512) // 80 nodes × 512-byte buffers → dies
+}
+
+func GCDeadTraceComplex() {
+	runtime.MemProfileRate = 1
+
+	runtime.GcDeadSessionStart()
+
+	// Phase 1: Live blocks — stored in global, will appear in gcdeadsession:alive.
+	// Same allocation function (buildBlockList), different caller.
+	globalLiveBlocks = buildBlockList(30, 256) // 30 nodes × 256-byte buffers → alive
+
+	// Phase 2: Dead blocks from two different callers.
+	// Both call buildBlockList → createDataBlock, but gcdeadtrace can
+	// distinguish them by the caller context.
+	deadSmall := makeDeadSmallBlocks() // caller: makeDeadSmallBlocks → will die
+	deadLarge := makeDeadLargeBlocks() // caller: makeDeadLargeBlocks → will die
+
+	// Phase 3: Actually use the allocated data.
+	cs1 := checksumBlockList(deadSmall)
+	cs2 := checksumBlockList(deadLarge)
+	_ = cs1
+	_ = cs2
+
+	// Phase 4: Temp buffer used and released → will die.
+	_ = processTempBuffer(4096)
+
+	// Phase 5: Global cache kept alive → will appear in gcdeadsession:alive.
+	globalLiveCache = make([]byte, 1024)
+	for i := range globalLiveCache {
+		globalLiveCache[i] = 0xAB
+	}
+
+	runtime.GcDeadSessionEnd()
+
+	// Phase 6: Release dead objects.
+	deadSmall = nil
+	deadLarge = nil
+
+	runtime.GC()
+
+	fmt.Println("OK")
+}
+
+func GCDeadTraceSession() {
+	runtime.MemProfileRate = 1
+
+	var wg sync.WaitGroup
+
+	// Phase 1: Main goroutine allocates (NOT in session → NOT in gcdeadsession).
+	gcDeadPreSink = make([]byte, 128)
+
+	// Phase 2: Session goroutine A:
+	//   - allocates 256B that will die (nil'd before GC)
+	//   - allocates 1024B that will stay alive (kept via gcDeadAliveSink)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		gcDeadSessionSink = make([]byte, 256)  // will die
+		gcDeadAliveSink = make([]byte, 1024)   // will stay alive
+		runtime.GcDeadSessionEnd()
+	}()
+	wg.Wait()
+
+	// Phase 3: Non-session goroutine B (NOT in gcdeadsession).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		gcDeadOtherSink = make([]byte, 512)
+	}()
+	wg.Wait()
+
+	// Drop dying references. gcDeadAliveSink is kept alive.
+	gcDeadPreSink = nil
+	gcDeadSessionSink = nil
+	gcDeadOtherSink = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// --- Fully dead site test helpers ---
+// Each function is a distinct call site in the profiler stack trace.
+
+//go:noinline
+func makeFullyDead64() []byte {
+	return make([]byte, 64)
+}
+
+//go:noinline
+func makeFullyDead128() []byte {
+	return make([]byte, 128)
+}
+
+//go:noinline
+func makeMixed256() []byte {
+	return make([]byte, 256)
+}
+
+//go:noinline
+func makeAllAlive1024() []byte {
+	return make([]byte, 1024)
+}
+
+var (
+	fullyDeadTemp []byte   // overwritten repeatedly, last ref nil'd → all die
+	fullyDeadLive []byte   // keeps some mixed allocs alive
+)
+
+func GCDeadTraceFullyDead() {
+	runtime.MemProfileRate = 1
+
+	runtime.GcDeadSessionStart()
+
+	// Call site A: 5 × 64B, ALL die (overwritten + nil'd before GC).
+	for i := 0; i < 5; i++ {
+		fullyDeadTemp = makeFullyDead64()
+	}
+
+	// Call site B: 3 × 128B, ALL die (overwritten + nil'd before GC).
+	for i := 0; i < 3; i++ {
+		fullyDeadTemp = makeFullyDead128()
+	}
+
+	// Call site C: 4 × 256B, MIXED — 2 survive, 2 die.
+	for i := 0; i < 4; i++ {
+		b := makeMixed256()
+		if i < 2 {
+			fullyDeadLive = b // keep 2 alive via global (b escapes)
+		}
+		// other 2: b goes out of scope → die
+	}
+
+	// Call site D: 1 × 1024B, ALL survive (kept via global).
+	globalLiveCache = makeAllAlive1024()
+
+	runtime.GcDeadSessionEnd()
+
+	// Drop the last overwritten local reference → remaining all-dead objects die.
+	fullyDeadTemp = nil
+
+	runtime.GC()
+	fmt.Println("OK")
 }
 
 // Test SetMemoryLimit functionality.

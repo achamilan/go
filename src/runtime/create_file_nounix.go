@@ -12,3 +12,6 @@ func create(name *byte, perm int32) int32 {
 	throw("unimplemented")
 	return -1
 }
+
+// writeDeadTraceToFile is a no-op on platforms that don't support file creation.
+func writeDeadTraceToFile(path string, buf []byte) {}

@@ -1617,6 +1617,10 @@ func gcMarkTermination(stw worldStop) {
 		println("checkfinalizers: queue:", fn, "finalizers +", cn, "cleanups")
 	}
 
+	if debug.gcdeadtrace > 0 {
+		gcDeadTracePrint()
+	}
+
 	// Set any arena chunks that were deferred to fault.
 	lock(&userArenaState.lock)
 	faultList := userArenaState.fault

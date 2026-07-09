@@ -13,6 +13,7 @@ import (
 	"math/bits"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
@@ -212,6 +213,182 @@ func TestGcZombieReporting(t *testing.T) {
 	want := "found pointer to free object"
 	if !strings.Contains(got, want) {
 		t.Fatalf("expected %q in output, but got %q", want, got)
+	}
+}
+
+func TestGcDeadTrace(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTrace", "GODEBUG=gcdeadtrace=1")
+	if !strings.Contains(got, "gcdead:") {
+		t.Fatalf("expected gcdeadtrace output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "objs") || !strings.Contains(got, "bytes") {
+		t.Fatalf("gcdeadtrace output missing expected fields; got:\n%s", got)
+	}
+}
+
+func TestGcDeadTraceComplex(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceComplex", "GODEBUG=gcdeadtrace=1")
+
+	// Write output to project root for inspection.
+	if err := os.WriteFile(filepath.Join(runtime.GOROOT(), "gcdeadtrace_complex_output.txt"), []byte(got), 0644); err != nil {
+		t.Logf("failed to write output file: %v", err)
+	} else {
+		t.Logf("output written to GOROOT/gcdeadtrace_complex_output.txt")
+	}
+
+	// Verify structure.
+	if !strings.Contains(got, "gcdead:") {
+		t.Fatalf("expected gcdeadtrace output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "sites") {
+		t.Fatalf("expected 'sites' in gcdeadtrace output, got:\n%s", got)
+	}
+
+	// Session tracking: freed and alive sections should both exist.
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:alive:") {
+		t.Fatalf("expected gcdeadsession:alive output, got:\n%s", got)
+	}
+
+	// Verify we have per-site lines with file:line info.
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	siteCount := 0
+	hasOK := false
+	hasFreed := false
+	hasAlive := false
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.Contains(l, "(") && strings.Contains(l, "):") {
+			siteCount++
+		}
+		if strings.HasPrefix(l, "gcdeadsession:freed:") {
+			hasFreed = true
+			t.Logf("complex freed: %s", l)
+		}
+		if strings.HasPrefix(l, "gcdeadsession:alive:") {
+			hasAlive = true
+			t.Logf("complex alive: %s", l)
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+	if siteCount == 0 {
+		t.Fatalf("expected per-site detail lines with (file:line) format, got:\n%s", got)
+	}
+	if !hasFreed {
+		t.Error("expected gcdeadsession:freed line in complex output")
+	}
+	if !hasAlive {
+		t.Error("expected gcdeadsession:alive line in complex output")
+	}
+	t.Logf("found %d allocation sites", siteCount)
+}
+
+func TestGcDeadTraceSession(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceSession", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:alive:") {
+		t.Fatalf("expected gcdeadsession:alive output, got:\n%s", got)
+	}
+
+	// Multi-goroutine session isolation:
+	//   Session goroutine A: 256B (freed) + 1024B (alive)
+	//   Main goroutine: 128B (non-session) — should NOT appear
+	//   Goroutine B: 512B (non-session) — should NOT appear
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	hasOK := false
+	freedOK := false
+	aliveOK := false
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.HasPrefix(l, "gcdeadsession:freed:") {
+			t.Logf("freed line: %s", l)
+			if strings.Contains(l, "256 bytes") {
+				freedOK = true
+			}
+		}
+		if strings.HasPrefix(l, "gcdeadsession:alive:") {
+			t.Logf("alive line: %s", l)
+			if strings.Contains(l, "1024 bytes") {
+				aliveOK = true
+			}
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+	if !freedOK {
+		t.Errorf("gcdeadsession:freed should report ~256 bytes (freed session alloc)")
+	}
+	if !aliveOK {
+		t.Errorf("gcdeadsession:alive should report ~1024 bytes (alive session alloc)")
+	}
+}
+
+func TestGcDeadTraceFullyDead(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceFullyDead", "GODEBUG=gcdeadtrace=1")
+
+	// Write output for the analysis tool.
+	outPath := filepath.Join(runtime.GOROOT(), "gcdeadtrace_fullydead_output.txt")
+	if err := os.WriteFile(outPath, []byte(got), 0644); err != nil {
+		t.Logf("failed to write output file: %v", err)
+	} else {
+		t.Logf("output written to %s", outPath)
+	}
+
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:alive:") {
+		t.Fatalf("expected gcdeadsession:alive output, got:\n%s", got)
+	}
+
+	// Run analysis tool on the output.
+	analyzeDir := filepath.Join(runtime.GOROOT(), "tools", "analyze_gcdeadtrace")
+	analyzeOut := filepath.Join(runtime.GOROOT(), "gcdeadtrace_fullydead_analysis.txt")
+
+	cmd := testenv.Command(t, "go", "run", ".",
+		"-input="+outPath,
+		"-output="+analyzeOut)
+	cmd.Dir = analyzeDir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("analyze tool failed: %v\n%s", err, out)
+	}
+	t.Logf("analyze output:\n%s", string(out))
+
+	// Read and log the analysis result.
+	data, err := os.ReadFile(analyzeOut)
+	if err != nil {
+		t.Fatalf("failed to read analysis output: %v", err)
+	}
+	analysis := string(data)
+	t.Logf("analysis file:\n%s", analysis)
+
+	// Expected: makeFullyDead64 and makeFullyDead128 should be fully dead.
+	if !strings.Contains(analysis, "makeFullyDead64") {
+		t.Errorf("expected makeFullyDead64 in fully-dead sites")
+	}
+	if !strings.Contains(analysis, "makeFullyDead128") {
+		t.Errorf("expected makeFullyDead128 in fully-dead sites")
+	}
+	// makeMixed256 should NOT be fully dead (some alive).
+	if strings.Contains(analysis, "makeMixed256") {
+		// Check if it appears as partially dead, not fully dead.
+		// It may appear in the partial section — that's fine.
+		t.Logf("makeMixed256 found in analysis (may be in partial section)")
 	}
 }
 

@@ -142,6 +142,30 @@ type memRecord struct {
 	// C becomes the active cycle and when we've flushed it to
 	// active.
 	future [3]memRecordCycle
+
+	// gcDeadFrees and gcDeadFreeBytes accumulate frees for GODEBUG=gcdeadtrace.
+	// Read-and-reset atomically at GC end.
+	gcDeadFrees     uintptr
+	gcDeadFreeBytes uintptr
+
+	// gcDeadSessionAllocs / gcDeadSessionAllocBytes are atomically
+	// incremented at alloc time when the allocating goroutine is in
+	// a gcdeadtrace session. Cumulative, never reset.
+	// >0 means this bucket had at least one session allocation.
+	gcDeadSessionAllocs     uintptr
+	gcDeadSessionAllocBytes uintptr
+
+	// gcDeadSessionFrees / gcDeadSessionFreeBytes accumulate per-cycle
+	// frees attributed to session-allocated objects. Read-and-reset at GC end.
+	gcDeadSessionFrees     uintptr
+	gcDeadSessionFreeBytes uintptr
+
+	// gcDeadSessionCumFrees / gcDeadSessionCumFreeBytes accumulate
+	// total frees attributed to session-allocated objects. Cumulative,
+	// never reset. Used with gcDeadSessionAllocs/AllocBytes to compute
+	// "still alive" = total alloc - total free.
+	gcDeadSessionCumFrees     uintptr
+	gcDeadSessionCumFreeBytes uintptr
 }
 
 // memRecordCycle
@@ -456,6 +480,14 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr) {
 	mpc.alloc_bytes += size
 	unlock(&profMemFutureLock[index])
 
+	if debug.gcdeadtrace > 0 {
+		gp := mp.curg
+		if gp != nil && gp.gcDeadSessionActive {
+			atomic.Xadduintptr(&mr.gcDeadSessionAllocs, 1)
+			atomic.Xadduintptr(&mr.gcDeadSessionAllocBytes, size)
+		}
+	}
+
 	// Setprofilebucket locks a bunch of other mutexes, so we call it outside of
 	// the profiler locks. This reduces potential contention and chances of
 	// deadlocks. Since the object must be alive during the call to
@@ -475,7 +507,477 @@ func mProf_Free(b *bucket, size uintptr) {
 	lock(&profMemFutureLock[index])
 	mpc.frees++
 	mpc.free_bytes += size
+	if debug.gcdeadtrace > 0 {
+		atomic.Xadduintptr(&mp.gcDeadFrees, 1)
+		atomic.Xadduintptr(&mp.gcDeadFreeBytes, size)
+		if mp.gcDeadSessionAllocBytes > 0 {
+			atomic.Xadduintptr(&mp.gcDeadSessionFrees, 1)
+			atomic.Xadduintptr(&mp.gcDeadSessionFreeBytes, size)
+			atomic.Xadduintptr(&mp.gcDeadSessionCumFrees, 1)
+			atomic.Xadduintptr(&mp.gcDeadSessionCumFreeBytes, size)
+		}
+	}
 	unlock(&profMemFutureLock[index])
+}
+
+// gcDeadTraceMaxSites is the maximum number of distinct allocation sites
+// reported per GC cycle. For complex sessions with many allocation points,
+// this can be increased. Arrays are heap-allocated via persistentalloc
+// on first use, so this consumes ~2 MB of persistent memory at runtime
+// only when gcdeadtrace is enabled.
+const gcDeadTraceMaxSites = 4096
+
+// gcDeadTraceMaxFrames is the maximum number of user frames to
+// distinguish call sites. Increasing this helps separate objects
+// allocated by the same function called from different places.
+const gcDeadTraceMaxFrames = 3
+
+// gcDeadTraceBufSize is the output buffer size (1 MB).
+const gcDeadTraceBufSize = 1 << 20
+
+// gcDeadTrace storage types, defined at package level so persistentalloc
+// can compute their size.
+type gcDeadRawEntry struct {
+	pcs              [gcDeadTraceMaxFrames]uintptr
+	nframes          int
+	frees            uintptr
+	bytes            uintptr
+	sessionFrees     uintptr
+	sessionBytes     uintptr
+	sessionAllocs    uintptr
+	sessionAllocBytes uintptr
+	sessionCumFrees   uintptr
+	sessionCumFreeBytes uintptr
+}
+
+type gcDeadSite struct {
+	funcs [gcDeadTraceMaxFrames]struct {
+		name string
+		file string
+		line int32
+	}
+	nframes           int
+	frees             uintptr
+	bytes             uintptr
+	sessionFrees      uintptr
+	sessionBytes      uintptr
+	sessionAllocs     uintptr
+	sessionAllocBytes uintptr
+	sessionCumFrees   uintptr
+	sessionCumFreeBytes uintptr
+}
+
+// Persistent storage for gcDeadTracePrint, allocated once on first use.
+var (
+	gcDeadRawData   *[gcDeadTraceMaxSites]gcDeadRawEntry
+	gcDeadSitesData *[gcDeadTraceMaxSites]gcDeadSite
+	gcDeadBufData   *[gcDeadTraceBufSize]byte
+)
+
+// gcDeadTracePrint prints a summary of freed profiled objects grouped by
+// allocation site. Called at the end of each GC cycle when GODEBUG=gcdeadtrace>0.
+//
+// Grouping uses up to gcDeadTraceMaxFrames non-runtime stack frames, so
+// objects allocated by the same function from different call sites
+// (e.g. B = A() vs C = A() at different lines) are distinguishable.
+func gcDeadTracePrint() {
+	// Allocate persistent storage on first call.
+	if gcDeadRawData == nil {
+		rawSize := unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadRawEntry{})
+		p := persistentalloc(rawSize, 0, &memstats.other_sys)
+		gcDeadRawData = (*[gcDeadTraceMaxSites]gcDeadRawEntry)(p)
+
+		sitesSize := unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadSite{})
+		p2 := persistentalloc(sitesSize, 0, &memstats.other_sys)
+		gcDeadSitesData = (*[gcDeadTraceMaxSites]gcDeadSite)(p2)
+
+		p3 := persistentalloc(gcDeadTraceBufSize, 0, &memstats.other_sys)
+		gcDeadBufData = (*[gcDeadTraceBufSize]byte)(p3)
+	}
+
+	raw := gcDeadRawData[:]
+	sites := gcDeadSitesData[:]
+	buf := gcDeadBufData[:]
+
+	// Phase 1: collect raw bucket data under lock (no symbol lookup).
+	rawCount := 0
+	totalFrees := uintptr(0)
+	totalBytes := uintptr(0)
+	totalSessionFrees := uintptr(0)
+	totalSessionBytes := uintptr(0)
+	totalSessionAlive := uintptr(0)
+	totalSessionAliveBytes := uintptr(0)
+
+	lock(&profMemActiveLock)
+	for b := (*bucket)(mbuckets.Load()); b != nil; b = b.allnext {
+		mp := b.mp()
+		f := atomic.Xchguintptr(&mp.gcDeadFrees, 0)
+		b2 := atomic.Xchguintptr(&mp.gcDeadFreeBytes, 0)
+		sf := atomic.Xchguintptr(&mp.gcDeadSessionFrees, 0)
+		sb := atomic.Xchguintptr(&mp.gcDeadSessionFreeBytes, 0)
+
+		// Read cumulative session alloc/free counters (never reset).
+		sa := atomic.Loaduintptr(&mp.gcDeadSessionAllocs)
+		sab := atomic.Loaduintptr(&mp.gcDeadSessionAllocBytes)
+		scf := atomic.Loaduintptr(&mp.gcDeadSessionCumFrees)
+		scfb := atomic.Loaduintptr(&mp.gcDeadSessionCumFreeBytes)
+
+		// alive = total session allocs - cumulative session frees
+		sAlive := uintptr(0)
+		sAliveBytes := uintptr(0)
+		if sa > scf {
+			sAlive = sa - scf
+			sAliveBytes = sab - scfb
+		}
+
+		if f == 0 && sf == 0 && sAlive == 0 {
+			continue
+		}
+		totalFrees += f
+		totalBytes += b2
+		totalSessionFrees += sf
+		totalSessionBytes += sb
+		totalSessionAlive += sAlive
+		totalSessionAliveBytes += sAliveBytes
+
+		// Walk the stack to find up to gcDeadTraceMaxFrames non-runtime frames.
+		stk := b.stk()
+		var pcs [gcDeadTraceMaxFrames]uintptr
+		nframes := 0
+		for _, p := range stk {
+			callPC := p
+			if callPC > 1 {
+				callPC--
+			}
+			fi := findfunc(callPC)
+			if fi.valid() {
+				name := funcname(fi)
+				if len(name) >= 8 && name[:8] == "runtime." {
+					continue
+				}
+				pcs[nframes] = callPC
+				nframes++
+				if nframes >= gcDeadTraceMaxFrames {
+					break
+				}
+			}
+		}
+		if nframes == 0 && len(stk) > 0 {
+			pcs[0] = stk[len(stk)-1]
+			nframes = 1
+		}
+
+		// Merge with existing entry by the PC tuple.
+		idx := -1
+		for i := 0; i < rawCount; i++ {
+			if raw[i].nframes != nframes {
+				continue
+			}
+			match := true
+			for j := 0; j < nframes; j++ {
+				if raw[i].pcs[j] != pcs[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			raw[idx].frees += f
+			raw[idx].bytes += b2
+			raw[idx].sessionFrees += sf
+			raw[idx].sessionBytes += sb
+			raw[idx].sessionAllocs += sa
+			raw[idx].sessionAllocBytes += sab
+			raw[idx].sessionCumFrees += scf
+			raw[idx].sessionCumFreeBytes += scfb
+		} else if rawCount < gcDeadTraceMaxSites {
+			raw[rawCount] = gcDeadRawEntry{
+				pcs: pcs, nframes: nframes,
+				frees: f, bytes: b2,
+				sessionFrees: sf, sessionBytes: sb,
+				sessionAllocs: sa, sessionAllocBytes: sab,
+				sessionCumFrees: scf, sessionCumFreeBytes: scfb,
+			}
+			rawCount++
+		}
+	}
+	unlock(&profMemActiveLock)
+
+	if totalFrees == 0 && totalSessionFrees == 0 && totalSessionAlive == 0 {
+		return
+	}
+
+	// Phase 2: resolve PCs and merge by the full site key.
+	siteCount := 0
+
+	for i := 0; i < rawCount; i++ {
+		r := &raw[i]
+		key := [gcDeadTraceMaxFrames]struct {
+			name string
+			file string
+			line int32
+		}{}
+		for j := 0; j < r.nframes; j++ {
+			key[j].name = "?"
+			key[j].file = "?"
+			if r.pcs[j] != 0 {
+				fi := findfunc(r.pcs[j])
+				if fi.valid() {
+					key[j].name = funcname(fi)
+					key[j].file, key[j].line = funcline(fi, r.pcs[j])
+				}
+			}
+		}
+
+		idx := -1
+		for j := 0; j < siteCount; j++ {
+			if sites[j].nframes != r.nframes {
+				continue
+			}
+			match := true
+			for k := 0; k < r.nframes; k++ {
+				if sites[j].funcs[k].name != key[k].name ||
+					sites[j].funcs[k].file != key[k].file ||
+					sites[j].funcs[k].line != key[k].line {
+					match = false
+					break
+				}
+			}
+			if match {
+				idx = j
+				break
+			}
+		}
+		if idx >= 0 {
+			sites[idx].frees += r.frees
+			sites[idx].bytes += r.bytes
+			sites[idx].sessionFrees += r.sessionFrees
+			sites[idx].sessionBytes += r.sessionBytes
+			sites[idx].sessionAllocs += r.sessionAllocs
+			sites[idx].sessionAllocBytes += r.sessionAllocBytes
+			sites[idx].sessionCumFrees += r.sessionCumFrees
+			sites[idx].sessionCumFreeBytes += r.sessionCumFreeBytes
+		} else if siteCount < gcDeadTraceMaxSites {
+			sites[siteCount] = gcDeadSite{
+				funcs:             key,
+				nframes:           r.nframes,
+				frees:             r.frees,
+				bytes:             r.bytes,
+				sessionFrees:      r.sessionFrees,
+				sessionBytes:      r.sessionBytes,
+				sessionAllocs:     r.sessionAllocs,
+				sessionAllocBytes: r.sessionAllocBytes,
+				sessionCumFrees:   r.sessionCumFrees,
+				sessionCumFreeBytes: r.sessionCumFreeBytes,
+			}
+			siteCount++
+		}
+	}
+
+	// Phase 3: sort by bytes freed, descending (insertion sort).
+	for i := 1; i < siteCount; i++ {
+		tmp := sites[i]
+		j := i
+		for j > 0 && sites[j-1].bytes < tmp.bytes {
+			sites[j] = sites[j-1]
+			j--
+		}
+		sites[j] = tmp
+	}
+
+	// Phase 4: build output into a buffer.
+	n := 0
+
+	appendStr := func(s string) {
+		m := copy(buf[n:], s)
+		n += m
+	}
+
+	appendUintptr := func(v uintptr) {
+		if v == 0 {
+			buf[n] = '0'
+			n++
+			return
+		}
+		var tmp [20]byte
+		b := itoa(tmp[:], uint64(v))
+		m := copy(buf[n:], b)
+		n += m
+	}
+
+	appendStr("gcdead: ")
+	appendUintptr(totalFrees)
+	appendStr(" objs (")
+	appendUintptr(totalBytes)
+	appendStr(" bytes) freed from ")
+	appendUintptr(uintptr(siteCount))
+	appendStr(" sites\n")
+
+	for i := 0; i < siteCount; i++ {
+		s := &sites[i]
+		var linetmp [20]byte
+
+		appendStr("  ")
+		for j := 0; j < s.nframes; j++ {
+			if j > 0 {
+				appendStr(" < ")
+			}
+			lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+			appendStr(s.funcs[j].name)
+			appendStr(" (")
+			appendStr(s.funcs[j].file)
+			appendStr(":")
+			appendStr(string(lb))
+			appendStr(")")
+		}
+
+		appendStr(": ")
+		appendUintptr(s.frees)
+		appendStr(" objs, ")
+		appendUintptr(s.bytes)
+		appendStr(" bytes\n")
+	}
+
+	// Session freed report: objects allocated in session that have been freed.
+	if totalSessionFrees > 0 {
+		sessionSiteCount := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].sessionFrees > 0 {
+				sessionSiteCount++
+			}
+		}
+
+		appendStr("gcdeadsession:freed: ")
+		appendUintptr(totalSessionFrees)
+		appendStr(" session objs (")
+		appendUintptr(totalSessionBytes)
+		appendStr(" bytes) freed from ")
+		appendUintptr(sessionSiteCount)
+		appendStr(" sites\n")
+
+		for i := 0; i < siteCount; i++ {
+			s := &sites[i]
+			if s.sessionFrees == 0 {
+				continue
+			}
+			var linetmp [20]byte
+
+			appendStr("  ")
+			for j := 0; j < s.nframes; j++ {
+				if j > 0 {
+					appendStr(" < ")
+				}
+				lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+				appendStr(s.funcs[j].name)
+				appendStr(" (")
+				appendStr(s.funcs[j].file)
+				appendStr(":")
+				appendStr(string(lb))
+				appendStr(")")
+			}
+
+			appendStr(": ")
+			appendUintptr(s.sessionFrees)
+			appendStr(" session objs, ")
+			appendUintptr(s.sessionBytes)
+			appendStr(" session bytes\n")
+		}
+	}
+
+	// Session alive report: objects allocated in session that are still alive.
+	if totalSessionAlive > 0 {
+		sessionSiteCount := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].sessionAllocs > sites[i].sessionCumFrees {
+				sessionSiteCount++
+			}
+		}
+
+		appendStr("gcdeadsession:alive: ")
+		appendUintptr(totalSessionAlive)
+		appendStr(" session objs (")
+		appendUintptr(totalSessionAliveBytes)
+		appendStr(" bytes) still alive from ")
+		appendUintptr(sessionSiteCount)
+		appendStr(" sites\n")
+
+		for i := 0; i < siteCount; i++ {
+			s := &sites[i]
+			sAlive := uintptr(0)
+			sAliveBytes := uintptr(0)
+			if s.sessionAllocs > s.sessionCumFrees {
+				sAlive = s.sessionAllocs - s.sessionCumFrees
+				sAliveBytes = s.sessionAllocBytes - s.sessionCumFreeBytes
+			}
+			if sAlive == 0 {
+				continue
+			}
+			var linetmp [20]byte
+
+			appendStr("  ")
+			for j := 0; j < s.nframes; j++ {
+				if j > 0 {
+					appendStr(" < ")
+				}
+				lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+				appendStr(s.funcs[j].name)
+				appendStr(" (")
+				appendStr(s.funcs[j].file)
+				appendStr(":")
+				appendStr(string(lb))
+				appendStr(")")
+			}
+
+			appendStr(": ")
+			appendUintptr(sAlive)
+			appendStr(" session objs, ")
+			appendUintptr(sAliveBytes)
+			appendStr(" session bytes\n")
+		}
+	}
+
+	// Phase 5: write output.
+	printlock()
+	write(2, unsafe.Pointer(&buf[0]), int32(n))
+	printunlock()
+
+	if debug.gcdeadtracefile != "" {
+		writeDeadTraceToFile(debug.gcdeadtracefile, buf[:n])
+	}
+}
+
+// GcDeadSessionStart begins a gcdeadtrace session for the calling goroutine.
+// While in a session, all allocations made by this goroutine are tracked
+// and reported separately as gcdeadsession: output at the end of each GC cycle.
+// Has no effect if GODEBUG=gcdeadtrace=0.
+func GcDeadSessionStart() {
+	if debug.gcdeadtrace == 0 {
+		return
+	}
+	gp := getg().m.curg
+	if gp == nil || gp.gcDeadSessionActive {
+		return
+	}
+	gp.gcDeadSessionActive = true
+}
+
+// GcDeadSessionEnd ends a gcdeadtrace session for the calling goroutine.
+// After this call, allocations by this goroutine are no longer tracked
+// as session allocations.
+// Has no effect if GODEBUG=gcdeadtrace=0.
+func GcDeadSessionEnd() {
+	if debug.gcdeadtrace == 0 {
+		return
+	}
+	gp := getg().m.curg
+	if gp == nil || !gp.gcDeadSessionActive {
+		return
+	}
+	gp.gcDeadSessionActive = false
 }
 
 var blockprofilerate uint64 // in CPU ticks

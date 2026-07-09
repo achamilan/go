@@ -546,7 +546,11 @@ type g struct {
 	fipsOnlyBypass  bool
 	ditWanted       bool // set if g wants to be executed with DIT enabled
 	syncSafePoint   bool // set if g is stopped at a synchronous safe point.
-	runningCleanups atomic.Bool
+	// gcDeadSessionActive is set by GcDeadSessionStart and cleared by
+	// GcDeadSessionEnd. When true, allocations by this goroutine are
+	// tracked for per-session gcdeadtrace reporting.
+	gcDeadSessionActive bool
+	runningCleanups      atomic.Bool
 	sig             uint32
 	secret          int32 // current nesting of runtime/secret.Do calls.
 	writebuf        []byte
