@@ -442,7 +442,9 @@ func parseRuntimeDebugVars(godebug string) {
 	parsegodebug(godebug, nil)
 
 	// Parse gcdeadtracefile from GODEBUG string (string-valued, not handled by parsegodebug).
-	// Format: gcdeadtracefile=/path/to/file
+	// GODEBUG=gcdeadtracefile=<path> appends gcdeadtrace output to the specified file.
+	// File is created if it doesn't exist; multiple GC cycles are accumulated
+	// (open with O_APPEND / FILE_APPEND_DATA).
 	{
 		const prefix = "gcdeadtracefile="
 		for p := godebug; p != ""; {

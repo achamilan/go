@@ -180,16 +180,15 @@ v3: 新增会话存活对象追踪，区分"已释放"和"仍存活"的会话内
 
   Phase 4 — 格式化输出 (v3)
     ┌──────────────────────────────────────────────────────────────┐
-    │ gcdead: N objs (M bytes) freed from K sites                  │
-    │   funcName (file:line): N objs, M bytes                      │
-    │   ...                                                        │
-    │                                                              │
-    │ gcdeadsession:freed: N session objs (M bytes) freed from ... │  ← v3
+    │ gcdeadsession:freed: N session objs (M bytes) freed from ... │
     │   funcName (file:line): N session objs, M session bytes      │
     │                                                              │
-    │ gcdeadsession:alive: N session objs (M bytes) still alive .. │  ← v3
+    │ gcdeadsession:alive: N session objs (M bytes) still alive .. │
     │   funcName (file:line): N session objs, M session bytes      │
     └──────────────────────────────────────────────────────────────┘
+
+    全局 gcdead: 段落已移除，只输出 session 数据。这样可以避免非
+    session 协程的分配噪声，只关注会话内的内存使用。
 
     gcdeadsession:freed: 本周期内会话分配 → 已被 GC 释放的对象
       (数据来源: gcDeadSessionFrees/FreeBytes，每周期清零)
@@ -237,8 +236,7 @@ v3: 新增会话存活对象追踪，区分"已释放"和"仍存活"的会话内
     512B 对象释放（Goroutine B 分配的）：
       其 bucket 的 AllocBytes == 0 → 不更新 gcDeadSessionFrees
 
-  Step 3 — GC 结束时分别报告（v3 格式）
-    gcdead: 包含所有 3 个对象的释放（128 + 256 + 512 = 896B）
+  Step 3 — GC 结束时输出（仅 session，无全局 gcdead:）
     gcdeadsession:freed: 仅包含 256B（打过标记的 bucket，本周期释放）
     gcdeadsession:alive: 0B（如果会话对象全部释放了）
 
@@ -288,3 +286,46 @@ v3: 新增会话存活对象追踪，区分"已释放"和"仍存活"的会话内
   src/runtime/mprof.go:864     — GcDeadSessionEnd
   src/runtime/mgc.go:1620      — GC 结束时调用 gcDeadTracePrint()
   src/runtime/runtime1.go:319  — debug.gcdeadtrace GODEBUG 注册
+  src/runtime/create_file_unix.go    — Unix 文件写入 (O_APPEND)
+  src/runtime/create_file_windows.go  — Windows 文件写入 (FILE_APPEND_DATA)
+  src/runtime/create_file_nounix.go   — 其他平台 (no-op)
+
+
+附录: GODEBUG 使用说明
+======================
+
+1. 基本用法
+
+   // 启用 gcdeadtrace，输出到 stderr
+   GODEBUG=gcdeadtrace=1 go run main.go
+
+   // 同时输出到文件 (追加模式)
+   GODEBUG=gcdeadtrace=1,gcdeadtracefile=gcdeadtrace.log go run main.go
+
+   // 文件仅追加，不输出到 stderr
+   GODEBUG=gcdeadtrace=1,gcdeadtracefile=gcdeadtrace.log go run main.go 2>/dev/null
+
+2. 输出格式
+
+   仅输出 session 数据，无全局 gcdead: 报告:
+
+   gcdeadsession:freed: N session objs (M bytes) ...      ← 会话内分配且已释放
+     funcName (file:line): N session objs, M session bytes
+     funcName (file:line): N session objs, M bytes
+
+   gcdeadsession:alive: N session objs (M bytes) ...      ← 会话内分配仍存活
+     funcName (file:line): N session objs, M bytes
+
+3. Session API
+
+   runtime.GcDeadSessionStart()
+   // ... 分配会被追踪为 session 分配 ...
+   runtime.GcDeadSessionEnd()
+   // ... 后续分配不在 session 内 ...
+
+4. 文件输出说明
+
+   - gcdeadtracefile=<path> 追加模式，多次 GC 周期/多次运行的结果不丢失
+   - 文件不存在自动创建
+   - 与 stderr 输出同时生效（两者互不影响）
+   - 只输出 gcdeadtrace 内容，不包含普通程序日志

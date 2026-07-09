@@ -580,6 +580,20 @@ var (
 // Grouping uses up to gcDeadTraceMaxFrames non-runtime stack frames, so
 // objects allocated by the same function from different call sites
 // (e.g. B = A() vs C = A() at different lines) are distinguishable.
+//
+// Only session-specific output is printed. The gcdead: global section is
+// not included; use GODEBUG=gcdeadtracefile to capture full output.
+//
+//	gcdeadsession:freed: N session objs (M bytes) freed from K sites
+//	  funcName (file:line): N session objs, M session bytes
+//	gcdeadsession:alive: N session objs (M bytes) still alive from K sites
+//	  funcName (file:line): N session objs, M session bytes
+//
+// GODEBUG options:
+//
+//	GODEBUG=gcdeadtrace=1              enable gcdeadtrace (output to stderr)
+//	GODEBUG=gcdeadtracefile=<path>     also append output to the given file
+//	                                   (file is created if it doesn't exist)
 func gcDeadTracePrint() {
 	// Allocate persistent storage on first call.
 	if gcDeadRawData == nil {
@@ -809,39 +823,6 @@ func gcDeadTracePrint() {
 		n += m
 	}
 
-	appendStr("gcdead: ")
-	appendUintptr(totalFrees)
-	appendStr(" objs (")
-	appendUintptr(totalBytes)
-	appendStr(" bytes) freed from ")
-	appendUintptr(uintptr(siteCount))
-	appendStr(" sites\n")
-
-	for i := 0; i < siteCount; i++ {
-		s := &sites[i]
-		var linetmp [20]byte
-
-		appendStr("  ")
-		for j := 0; j < s.nframes; j++ {
-			if j > 0 {
-				appendStr(" < ")
-			}
-			lb := itoa(linetmp[:], uint64(s.funcs[j].line))
-			appendStr(s.funcs[j].name)
-			appendStr(" (")
-			appendStr(s.funcs[j].file)
-			appendStr(":")
-			appendStr(string(lb))
-			appendStr(")")
-		}
-
-		appendStr(": ")
-		appendUintptr(s.frees)
-		appendStr(" objs, ")
-		appendUintptr(s.bytes)
-		appendStr(" bytes\n")
-	}
-
 	// Session freed report: objects allocated in session that have been freed.
 	if totalSessionFrees > 0 {
 		sessionSiteCount := uintptr(0)
@@ -954,6 +935,14 @@ func gcDeadTracePrint() {
 // While in a session, all allocations made by this goroutine are tracked
 // and reported separately as gcdeadsession: output at the end of each GC cycle.
 // Has no effect if GODEBUG=gcdeadtrace=0.
+//
+// Example:
+//
+//	runtime.GcDeadSessionStart()
+//	obj := allocate()   // tracked as session allocation
+//	runtime.GcDeadSessionEnd()
+//
+// Use GODEBUG=gcdeadtracefile=<path> to save output to a file.
 func GcDeadSessionStart() {
 	if debug.gcdeadtrace == 0 {
 		return

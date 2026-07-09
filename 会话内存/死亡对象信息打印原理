@@ -1,0 +1,185 @@
+数据采集 — 分配时 (mProf_Malloc)
+
+  用户代码: deadSink = make([]byte, 256)
+    → runtime.makeslice → runtime.mallocgc → runtime.profilealloc
+      → mProf_Malloc(mp, p, size=256)         // mprof.go:442
+
+  mProf_Malloc 做了三件事：
+
+  1. 捕获调用栈 — callers(3, mp.profStack) 获取返回地址（PC）数组，skip=3 跳过 callers/mProf_Malloc/profilealloc 三层，从 mallocgc
+  的调用者开始记录
+  2. 存入 bucket — stkbucket(memProfile, 256, stack, true) 用栈+size 做 hash，在 mbuckets 链表中找到或创建 bucket（mprof.go:455）
+  3. 关联到 span — setprofilebucket(p, b) 把 bucket 指针存到对象所在 span 的 specials 里（malloc.go:2299）
+
+  数据采集 — 释放时 (mProf_Free)
+
+  GC sweep → 扫描 dead span → 读取 span.specials 中的 bucket 指针
+    → mProf_Free(b, size=256)                 // mprof.go:474
+
+  我们新增的代码在原有 free 计数之后：
+
+  if debug.gcdeadtrace > 0 {
+      atomic.Xadduintptr(&mp.gcDeadFrees, 1)     // 原子累加释放次数
+      atomic.Xadduintptr(&mp.gcDeadFreeBytes, size) // 原子累加释放字节
+  }
+
+  数据读取 & 打印 (gcDeadTracePrint)
+
+  GC 结束时调用（mgc.go:1620）：
+
+  ┌─────────────────┬────────────────────────────────────────────┬────────────────────┐
+  │      步骤       │                  代码位置                  │     获取的信息     │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 读/清零计数     │ atomic.Xchguintptr(&mp.gcDeadFrees, 0)     │ 对象数 count       │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 读/清零字节     │ atomic.Xchguintptr(&mp.gcDeadFreeBytes, 0) │ 字节数 bytes       │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 遍历调用栈      │ b.stk() 返回 []uintptr，逐个帧检查         │ PC 地址            │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 查找函数信息    │ findfunc(pc) — symtab.go:922               │ funcInfo 结构      │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 获取函数名      │ funcname(fi) — symtab.go:1145              │ "main.GCDeadTrace" │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 获取文件/行号   │ funcline(fi, pc) — symtab.go:1205          │ "gc.go", 329       │
+  ├─────────────────┼────────────────────────────────────────────┼────────────────────┤
+  │ 跳过 runtime 帧 │ if name[:8] != "runtime."                  │ 只保留用户代码位置 │
+  └─────────────────┴────────────────────────────────────────────┴────────────────────┘
+
+  关键数据结构关系：
+
+  mbuckets (全局链表)
+    └→ bucket {next, allnext, hash, size, nstk, stack[]}
+         └→ memRecord {future[3], gcDeadFrees, gcDeadFreeBytes}
+
+  - bucket.stack[] — 存放调用栈 PC，来自 callers() 采集的返回地址
+  - bucket.size — 分配大小，但不存储类型信息
+  - memRecord.gcDeadFrees — 本次 GC 周期内该 bucket 对应对象的释放次数
+  - memRecord.gcDeadFreeBytes — 本次 GC 周期内该 bucket 对应对象的释放字节数
+
+  没有对象类型信息是因为 Go 内存 profiler 只按"调用栈 + 分配大小"分组，bucket 结构体中没有存储 *_type 字段。
+
+
+  协程级会话追踪 (Per-Goroutine Session Tracking) - 新增特性
+  ================================================================
+
+  设计目标
+  --------
+  在协程粒度做会话级别的追踪：
+    协程调用 GcDeadSessionStart() → 分配对象 → GcDeadSessionEnd() → GC
+      → 只看到该协程会话期间分配且死亡的对象，与非会话对象分开报告。
+
+  核心挑战
+  --------
+  分配时知道 goroutine 是否在会话中（通过 g.gcDeadSessionActive 标记），
+  但释放时（mProf_Free）只有 *bucket，不知道原始 goroutine 和会话状态。
+
+  设计决策：Bucket 级启发式
+  -------------------------
+  不修改 per-object metadata，使用 bucket 级别的启发式标记：
+  - memRecord 新增 gcDeadSessionAllocBytes 字段（原子递增，永不归零）
+  - 会话中分配 → 在 bucket 上打"曾有会话分配"标记
+  - 释放时 → 如果 bucket 曾被会话分配过，同步递增会话释放计数
+  - 精度：bucket 若被会话和非会话代码共享会过计，对专用 worker goroutine 精确
+
+
+  API — 启用/禁用会话
+  --------------------
+
+  // GcDeadSessionStart 为当前 goroutine 开启 gcdeadtrace 会话。
+  // 会话期间该 goroutine 的所有分配会被单独追踪。
+  func GcDeadSessionStart()             // mprof.go:837
+
+  // GcDeadSessionEnd 结束当前 goroutine 的 gcdeadtrace 会话。
+  func GcDeadSessionEnd()               // mprof.go:851
+
+  实现逻辑：
+    1. 检查 debug.gcdeadtrace == 0 则直接返回（GODEBUG 未开启）
+    2. 获取 getg().m.curg（当前用户 goroutine）
+    3. 设置/清除 g.gcDeadSessionActive = true/false
+    4. 导出函数 → testprog 可直接调用 runtime.GcDeadSessionStart()
+
+
+  数据结构变更
+  -----------
+
+  g struct 新增字段（runtime2.go:553）：
+    gcDeadSessionActive bool  // goroutine 是否处于会话中
+
+  memRecord 新增字段（mprof.go:152-159）：
+    gcDeadSessionAllocBytes uintptr  // >0 表示此 bucket 至少有过一次会话分配（原子递增，永不归零）
+    gcDeadSessionFrees     uintptr  // 会话归因的释放次数（GC 结束时读取并清零）
+    gcDeadSessionFreeBytes uintptr  // 会话归因的释放字节（GC 结束时读取并清零）
+
+  gcDeadRawEntry / gcDeadSite 新增字段（mprof.go:528-544）：
+    sessionFrees uintptr  // 会话释放数
+    sessionBytes uintptr  // 会话释放字节
+
+
+  数据采集 — 分配时 (mProf_Malloc 会话扩展)
+  ------------------------------------------
+
+  原有 alloc 统计之后、setprofilebucket 之前新增（mprof.go:474-479）：
+
+    if debug.gcdeadtrace > 0 {
+        gp := mp.curg
+        if gp != nil && gp.gcDeadSessionActive {
+            atomic.Xadduintptr(&mr.gcDeadSessionAllocBytes, size)  // 标记此 bucket 有会话分配
+        }
+    }
+
+
+  数据采集 — 释放时 (mProf_Free 会话扩展)
+  ----------------------------------------
+
+  在原有 gcDeadFrees 递增之后新增（mprof.go:496-499）：
+
+    if debug.gcdeadtrace > 0 {
+        atomic.Xadduintptr(&mp.gcDeadFrees, 1)
+        atomic.Xadduintptr(&mp.gcDeadFreeBytes, size)
+        // 新增：如果此 bucket 曾有过会话分配，同步递增会话释放计数
+        if mp.gcDeadSessionAllocBytes > 0 {
+            atomic.Xadduintptr(&mp.gcDeadSessionFrees, 1)
+            atomic.Xadduintptr(&mp.gcDeadSessionFreeBytes, size)
+        }
+    }
+
+
+  数据读取 & 打印 (gcDeadTracePrint 会话扩展)
+  -------------------------------------------
+
+  Phase 1 — 读取并清零计数器时，额外读取会话计数器（mprof.go:592-594）：
+    sf := atomic.Xchguintptr(&mp.gcDeadSessionFrees, 0)
+    sb := atomic.Xchguintptr(&mp.gcDeadSessionFreeBytes, 0)
+    if f == 0 && sf == 0 { continue }  // 无普通释放也无会话释放才跳过
+
+  Phase 2 — 合并 raw entry / site 时同步累加 sessionFrees / sessionBytes
+
+  Phase 4 — 在现有 gcdead: 报告后追加（mprof.go:792-842）：
+    gcdeadsession: 1 session objs (256 bytes) freed from 1 sites
+      main.GCDeadTraceSession (gc_test.go:270): 1 session objs, 256 session bytes
+
+
+  输出示例
+  --------
+
+  gcdead: 3 objs (896 bytes) freed from 1 sites
+    main.GCDeadTraceSession (gc.go:340): 3 objs, 896 bytes
+  gcdeadsession: 1 session objs (256 bytes) freed from 1 sites
+    main.GCDeadTraceSession (gc.go:370): 1 session objs, 256 session bytes
+
+  ↑ gcdead: 包含所有死亡对象（会话 + 非会话）
+  ↑ gcdeadsession: 仅包含会话内分配的对象（256B），不含会话前（128B）和会话后（512B）
+
+
+  更新后的关键数据结构关系：
+
+  mbuckets (全局链表)
+    └→ bucket {next, allnext, hash, size, nstk, stack[]}
+         └→ memRecord {
+              future[3],
+              gcDeadFrees, gcDeadFreeBytes,          // 原有全局计数
+              gcDeadSessionAllocBytes,                // >0 = 曾有会话分配
+              gcDeadSessionFrees, gcDeadSessionFreeBytes  // 会话释放计数
+            }
+
+  g struct ── gcDeadSessionActive ──→ 分配时判断是否在会话中

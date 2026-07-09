@@ -1,0 +1,77 @@
+mProf_Malloc — 分配时的 profiling 采集（含会话追踪）
+=======================================================
+
+mProf_Malloc 是 mallocgc 分配路径上记录 profiling 信息的入口。
+
+函数签名
+--------
+  func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr)
+
+
+调用链
+------
+  user code: make([]byte, 256)
+    → runtime.makeslice
+      → runtime.mallocgc
+        → runtime.profilealloc
+          → mProf_Malloc(mp, p, size=256)
+
+
+执行流程（mprof.go:452-491）
+----------------------------
+
+1. 检查 profStack 是否已初始化
+     mp.profStack == nil → 初始化期间采样，直接返回
+
+2. 捕获调用栈
+     nstk := callers(3, mp.profStack[:debug.profstackdepth+2])
+     skip=3 跳过 callers → mProf_Malloc → profilealloc 三层
+     从 mallocgc 的调用者开始记录
+
+3. 确定 future cycle index
+     index := (mProfCycle.read() + 2) % 3
+     alloc 计入 C+2 周期
+
+4. 查找或创建 bucket
+     b := stkbucket(memProfile, size, mp.profStack[:nstk], true)
+     以"调用栈 + 分配大小"做 hash，在 mbuckets 全局链表中查找
+     不存在则创建新 bucket
+
+5. 累加 alloc 计数
+     lock → mpc.allocs++ / mpc.alloc_bytes += size → unlock
+
+6. 会话追踪（新增）
+     if debug.gcdeadtrace > 0 {
+         gp := mp.curg
+         if gp != nil && gp.gcDeadSessionActive {
+             atomic.Xadduintptr(&mr.gcDeadSessionAllocBytes, size)
+         }
+     }
+
+7. 关联 bucket 到 span
+     systemstack(func() { setprofilebucket(p, b) })
+     将 bucket 指针存入对象所在 span 的 specials 链表
+     后续 GC sweep 时通过 specials 找到 bucket 执行 mProf_Free
+
+
+会话追踪原理（新增）
+-------------------
+
+  分配时：goroutine 在会话中 → 在 bucket 上原子递增 gcDeadSessionAllocBytes
+          ↑ 这是"标记位"，表示该 bucket 至少有过一次会话分配，永不归零
+
+  释放时：检查 bucket 的 gcDeadSessionAllocBytes > 0 → 递增会话释放计数
+          ↑ 不需要知道释放时的 goroutine，只看 bucket 是否有过会话标记
+
+  精度：bucket 级启发式
+         如果同一个 bucket 被会话和非会话 goroutine 共享 → 会过计
+         对专用 worker goroutine（每个分配大小固定）→ 精确
+
+
+与其他组件的关系
+----------------
+  mProf_Malloc  ──分配──→ bucket ──关联──→ span.specials
+                              │
+  mProf_Free    ←──释放── GC sweep 读取 span.specials 找到 bucket
+                              │
+  gcDeadTracePrint ←──GC 结束── 读取 bucket.memRecord 计数并清零
