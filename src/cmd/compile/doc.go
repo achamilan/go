@@ -118,6 +118,8 @@ Flags:
 		Write an execution trace to file.
 	-trimpath prefix
 		Remove prefix from recorded source file paths.
+	-trippkgpath path
+		Set trip package path for compiler modules.
 
 Flags related to debugging information:
 

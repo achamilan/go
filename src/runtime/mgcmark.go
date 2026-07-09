@@ -19,6 +19,7 @@ const (
 	fixedRootFinalizers = iota
 	fixedRootFreeGStacks
 	fixedRootCleanups
+	fixedRootSessionSpans
 	fixedRootCount
 
 	// rootBlockBytes is the number of bytes to scan per data or
@@ -254,6 +255,9 @@ func markroot(gcw *gcWork, i uint32, flushBgCredit bool) int64 {
 			scanblock(uintptr(unsafe.Pointer(&cb.cleanups[0])), n*unsafe.Sizeof(cleanupFn{}), &cleanupBlockPtrMask[0], gcw, nil)
 		}
 
+	case i == fixedRootSessionSpans:
+		markrootSessionSpans(gcw)
+
 	case work.baseSpans <= i && i < work.baseStacks:
 		// mark mspan.specials
 		markrootSpans(gcw, int(i-work.baseSpans))
@@ -435,9 +439,9 @@ func markrootSpans(gcw *gcWork, shard int) {
 			// about the span being freed and re-used.
 			s := ha.spans[arenaPage+uint(i)*8+j]
 
-			// The state must be mSpanInUse if the specials bit is set, so
+			// The state must be mSpanInUse or mSpanSession if the specials bit is set, so
 			// sanity check that.
-			if state := s.state.get(); state != mSpanInUse {
+			if state := s.state.get(); state != mSpanInUse && state != mSpanSession {
 				print("s.state = ", state, "\n")
 				throw("non in-use span found with specials bit set")
 			}

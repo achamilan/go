@@ -238,6 +238,8 @@
 //		during the build. For more information about build tags, see
 //		'go help buildconstraint'. (Earlier versions of Go used a
 //		space-separated list, and that form is deprecated but still recognized.)
+//	-trippkgpath path
+//		set trip package path passed through to the compiler.
 //	-trimpath
 //		remove all file system paths from the resulting executable.
 //		Instead of absolute file system paths, the recorded file names

@@ -226,6 +226,7 @@ type mheap struct {
 	specialWeakHandleAlloc     fixalloc // allocator for specialWeakHandle
 	specialBubbleAlloc         fixalloc // allocator for specialBubble
 	specialSecretAlloc         fixalloc // allocator for specialSecret
+	specialSessionAlloc        fixalloc // allocator for specialSession
 	speciallock                mutex    // lock for special record allocators.
 	arenaHintAlloc             fixalloc // allocator for arenaHints
 
@@ -387,6 +388,7 @@ const (
 	mSpanDead   mSpanState = iota
 	mSpanInUse             // allocated for garbage collected heap
 	mSpanManual            // allocated for manual management (e.g., stack allocator)
+	mSpanSession           // allocated for session memory (bump-allocated, GC-scanned)
 )
 
 // mSpanStateNames are the names of the span states, indexed by
@@ -395,6 +397,7 @@ var mSpanStateNames = []string{
 	"mSpanDead",
 	"mSpanInUse",
 	"mSpanManual",
+	"mSpanSession",
 }
 
 // mSpanStateBox holds an atomic.Uint8 to provide atomic operations on
@@ -666,7 +669,7 @@ func inHeapOrStack(b uintptr) bool {
 		return false
 	}
 	switch s.state.get() {
-	case mSpanInUse, mSpanManual:
+	case mSpanInUse, mSpanManual, mSpanSession:
 		return b < s.limit
 	default:
 		return false
@@ -792,6 +795,7 @@ func (h *mheap) init() {
 	h.specialSecretAlloc.init(unsafe.Sizeof(specialSecret{}), nil, nil, &memstats.other_sys)
 	h.specialWeakHandleAlloc.init(unsafe.Sizeof(specialWeakHandle{}), nil, nil, &memstats.gcMiscSys)
 	h.specialBubbleAlloc.init(unsafe.Sizeof(specialBubble{}), nil, nil, &memstats.other_sys)
+	h.specialSessionAlloc.init(unsafe.Sizeof(specialSession{}), nil, nil, &memstats.other_sys)
 	h.arenaHintAlloc.init(unsafe.Sizeof(arenaHint{}), nil, nil, &memstats.other_sys)
 
 	// Don't zero mspan allocations. Background sweeping can
@@ -981,6 +985,7 @@ const (
 	spanAllocHeap    spanAllocType = iota // heap span
 	spanAllocStack                        // stack span
 	spanAllocWorkBuf                      // work buf span
+	spanAllocSession                      // session memory bucket span
 )
 
 // manual returns true if the span allocation is manually managed.
@@ -1411,6 +1416,8 @@ HaveSpan:
 		atomic.Xaddint64(&stats.inStacks, int64(nbytes))
 	case spanAllocWorkBuf:
 		atomic.Xaddint64(&stats.inWorkBufs, int64(nbytes))
+	case spanAllocSession:
+		atomic.Xaddint64(&stats.inHeap, int64(nbytes))
 	}
 	memstats.heapStats.release()
 
@@ -1441,7 +1448,11 @@ func (h *mheap) initSpan(s *mspan, typ spanAllocType, spanclass spanClass, base,
 		s.needzero = 1
 	}
 	nbytes := npages * pageSize
-	if typ.manual() {
+	if typ == spanAllocSession {
+		s.manualFreeList = 0
+		s.nelems = 0
+		s.state.set(mSpanSession)
+	} else if typ.manual() {
 		s.manualFreeList = 0
 		s.nelems = 0
 		s.state.set(mSpanManual)
@@ -1722,7 +1733,7 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 	assertLockHeld(&h.lock)
 
 	switch s.state.get() {
-	case mSpanManual:
+	case mSpanManual, mSpanSession:
 		if s.allocCount != 0 {
 			throw("mheap.freeSpanLocked - invalid stack free")
 		}
@@ -1765,6 +1776,8 @@ func (h *mheap) freeSpanLocked(s *mspan, typ spanAllocType) {
 		atomic.Xaddint64(&stats.inStacks, -int64(nbytes))
 	case spanAllocWorkBuf:
 		atomic.Xaddint64(&stats.inWorkBufs, -int64(nbytes))
+	case spanAllocSession:
+		atomic.Xaddint64(&stats.inHeap, -int64(nbytes))
 	}
 	memstats.heapStats.release()
 
@@ -1960,6 +1973,8 @@ const (
 	// _KindSpecialSecret is a special used to mark an object
 	// as needing zeroing immediately upon freeing.
 	_KindSpecialSecret = 10
+	// _KindSpecialSession associates an object with a session memory bucket.
+	_KindSpecialSession = 11
 )
 
 type special struct {
@@ -2738,6 +2753,16 @@ type specialSecret struct {
 	size    uintptr
 }
 
+// specialSession associates a heap object with a session memory bucket.
+// It is used to track which session owns each bump-allocated object,
+// enabling GC-driven session death detection and bucket-level reclamation.
+type specialSession struct {
+	_       sys.NotInHeap
+	special special
+	sess    *Session      // owning session root
+	bucket  *sessionBucket // bucket containing this object
+}
+
 // specialsIter helps iterate over specials lists.
 type specialsIter struct {
 	pprev **special
@@ -2842,6 +2867,14 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		memclrNoHeapPointers(p, ss.size)
 		lock(&mheap_.speciallock)
 		mheap_.specialSecretAlloc.free(unsafe.Pointer(s))
+		unlock(&mheap_.speciallock)
+	case _KindSpecialSession:
+		ss := (*specialSession)(unsafe.Pointer(s))
+		// Decrement the bucket's ref count; the session object
+		// is no longer referenced from this allocation.
+		ss.bucket.refs.Add(-1)
+		lock(&mheap_.speciallock)
+		mheap_.specialSessionAlloc.free(unsafe.Pointer(ss))
 		unlock(&mheap_.speciallock)
 	default:
 		throw("bad special kind")

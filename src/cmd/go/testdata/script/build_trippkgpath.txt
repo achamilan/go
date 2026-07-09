@@ -1,0 +1,19 @@
+go build -n -x -trippkgpath=example.com/trip/path .
+stderr '([\\/]compile).* -trippkgpath example\.com/trip/path'
+
+go build -o withflag$GOEXE -trippkgpath=example.com/trip/path .
+go version -m withflag$GOEXE
+stdout '^\tbuild\t-trippkgpath=example\.com/trip/path$'
+
+go build -o noflag$GOEXE .
+go version -m noflag$GOEXE
+! stdout '^\tbuild\t-trippkgpath='
+
+-- go.mod --
+module example.com/tripmod
+
+go 1.22
+-- main.go --
+package main
+
+func main() {}
