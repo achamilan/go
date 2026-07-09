@@ -615,8 +615,6 @@ func gcDeadTracePrint() {
 
 	// Phase 1: collect raw bucket data under lock (no symbol lookup).
 	rawCount := 0
-	totalFrees := uintptr(0)
-	totalBytes := uintptr(0)
 	totalSessionFrees := uintptr(0)
 	totalSessionBytes := uintptr(0)
 	totalSessionAlive := uintptr(0)
@@ -647,8 +645,6 @@ func gcDeadTracePrint() {
 		if f == 0 && sf == 0 && sAlive == 0 {
 			continue
 		}
-		totalFrees += f
-		totalBytes += b2
 		totalSessionFrees += sf
 		totalSessionBytes += sb
 		totalSessionAlive += sAlive
@@ -721,7 +717,7 @@ func gcDeadTracePrint() {
 	}
 	unlock(&profMemActiveLock)
 
-	if totalFrees == 0 && totalSessionFrees == 0 && totalSessionAlive == 0 {
+	if totalSessionFrees == 0 && totalSessionAlive == 0 {
 		return
 	}
 
@@ -821,6 +817,13 @@ func gcDeadTracePrint() {
 		b := itoa(tmp[:], uint64(v))
 		m := copy(buf[n:], b)
 		n += m
+	}
+
+	// Add a separator with GC cycle number so outputs are distinguishable.
+	if totalSessionFrees > 0 || totalSessionAlive > 0 {
+		appendStr("=== GC #")
+		appendUintptr(uintptr(memstats.numgc))
+		appendStr(" ===\n")
 	}
 
 	// Session freed report: objects allocated in session that have been freed.
