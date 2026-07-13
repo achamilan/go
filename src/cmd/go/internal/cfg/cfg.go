@@ -92,7 +92,6 @@ var (
 	BuildToolchainName     string
 	BuildToolchainCompiler func() string
 	BuildToolchainLinker   func() string
-	BuildTripPkgPath       string // -trippkgpath flag
 	BuildTrimpath          bool // -trimpath flag
 	BuildV                 bool // -v flag
 	BuildWork              bool // -work flag

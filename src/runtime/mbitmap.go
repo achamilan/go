@@ -1379,8 +1379,7 @@ func findObject(p, refBase, refOff uintptr) (base uintptr, s *mspan, objIndex ui
 	// before checking other fields. See also spanOfHeap.
 	if state := s.state.get(); state != mSpanInUse || p < s.base() || p >= s.limit {
 		// Pointers into stacks are also ok, the runtime manages these explicitly.
-		// Session spans are also managed by the session memory subsystem.
-		if state == mSpanManual || state == mSpanSession {
+		if state == mSpanManual {
 			return
 		}
 		// The following ensures that we are rigorous about what data

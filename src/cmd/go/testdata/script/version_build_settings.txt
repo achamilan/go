@@ -27,10 +27,6 @@ go build -trimpath
 go version -m m$GOEXE
 stdout '\tbuild\t-trimpath=true$'
 
-go build -trippkgpath=example.com/trip/path
-go version -m m$GOEXE
-stdout '^\tbuild\t-trippkgpath=example\.com/trip/path$'
-
 # gccgoflags are not added when gc is used, and vice versa.
 # TODO: test gccgo.
 go build -gccgoflags=all=UNUSED

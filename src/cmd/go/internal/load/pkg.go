@@ -2450,9 +2450,6 @@ func (p *Package) setBuildInfo(ctx context.Context, f *modfetch.Fetcher, autoVCS
 	if cfg.BuildTrimpath {
 		appendSetting("-trimpath", "true")
 	}
-	if cfg.BuildTripPkgPath != "" {
-		appendSetting("-trippkgpath", cfg.BuildTripPkgPath)
-	}
 	if p.DefaultGODEBUG != "" {
 		appendSetting("DefaultGODEBUG", p.DefaultGODEBUG)
 	}
