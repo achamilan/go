@@ -12,6 +12,48 @@ import (
 	"time"
 )
 
+// Package-level sink variables ensure heap escape for gcdeadtrace tests.
+var (
+	concurrentSinkA1 []byte
+	concurrentSinkA2 []byte
+	concurrentSinkB1 []byte
+	concurrentSinkB2 []byte
+)
+
+// Custom type definitions for gcdeadtrace type tracking demo.
+type ListNode struct {
+	next *ListNode
+	data []byte
+}
+
+type StringContainer struct {
+	name   string
+	labels []string
+}
+
+type DataProcessor interface {
+	Process() uint64
+}
+
+type intProcessor struct {
+	id   uint64
+	data []byte
+}
+
+func (p *intProcessor) Process() uint64 {
+	return p.id
+}
+
+// Package-level sink variables for custom types.
+var (
+	ctListHead    *ListNode
+	ctMapSink     map[uint64][]byte
+	ctProcessor   DataProcessor
+	ctBuiltString string
+	ctScratchMap  map[uint64][]byte
+	ctScratchStr  string
+)
+
 // ============================================================
 // Actor Framework
 // ============================================================
@@ -79,6 +121,8 @@ const (
 	PatternMixed                    // GCDeadTraceComplex-like: some live, some die
 	PatternSession                  // GCDeadTraceSession-like: session tracked
 	PatternFullyDead                // GCDeadTraceFullyDead-like: per-site tracking
+	PatternConcurrent               // Multi-session concurrent tracking
+	PatternCustomTypes              // Custom types: struct, map, interface, string
 )
 
 func (p AllocPattern) String() string {
@@ -91,6 +135,10 @@ func (p AllocPattern) String() string {
 		return "session"
 	case PatternFullyDead:
 		return "fullydead"
+	case PatternConcurrent:
+		return "concurrent"
+	case PatternCustomTypes:
+		return "customtypes"
 	default:
 		return "unknown"
 	}
@@ -160,8 +208,8 @@ func (w *WorkerActor) run() {
 	ticker := time.NewTicker(w.interval)
 	defer ticker.Stop()
 
-	// Enable profiling at allocation level.
-	runtime.MemProfileRate = 1
+	// MemProfileRate is automatically set to 1 by GcDeadSessionStart,
+	// so no explicit rate setting is needed here.
 
 	for {
 		select {
@@ -224,6 +272,10 @@ func (w *WorkerActor) doAllocBurst() {
 		w.patternSession()
 	case PatternFullyDead:
 		w.patternFullyDead()
+	case PatternConcurrent:
+		w.patternConcurrent()
+	case PatternCustomTypes:
+		w.patternCustomTypes()
 	}
 }
 
@@ -368,6 +420,94 @@ func (w *WorkerActor) allocSiteB() []byte { return make([]byte, 128) }
 
 //go:noinline
 func (w *WorkerActor) allocSiteC() []byte { return make([]byte, 256) }
+
+// patternConcurrent: two concurrent sessions allocating from the same call site.
+// Each session's allocations/frees should be tracked independently in the
+// per-session breakdown output.
+//
+// Session A: 3 × 256B (freed) + 1 × 1024B (alive)
+// Session B: 2 × 256B (freed) + 1 × 512B (alive)
+func (w *WorkerActor) patternConcurrent() {
+	// Reset sinks from previous burst so prior allocations die.
+	concurrentSinkA1 = nil
+	concurrentSinkA2 = nil
+	concurrentSinkB1 = nil
+	concurrentSinkB2 = nil
+
+	var wg sync.WaitGroup
+
+	// Session goroutine A: 3 × 256B (freed) + 1 × 1024B (alive).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
+		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
+		concurrentSinkA1 = make([]byte, 256)  // nil'd below → dies
+		concurrentSinkA2 = make([]byte, 1024) // kept alive
+		runtime.GcDeadSessionEnd()
+	}()
+
+	// Session goroutine B: 2 × 256B (freed) + 1 × 512B (alive).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		concurrentSinkB1 = make([]byte, 256) // overwritten → dies
+		concurrentSinkB1 = make([]byte, 256) // nil'd below → dies
+		concurrentSinkB2 = make([]byte, 512) // kept alive
+		runtime.GcDeadSessionEnd()
+	}()
+
+	wg.Wait()
+
+	// Drop dying references; alive refs (A2, B2) stay assigned.
+	concurrentSinkA1 = nil
+	concurrentSinkB1 = nil
+
+	atomic.AddInt64(&w.stats.TotalAllocs, 7)
+	atomic.AddInt64(&w.stats.TotalBytes, 3*256+1024+2*256+512)
+	atomic.AddInt64(&w.stats.DeadAllocs, 5)
+	atomic.AddInt64(&w.stats.DeadBytes, 3*256+2*256)
+
+	// Trigger GC to see per-session breakdown output.
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
+
+// patternCustomTypes: tests gcdeadtrace tracking of various Go types.
+// Allocations: struct (new), slice (make), map (make), interface (&struct), string (conversion).
+func (w *WorkerActor) patternCustomTypes() {
+	runtime.GcDeadSessionStart()
+
+	// 1. Struct allocation — ListNode via new(), nested make([]byte, size)
+	ctListHead = ctAllocListNode(1, 128) // alive
+	_ = ctAllocListNode(2, 64)           // dies (no reference kept)
+
+	// 2. String conversion
+	raw := make([]byte, 32)
+	for i := range raw {
+		raw[i] = byte(i)
+	}
+	ctBuiltString = string(raw) // alive
+	ctScratchStr = string(raw)  // dies (overwritten to "" below)
+
+	// 3. Map allocations (map with nested byte slices)
+	ctMapSink = ctAllocMap(4)    // alive
+	ctScratchMap = ctAllocMap(2) // dies
+
+	// 4. Interface allocation via &intProcessor{}
+	ctProcessor = ctAllocProcessor(42) // alive
+
+	runtime.GcDeadSessionEnd()
+
+	// Drop dead references before GC
+	ctScratchStr = ""
+	ctScratchMap = nil
+
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
 
 // ============================================================
 // MonitorActor — monitors memory usage across actors
@@ -584,6 +724,39 @@ func (as *ActorSystem) Stop() {
 }
 
 // ============================================================
+// Custom Type Helper Functions
+// ============================================================
+
+//go:noinline
+func ctAllocListNode(id uint64, size int) *ListNode {
+	return &ListNode{
+		data: make([]byte, size),
+	}
+}
+
+//go:noinline
+func ctAllocByteSlice(size int) []byte {
+	return make([]byte, size)
+}
+
+//go:noinline
+func ctAllocMap(n int) map[uint64][]byte {
+	m := make(map[uint64][]byte)
+	for i := 0; i < n; i++ {
+		m[uint64(i)] = make([]byte, 32)
+	}
+	return m
+}
+
+//go:noinline
+func ctAllocProcessor(id uint64) DataProcessor {
+	return &intProcessor{
+		id:   id,
+		data: make([]byte, 64),
+	}
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -604,6 +777,7 @@ func checksum(blocks [][]byte) uint64 {
 
 func main() {
 	duration := flag.Duration("duration", 10*time.Second, "total run duration")
+	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes")
 	flag.Parse()
 
 	fmt.Println("========================================")
@@ -611,31 +785,49 @@ func main() {
 	fmt.Println("========================================")
 	fmt.Printf("  Runtime: %s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
 	fmt.Printf("  GOMAXPROCS: %d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("  Mode: %s\n", *mode)
 	fmt.Println("========================================")
 	fmt.Println()
 
-	// Check if gcdeadtrace is available in the runtime.
-	// The demo works with or without it, but session tracking
-	// requires the modified runtime.
+	if *mode == "all" {
+		fmt.Println("  Workers:")
+		fmt.Println("    worker-loop        — loop alloc, all die")
+		fmt.Println("    worker-mixed       — multi-site, some live/some die")
+		fmt.Println("    worker-session     — single session tracking")
+		fmt.Println("    worker-fullydead   — per-site fully-dead detection")
+		fmt.Println("    worker-concurrent  — two concurrent sessions, same site")
+		fmt.Println("    worker-customtypes — struct, map, interface, string types")
+		fmt.Println("  (gcdeadtrace session output appears on stderr via GODEBUG=gcdeadtrace=1)")
+		fmt.Println()
+	}
 
 	// Build the actor system.
 	system := NewActorSystem()
 
 	// Create worker actors with different allocation patterns.
-	_ = system.AddWorker("worker-loop", PatternLoop)       // GCDeadTrace-like
-	mixed := system.AddWorker("worker-mixed", PatternMixed) // GCDeadTraceComplex-like
-	_ = system.AddWorker("worker-session", PatternSession) // GCDeadTraceSession-like
-	_ = system.AddWorker("worker-fullydead", PatternFullyDead) // GCDeadTraceFullyDead-like
-
-	// Create monitor actors.
-	// monitor-general watches all workers every 2 seconds.
-	_ = system.AddMonitor("monitor-general", 2*time.Second)
-	// monitor-worker watches specific worker (mixed) every 1 second.
-	_ = system.AddMonitor("monitor-mixed", 1*time.Second)
-
-	// Register the second monitor to only watch the mixed worker.
-	// (Reuse mixed worker reference from above)
-	_ = mixed
+	switch *mode {
+	case "all":
+		_ = system.AddWorker("worker-loop", PatternLoop)
+		_ = system.AddWorker("worker-mixed", PatternMixed)
+		_ = system.AddWorker("worker-session", PatternSession)
+		_ = system.AddWorker("worker-fullydead", PatternFullyDead)
+		_ = system.AddWorker("worker-concurrent", PatternConcurrent)
+		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
+	case "loop":
+		_ = system.AddWorker("worker-loop", PatternLoop)
+	case "mixed":
+		_ = system.AddWorker("worker-mixed", PatternMixed)
+	case "session":
+		_ = system.AddWorker("worker-session", PatternSession)
+	case "fullydead":
+		_ = system.AddWorker("worker-fullydead", PatternFullyDead)
+	case "concurrent":
+		_ = system.AddWorker("worker-concurrent", PatternConcurrent)
+	case "customtypes":
+		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
+	default:
+		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes)", *mode)
+	}
 
 	// Start all actors.
 	system.Start()

@@ -218,7 +218,7 @@ func TestGcZombieReporting(t *testing.T) {
 
 func TestGcDeadTrace(t *testing.T) {
 	got := runTestProg(t, "testprog", "GCDeadTrace", "GODEBUG=gcdeadtrace=1")
-	if !strings.Contains(got, "gcdead:") {
+	if !strings.Contains(got, "gcdeadsession") {
 		t.Fatalf("expected gcdeadtrace output, got:\n%s", got)
 	}
 	if !strings.Contains(got, "objs") || !strings.Contains(got, "bytes") {
@@ -237,7 +237,7 @@ func TestGcDeadTraceComplex(t *testing.T) {
 	}
 
 	// Verify structure.
-	if !strings.Contains(got, "gcdead:") {
+	if !strings.Contains(got, "gcdeadsession") {
 		t.Fatalf("expected gcdeadtrace output, got:\n%s", got)
 	}
 	if !strings.Contains(got, "sites") {
@@ -335,6 +335,50 @@ func TestGcDeadTraceSession(t *testing.T) {
 	if !aliveOK {
 		t.Errorf("gcdeadsession:alive should report ~1024 bytes (alive session alloc)")
 	}
+}
+
+func TestGcDeadTraceMultiSession(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceMultiSession", "GODEBUG=gcdeadtrace=1")
+
+	// Should contain gcdeadsession by session section.
+	if !strings.Contains(got, "gcdeadsession by session:") {
+		t.Fatalf("expected per-session breakdown, got:\n%s", got)
+	}
+
+	// Should contain both freed and alive sections.
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:alive:") {
+		t.Fatalf("expected gcdeadsession:alive output, got:\n%s", got)
+	}
+
+	// Verify per-session breakdown has two session entries.
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	sessionCount := 0
+	hasOK := false
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.HasPrefix(l, "session #") {
+			sessionCount++
+			t.Logf("session line: %s", l)
+
+			// Each session should show all three categories.
+			if !strings.Contains(l, "allocs") || !strings.Contains(l, "freed") || !strings.Contains(l, "alive") {
+				t.Errorf("session line missing fields: %s", l)
+			}
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+	if sessionCount < 1 {
+		t.Errorf("expected at least 1 session entry in per-session breakdown, got %d", sessionCount)
+	}
+	t.Logf("found %d session entries, output:\n%s", sessionCount, got)
 }
 
 func TestGcDeadTraceFullyDead(t *testing.T) {

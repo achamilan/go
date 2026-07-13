@@ -1,0 +1,42 @@
+=== GC #1 ===
+gcdeadsession by session:
+  session #1 (gid=19): 3 allocs (1024 bytes), 2 freed (512 bytes), 1 alive (512 bytes) [start: D:/code/go/go/会话内存/demo/main.go:456, end: D:/code/go/go/会话内存/demo/main.go:460]
+  session #2 (gid=18): 4 allocs (1792 bytes), 3 freed (768 bytes), 1 alive (1024 bytes) [start: D:/code/go/go/会话内存/demo/main.go:444, end: D:/code/go/go/会话内存/demo/main.go:449]
+gcdeadsession:freed: 5 session objs (1280 bytes) freed from 5 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:446): 1 session objs, 256 session bytes [session #2: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:445): 1 session objs, 256 session bytes [session #2: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:444): 1 session objs, 256 session bytes [session #2: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:457): 1 session objs, 256 session bytes [session #1: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:456): 1 session objs, 256 session bytes [session #1: 1 objs, 256 bytes @uint8]
+gcdeadsession:alive: 2 session objs (1536 bytes) still alive from 2 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:447): 1 session objs, 1024 session bytes [session #2: 1 objs, 1024 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:458): 1 session objs, 512 session bytes [session #1: 1 objs, 512 bytes @uint8]
+=== GC #2 ===
+gcdeadsession by session:
+  session #3 (gid=43): 3 allocs (1024 bytes), 2 freed (512 bytes), 1 alive (512 bytes) [start: D:/code/go/go/会话内存/demo/main.go:456, end: D:/code/go/go/会话内存/demo/main.go:460]
+  session #4 (gid=42): 4 allocs (1792 bytes), 3 freed (768 bytes), 1 alive (1024 bytes) [start: D:/code/go/go/会话内存/demo/main.go:444, end: D:/code/go/go/会话内存/demo/main.go:449]
+gcdeadsession:freed: 6 session objs (2304 bytes) freed from 6 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:447): 1 session objs, 1024 session bytes [session #2: 1 objs, 1024 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:446): 1 session objs, 256 session bytes [session #4: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:445): 1 session objs, 256 session bytes [session #4: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:444): 1 session objs, 256 session bytes [session #4: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:457): 1 session objs, 256 session bytes [session #3: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:456): 1 session objs, 256 session bytes [session #3: 1 objs, 256 bytes @uint8]
+gcdeadsession:alive: 3 session objs (2048 bytes) still alive from 2 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:447): 1 session objs, 1024 session bytes [session #4: 1 objs, 1024 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:458): 2 session objs, 1024 session bytes [session #3: 1 objs, 512 bytes @uint8]
+=== GC #3 ===
+gcdeadsession by session:
+  session #5 (gid=21): 3 allocs (1024 bytes), 2 freed (512 bytes), 1 alive (512 bytes) [start: D:/code/go/go/会话内存/demo/main.go:456, end: D:/code/go/go/会话内存/demo/main.go:460]
+  session #6 (gid=20): 4 allocs (1792 bytes), 3 freed (768 bytes), 1 alive (1024 bytes) [start: D:/code/go/go/会话内存/demo/main.go:444, end: D:/code/go/go/会话内存/demo/main.go:449]
+gcdeadsession:freed: 8 session objs (3328 bytes) freed from 7 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:447): 1 session objs, 1024 session bytes [session #4: 1 objs, 1024 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:458): 2 session objs, 1024 session bytes [session #1: 1 objs, 512 bytes @uint8] [session #3: 1 objs, 512 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:446): 1 session objs, 256 session bytes [session #6: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:445): 1 session objs, 256 session bytes [session #6: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:444): 1 session objs, 256 session bytes [session #6: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:457): 1 session objs, 256 session bytes [session #5: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:456): 1 session objs, 256 session bytes [session #5: 1 objs, 256 bytes @uint8]
+gcdeadsession:alive: 2 session objs (1536 bytes) still alive from 2 sites
+  main.(*WorkerActor).patternConcurrent.func1 (D:/code/go/go/会话内存/demo/main.go:447): 1 session objs, 1024 session bytes [session #6: 1 objs, 1024 bytes @uint8]
+  main.(*WorkerActor).patternConcurrent.func2 (D:/code/go/go/会话内存/demo/main.go:458): 1 session objs, 512 session bytes [session #5: 1 objs, 512 bytes @uint8]

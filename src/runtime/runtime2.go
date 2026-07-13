@@ -550,6 +550,9 @@ type g struct {
 	// GcDeadSessionEnd. When true, allocations by this goroutine are
 	// tracked for per-session gcdeadtrace reporting.
 	gcDeadSessionActive bool
+	// gcDeadSessionID is a unique identifier for the current session.
+	// Assigned by GcDeadSessionStart.
+	gcDeadSessionID uint64
 	runningCleanups      atomic.Bool
 	sig             uint32
 	secret          int32 // current nesting of runtime/secret.Do calls.

@@ -222,7 +222,7 @@ func smallScanNoHeaderStub(size uintptr, typ *_type, needzero bool) (unsafe.Poin
 	// using the whole allocation slot.
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -331,7 +331,7 @@ func smallNoScanStub(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, u
 	// using the whole allocation slot.
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -478,7 +478,7 @@ func tinyStub(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uintptr)
 	// using the whole allocation slot.
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)

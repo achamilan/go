@@ -30,6 +30,7 @@ func init() {
 	register("GCDeadTraceComplex", GCDeadTraceComplex)
 	register("GCDeadTraceSession", GCDeadTraceSession)
 	register("GCDeadTraceFullyDead", GCDeadTraceFullyDead)
+	register("GCDeadTraceMultiSession", GCDeadTraceMultiSession)
 }
 
 func GCSys() {
@@ -330,10 +331,18 @@ var (
 	gcDeadSessionSink []byte // alloc on goroutine A, WITH session, will die
 	gcDeadOtherSink   []byte // alloc on goroutine B, NOT in session, will die
 	gcDeadAliveSink   []byte // alloc on goroutine A, WITH session, stays alive
+
+	// gcDeadSessionMulti sinks for GCDeadTraceMultiSession test.
+	gcDeadMultiA1 []byte // session A alloc, will die
+	gcDeadMultiA2 []byte // session A alloc, stays alive
+	gcDeadMultiB1 []byte // session B alloc, will die
+	gcDeadMultiB2 []byte // session B alloc, stays alive
 )
 
 func GCDeadTrace() {
 	runtime.MemProfileRate = 1 // profile every allocation
+
+	runtime.GcDeadSessionStart()
 
 	// Allocate garbage that escapes to the heap via the global deadSink.
 	// Previous iteration's value becomes unreferenced and dies.
@@ -341,6 +350,8 @@ func GCDeadTrace() {
 		deadSink = make([]byte, 256)
 	}
 	deadSink = nil // last iteration's allocation also dies
+
+	runtime.GcDeadSessionEnd()
 
 	live := make([]byte, 1024) // keep one allocation live
 	runtime.GC()               // force GC (sync sweep)
@@ -502,6 +513,55 @@ func GCDeadTraceSession() {
 	gcDeadPreSink = nil
 	gcDeadSessionSink = nil
 	gcDeadOtherSink = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadTraceMultiSession tests per-session object tagging with two
+// concurrent sessions that allocate from the same call site.
+// The per-session breakdown should attribute frees to the correct session
+// even when both sessions share the same bucket (same allocation site + size).
+//
+// Session A: 3 × 256B (freed) + 1 × 1024B (alive)
+// Session B: 2 × 256B (freed) + 1 × 512B (alive)
+// Main goroutine: 1 × 128B (non-session, not tracked)
+func GCDeadTraceMultiSession() {
+	runtime.MemProfileRate = 1
+
+	// Non-session allocation on main goroutine.
+	gcDeadPreSink = make([]byte, 128)
+
+	var wg sync.WaitGroup
+
+	// Session goroutine A: 3 × 256B freed, 1 × 1024B alive.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		gcDeadMultiA1 = make([]byte, 256)  // will die
+		gcDeadMultiA1 = make([]byte, 256)  // will die (overwritten)
+		gcDeadMultiA1 = make([]byte, 256)  // will die (overwritten)
+		gcDeadMultiA2 = make([]byte, 1024) // will stay alive
+		runtime.GcDeadSessionEnd()
+	}()
+
+	// Session goroutine B: 2 × 256B freed, 1 × 512B alive.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		gcDeadMultiB1 = make([]byte, 256)  // will die
+		gcDeadMultiB1 = make([]byte, 256)  // will die (overwritten)
+		gcDeadMultiB2 = make([]byte, 512)  // will stay alive
+		runtime.GcDeadSessionEnd()
+	}()
+
+	wg.Wait()
+
+	// Drop dying references; keep alive references stay.
+	gcDeadMultiA1 = nil
+	gcDeadMultiB1 = nil
 
 	runtime.GC()
 	fmt.Println("OK")

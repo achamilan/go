@@ -804,7 +804,7 @@ func newUserArenaChunk() (unsafe.Pointer, *mspan) {
 		if rate != 1 && int64(userArenaChunkBytes) < c.nextSample {
 			c.nextSample -= int64(userArenaChunkBytes)
 		} else {
-			profilealloc(mp, unsafe.Pointer(span.base()), userArenaChunkBytes)
+			profilealloc(mp, unsafe.Pointer(span.base()), userArenaChunkBytes, nil)
 		}
 	}
 	mp.mallocing = 0

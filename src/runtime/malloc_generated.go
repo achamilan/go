@@ -146,7 +146,7 @@ func mallocgcSmallScanNoHeaderSC1(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -314,7 +314,7 @@ func mallocgcSmallScanNoHeaderSC2(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -482,7 +482,7 @@ func mallocgcSmallScanNoHeaderSC3(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -650,7 +650,7 @@ func mallocgcSmallScanNoHeaderSC4(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -818,7 +818,7 @@ func mallocgcSmallScanNoHeaderSC5(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -986,7 +986,7 @@ func mallocgcSmallScanNoHeaderSC6(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1154,7 +1154,7 @@ func mallocgcSmallScanNoHeaderSC7(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1322,7 +1322,7 @@ func mallocgcSmallScanNoHeaderSC8(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1490,7 +1490,7 @@ func mallocgcSmallScanNoHeaderSC9(size uintptr, typ *_type, needzero bool) unsaf
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1658,7 +1658,7 @@ func mallocgcSmallScanNoHeaderSC10(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1826,7 +1826,7 @@ func mallocgcSmallScanNoHeaderSC11(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1994,7 +1994,7 @@ func mallocgcSmallScanNoHeaderSC12(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2162,7 +2162,7 @@ func mallocgcSmallScanNoHeaderSC13(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2330,7 +2330,7 @@ func mallocgcSmallScanNoHeaderSC14(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2498,7 +2498,7 @@ func mallocgcSmallScanNoHeaderSC15(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2666,7 +2666,7 @@ func mallocgcSmallScanNoHeaderSC16(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2834,7 +2834,7 @@ func mallocgcSmallScanNoHeaderSC17(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3002,7 +3002,7 @@ func mallocgcSmallScanNoHeaderSC18(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3170,7 +3170,7 @@ func mallocgcSmallScanNoHeaderSC19(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3338,7 +3338,7 @@ func mallocgcSmallScanNoHeaderSC20(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3506,7 +3506,7 @@ func mallocgcSmallScanNoHeaderSC21(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3674,7 +3674,7 @@ func mallocgcSmallScanNoHeaderSC22(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -3842,7 +3842,7 @@ func mallocgcSmallScanNoHeaderSC23(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4010,7 +4010,7 @@ func mallocgcSmallScanNoHeaderSC24(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4178,7 +4178,7 @@ func mallocgcSmallScanNoHeaderSC25(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4346,7 +4346,7 @@ func mallocgcSmallScanNoHeaderSC26(size uintptr, typ *_type, needzero bool) unsa
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4503,7 +4503,7 @@ func mallocgcTinySize1(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4659,7 +4659,7 @@ func mallocgcTinySize2(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4815,7 +4815,7 @@ func mallocgcTinySize3(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -4971,7 +4971,7 @@ func mallocgcTinySize4(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5127,7 +5127,7 @@ func mallocgcTinySize5(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5283,7 +5283,7 @@ func mallocgcTinySize6(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5439,7 +5439,7 @@ func mallocgcTinySize7(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5595,7 +5595,7 @@ func mallocgcTinySize8(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5751,7 +5751,7 @@ func mallocgcTinySize9(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -5907,7 +5907,7 @@ func mallocgcTinySize10(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6063,7 +6063,7 @@ func mallocgcTinySize11(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6219,7 +6219,7 @@ func mallocgcTinySize12(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6375,7 +6375,7 @@ func mallocgcTinySize13(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6531,7 +6531,7 @@ func mallocgcTinySize14(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6687,7 +6687,7 @@ func mallocgcTinySize15(size uintptr, typ *_type, needzero bool) unsafe.Pointer 
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6822,7 +6822,7 @@ func mallocgcSmallNoScanSC2(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -6958,7 +6958,7 @@ func mallocgcSmallNoScanSC3(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7094,7 +7094,7 @@ func mallocgcSmallNoScanSC4(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7230,7 +7230,7 @@ func mallocgcSmallNoScanSC5(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7366,7 +7366,7 @@ func mallocgcSmallNoScanSC6(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7502,7 +7502,7 @@ func mallocgcSmallNoScanSC7(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7638,7 +7638,7 @@ func mallocgcSmallNoScanSC8(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7774,7 +7774,7 @@ func mallocgcSmallNoScanSC9(size uintptr, typ *_type, needzero bool) unsafe.Poin
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -7910,7 +7910,7 @@ func mallocgcSmallNoScanSC10(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8046,7 +8046,7 @@ func mallocgcSmallNoScanSC11(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8182,7 +8182,7 @@ func mallocgcSmallNoScanSC12(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8318,7 +8318,7 @@ func mallocgcSmallNoScanSC13(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8454,7 +8454,7 @@ func mallocgcSmallNoScanSC14(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8590,7 +8590,7 @@ func mallocgcSmallNoScanSC15(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8726,7 +8726,7 @@ func mallocgcSmallNoScanSC16(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8862,7 +8862,7 @@ func mallocgcSmallNoScanSC17(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -8998,7 +8998,7 @@ func mallocgcSmallNoScanSC18(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9134,7 +9134,7 @@ func mallocgcSmallNoScanSC19(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9270,7 +9270,7 @@ func mallocgcSmallNoScanSC20(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9406,7 +9406,7 @@ func mallocgcSmallNoScanSC21(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9542,7 +9542,7 @@ func mallocgcSmallNoScanSC22(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9678,7 +9678,7 @@ func mallocgcSmallNoScanSC23(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9814,7 +9814,7 @@ func mallocgcSmallNoScanSC24(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -9950,7 +9950,7 @@ func mallocgcSmallNoScanSC25(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -10086,7 +10086,7 @@ func mallocgcSmallNoScanSC26(size uintptr, typ *_type, needzero bool) unsafe.Poi
 
 	c.nextSample -= int64(elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, elemsize)
+		profilealloc(mp, x, elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)

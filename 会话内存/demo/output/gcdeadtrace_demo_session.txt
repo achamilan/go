@@ -1,0 +1,22 @@
+=== GC #1 ===
+gcdeadsession by session:
+  session #1 (gid=6): 3 allocs (1304 bytes), 1 freed (256 bytes), 2 alive (1048 bytes) [start: D:/code/go/go/会话内存/demo/main.go:353, end: D:/code/go/go/会话内存/demo/main.go:368]
+gcdeadsession:freed: 1 session objs (256 bytes) freed from 1 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:357) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 1 session objs, 256 session bytes [session #1: 1 objs, 256 bytes @uint8]
+gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:362) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 2 session objs, 1048 session bytes [session #1: 2 objs, 1048 bytes @[]uint8]
+=== GC #2 ===
+gcdeadsession by session:
+  session #2 (gid=6): 3 allocs (1328 bytes), 1 freed (256 bytes), 2 alive (1072 bytes) [start: D:/code/go/go/会话内存/demo/main.go:353, end: D:/code/go/go/会话内存/demo/main.go:368]
+gcdeadsession:freed: 2 session objs (280 bytes) freed from 2 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:357) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 1 session objs, 256 session bytes [session #2: 1 objs, 256 bytes @uint8]
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:362) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 1 session objs, 24 session bytes [session #1: 1 objs, 24 bytes @[]uint8]
+gcdeadsession:alive: 3 session objs (2096 bytes) still alive from 1 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:362) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 3 session objs, 2096 session bytes [session #2: 2 objs, 1072 bytes @[]uint8]
+=== GC #3 ===
+gcdeadsession by session:
+  session #3 (gid=6): 3 allocs (1376 bytes), 1 freed (256 bytes), 2 alive (1120 bytes) [start: D:/code/go/go/会话内存/demo/main.go:353, end: D:/code/go/go/会话内存/demo/main.go:368]
+gcdeadsession:freed: 1 session objs (256 bytes) freed from 1 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:357) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 1 session objs, 256 session bytes [session #3: 1 objs, 256 bytes @uint8]
+gcdeadsession:alive: 5 session objs (3216 bytes) still alive from 1 sites
+  main.(*WorkerActor).patternSession (D:/code/go/go/会话内存/demo/main.go:362) < main.(*WorkerActor).doAllocBurst (D:/code/go/go/会话内存/demo/main.go:272) < main.(*WorkerActor).run (D:/code/go/go/会话内存/demo/main.go:221): 5 session objs, 3216 session bytes [session #3: 2 objs, 1120 bytes @[]uint8]

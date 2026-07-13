@@ -1378,7 +1378,7 @@ func mallocgcTiny(size uintptr, typ *_type) (unsafe.Pointer, uintptr) {
 	// using the whole allocation slot.
 	c.nextSample -= int64(span.elemsize)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, span.elemsize)
+		profilealloc(mp, x, span.elemsize, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1490,7 +1490,7 @@ func mallocgcSmallNoscan(size uintptr, typ *_type, needzero bool) (unsafe.Pointe
 	// using the whole allocation slot.
 	c.nextSample -= int64(size)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, size)
+		profilealloc(mp, x, size, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1630,7 +1630,7 @@ func mallocgcSmallScanNoHeader(size uintptr, typ *_type) (unsafe.Pointer, uintpt
 	// using the whole allocation slot.
 	c.nextSample -= int64(size)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, size)
+		profilealloc(mp, x, size, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1723,7 +1723,7 @@ func mallocgcSmallScanHeader(size uintptr, typ *_type) (unsafe.Pointer, uintptr)
 	// using the whole allocation slot.
 	c.nextSample -= int64(size)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, size)
+		profilealloc(mp, x, size, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -1797,7 +1797,7 @@ func mallocgcLarge(size uintptr, typ *_type, needzero bool) (unsafe.Pointer, uin
 	// using the whole allocation slot.
 	c.nextSample -= int64(size)
 	if c.nextSample < 0 || MemProfileRate != c.memProfRate {
-		profilealloc(mp, x, size)
+		profilealloc(mp, x, size, typ)
 	}
 	mp.mallocing = 0
 	releasem(mp)
@@ -2296,14 +2296,14 @@ func maps_newarray(typ *_type, n int) unsafe.Pointer {
 // records a memory profile sample.
 //
 // The caller must be non-preemptible and have a P.
-func profilealloc(mp *m, x unsafe.Pointer, size uintptr) {
+func profilealloc(mp *m, x unsafe.Pointer, size uintptr, typ *_type) {
 	c := getMCache(mp)
 	if c == nil {
 		throw("profilealloc called without a P or outside bootstrapping")
 	}
 	c.memProfRate = MemProfileRate
 	c.nextSample = nextSample()
-	mProf_Malloc(mp, x, size)
+	mProf_Malloc(mp, x, size, typ)
 }
 
 // nextSample returns the next sampling point for heap profiling. The goal is

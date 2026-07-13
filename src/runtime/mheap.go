@@ -227,6 +227,7 @@ type mheap struct {
 	specialBubbleAlloc         fixalloc // allocator for specialBubble
 	specialSecretAlloc         fixalloc // allocator for specialSecret
 	specialSessionAlloc        fixalloc // allocator for specialSession
+	specialGcDeadSessionAlloc  fixalloc // allocator for specialGcDeadSession
 	speciallock                mutex    // lock for special record allocators.
 	arenaHintAlloc             fixalloc // allocator for arenaHints
 
@@ -796,6 +797,7 @@ func (h *mheap) init() {
 	h.specialWeakHandleAlloc.init(unsafe.Sizeof(specialWeakHandle{}), nil, nil, &memstats.gcMiscSys)
 	h.specialBubbleAlloc.init(unsafe.Sizeof(specialBubble{}), nil, nil, &memstats.other_sys)
 	h.specialSessionAlloc.init(unsafe.Sizeof(specialSession{}), nil, nil, &memstats.other_sys)
+	h.specialGcDeadSessionAlloc.init(unsafe.Sizeof(specialGcDeadSession{}), nil, nil, &memstats.other_sys)
 	h.arenaHintAlloc.init(unsafe.Sizeof(arenaHint{}), nil, nil, &memstats.other_sys)
 
 	// Don't zero mspan allocations. Background sweeping can
@@ -1975,6 +1977,9 @@ const (
 	_KindSpecialSecret = 10
 	// _KindSpecialSession associates an object with a session memory bucket.
 	_KindSpecialSession = 11
+	// _KindSpecialGcDeadSession tracks which gcdeadtrace session owns a
+	// heap object. Used to attribute freed objects to the correct session.
+	_KindSpecialGcDeadSession = 12
 )
 
 type special struct {
@@ -2763,6 +2768,17 @@ type specialSession struct {
 	bucket  *sessionBucket // bucket containing this object
 }
 
+// specialGcDeadSession associates a heap object with a gcdeadtrace session.
+// Used to attribute freed objects to the correct session for per-session
+// reporting in gcdeadtrace.
+type specialGcDeadSession struct {
+	_         sys.NotInHeap
+	special   special
+	sessionID uint64
+	b         *bucket // allocation site bucket for per-site session attribution
+	typ       *_type  // type of the allocated object, for type name in output
+}
+
 // specialsIter helps iterate over specials lists.
 type specialsIter struct {
 	pprev **special
@@ -2867,6 +2883,12 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		memclrNoHeapPointers(p, ss.size)
 		lock(&mheap_.speciallock)
 		mheap_.specialSecretAlloc.free(unsafe.Pointer(s))
+		unlock(&mheap_.speciallock)
+	case _KindSpecialGcDeadSession:
+		ss := (*specialGcDeadSession)(unsafe.Pointer(s))
+		gcDeadRecordFree(ss.sessionID, size, ss.b, ss.typ)
+		lock(&mheap_.speciallock)
+		mheap_.specialGcDeadSessionAlloc.free(unsafe.Pointer(ss))
 		unlock(&mheap_.speciallock)
 	case _KindSpecialSession:
 		ss := (*specialSession)(unsafe.Pointer(s))
