@@ -1541,6 +1541,10 @@ var gcDeadNextSessionID atomic.Uint64
 // started, so it can be restored when all sessions end.
 var gcDeadSavedRate int
 
+// gcDeadTraceFileCreated tracks whether the gcdeadtracefile creation success
+// message has been printed, so we don't spam stderr on every GC cycle.
+var gcDeadTraceFileCreated bool
+
 var blockprofilerate uint64 // in CPU ticks
 
 // SetBlockProfileRate controls the fraction of goroutine blocking events

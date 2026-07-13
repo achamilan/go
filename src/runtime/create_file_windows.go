@@ -62,7 +62,12 @@ func writeDeadTraceToFile(path string, buf []byte) {
 		0, // hTemplateFile (NULL)
 	)
 	if handle == ^uintptr(0) { // INVALID_HANDLE_VALUE
+		println("runtime: gcdeadtracefile: failed to open", path)
 		return
+	}
+	if !gcDeadTraceFileCreated {
+		println("runtime: gcdeadtracefile: created", path)
+		gcDeadTraceFileCreated = true
 	}
 
 	var written uint32

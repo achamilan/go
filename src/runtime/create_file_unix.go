@@ -28,8 +28,14 @@ func writeDeadTraceToFile(path string, buf []byte) {
 	nameBytes[plen] = 0
 
 	fd := open(&nameBytes[0], _O_CREAT|_O_WRONLY|_O_APPEND, 0666)
-	if fd >= 0 {
-		write(uintptr(fd), unsafe.Pointer(&buf[0]), int32(len(buf)))
-		closefd(fd)
+	if fd < 0 {
+		println("runtime: gcdeadtracefile: failed to open", path)
+		return
 	}
+	if !gcDeadTraceFileCreated {
+		println("runtime: gcdeadtracefile: created", path)
+		gcDeadTraceFileCreated = true
+	}
+	write(uintptr(fd), unsafe.Pointer(&buf[0]), int32(len(buf)))
+	closefd(fd)
 }

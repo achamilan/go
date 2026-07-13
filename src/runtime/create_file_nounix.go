@@ -14,4 +14,9 @@ func create(name *byte, perm int32) int32 {
 }
 
 // writeDeadTraceToFile is a no-op on platforms that don't support file creation.
-func writeDeadTraceToFile(path string, buf []byte) {}
+func writeDeadTraceToFile(path string, buf []byte) {
+	if !gcDeadTraceFileCreated {
+		println("runtime: gcdeadtracefile: unsupported platform, cannot create", path)
+		gcDeadTraceFileCreated = true
+	}
+}
