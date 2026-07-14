@@ -371,7 +371,7 @@ type sessAgg struct {
 
 func buildOverviewSheet(allData []*ParsedData) *xlsxSheet {
 	s := &xlsxSheet{name: "Overview", colWidths: make([]float64, 20)}
-	s.addHeaderRow("Mode", "GC Cycles", "Sessions", "Total Freed", "Total Alive", "Avg Freed/GC", "Avg Alive/GC")
+	s.addHeaderRow("Mode", "GC Cycles", "Sessions", "Freed Objs", "Alive Objs", "Avg Freed/GC", "Avg Alive/GC")
 	for _, d := range allData {
 		tf, ta := 0, 0
 		for _, gc := range d.GCCycles {
@@ -453,7 +453,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	// Freed Site Attribution
 	s.addBlank()
 	s.addRow("=== Freed Sites ===")
-	s.addHeaderRow("Allocation Site", "Location", "Freed Objs", "Freed Bytes", "Session Refs")
+	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
 	type siteInfo struct {
 		Func, Loc          string
 		TotalObjs, TotalBytes int
@@ -469,7 +469,10 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			sort.Strings(refs)
 			refStr := strings.Join(refs, "; ")
 			if len(refStr) > 100 { refStr = refStr[:97] + "..." }
-			s.addRow(si.Func, shortLoc(si.Loc), fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
+			// Extract the first (file:line) from the call stack = actual alloc point.
+			// For simple stacks (no call chain), fall back to si.Loc.
+			loc := firstFileLine(si.Func, si.Loc)
+			s.addRow(si.Func, shortLoc(loc), fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
 		}
 	}
 	freedMap := make(map[string]*siteInfo)
@@ -486,7 +489,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	// Alive Site Attribution
 	s.addBlank()
 	s.addRow("=== Alive Sites ===")
-	s.addHeaderRow("Allocation Site", "Location", "Alive Objs", "Alive Bytes", "Session Refs")
+	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Alive Objs", "Alive Bytes", "Session Refs")
 	aliveMap := make(map[string]*siteInfo)
 	for _, gc := range gcs {
 		for _, site := range gc.AliveSites {
@@ -541,6 +544,25 @@ func shortLoc(loc string) string {
 		return base + loc[idx:]
 	}
 	return loc
+}
+
+// firstFileLine extracts the first (file:line) from a call stack string.
+// The call stack format from gcdeadtrace is:
+//
+//	topFunc (file1.go:123) < caller (file2.go:456) < ...
+//
+// Returns fallback when the stack doesn't contain a (file:line) pair.
+func firstFileLine(stack, fallback string) string {
+	idx := strings.Index(stack, " (")
+	if idx < 0 {
+		return fallback
+	}
+	start := idx + 2
+	end := strings.Index(stack[start:], ")")
+	if end < 0 {
+		return fallback
+	}
+	return stack[start : start+end]
 }
 
 // ── main ───────────────────────────────────────────────────────────
