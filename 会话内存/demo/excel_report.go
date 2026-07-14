@@ -468,7 +468,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			for r := range si.Refs { refs = append(refs, r) }
 			sort.Strings(refs)
 			refStr := strings.Join(refs, "; ")
-			if len(refStr) > 100 { refStr = refStr[:97] + "..." }
+			if len(refStr) > 1000 { refStr = refStr[:997] + "..." }
 			// Extract the first (file:line) from the call stack = actual alloc point.
 			// For simple stacks (no call chain), fall back to si.Loc.
 			loc := firstFileLine(si.Func, si.Loc)
@@ -500,6 +500,73 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		}
 	}
 	emitSites(aliveMap, "Alive")
+
+	// Cross-reference by Alloc File:Line
+	s.addBlank()
+	s.addRow("=== Alloc File:Line in Both Freed & Alive ===")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "Functions")
+	type lineAgg struct {
+		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
+		Funcs                                        map[string]bool
+	}
+	freedByLine := make(map[string]*lineAgg)
+	aliveByLine := make(map[string]*lineAgg)
+	for _, si := range freedMap {
+		loc := shortLoc(firstFileLine(si.Func, si.Loc))
+		if loc == "" { continue }
+		a, ok := freedByLine[loc]
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; freedByLine[loc] = a }
+		a.FreedObjs += si.TotalObjs
+		a.FreedBytes += si.TotalBytes
+		a.Funcs[si.Func] = true
+	}
+	for _, si := range aliveMap {
+		loc := shortLoc(firstFileLine(si.Func, si.Loc))
+		if loc == "" { continue }
+		a, ok := aliveByLine[loc]
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; aliveByLine[loc] = a }
+		a.AliveObjs += si.TotalObjs
+		a.AliveBytes += si.TotalBytes
+		a.Funcs[si.Func] = true
+	}
+	// Both freed & alive
+	var bothLines []string
+	for loc, fa := range freedByLine {
+		if aa, ok := aliveByLine[loc]; ok {
+			bothLines = append(bothLines, loc)
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			for f := range aa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
+			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+				fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes), fnStr)
+		}
+	}
+	if len(bothLines) == 0 {
+		s.addRow("(none)")
+	}
+
+	// Freed only
+	s.addBlank()
+	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Functions")
+	var freedOnly int
+	for loc, fa := range freedByLine {
+		if _, ok := aliveByLine[loc]; !ok {
+			freedOnly++
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
+			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes), fnStr)
+		}
+	}
+	if freedOnly == 0 {
+		s.addRow("(none)")
+	}
 
 	// Reprint timeline
 	if strings.Contains(strings.ToLower(data.Mode), "reprint") {
