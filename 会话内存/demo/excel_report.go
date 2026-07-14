@@ -232,7 +232,7 @@ func (xb *xlsxBuilder) writeXLSX(path string) error {
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets>`
 	for i, s := range xb.sheets {
-		wb += fmt.Sprintf("\n    <sheet name=\"%s\" sheetId=\"%d\" r:id=\"rId%d\"/>", escXML(s.name), i+1, i+2)
+		wb += fmt.Sprintf("\n    <sheet name=\"%s\" sheetId=\"%d\" r:id=\"rId%d\"/>", escXML(s.name), i+1, i+3)
 	}
 	wb += "\n  </sheets>\n</workbook>"
 	xb.writeFile(w, "xl/workbook.xml", wb)
@@ -450,40 +450,53 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.MaxAlive))
 	}
 
-	// Site Attribution
+	// Freed Site Attribution
 	s.addBlank()
-	s.addHeaderRow("Allocation Site", "Location", "Total Objs", "Total Bytes", "Session Refs")
+	s.addRow("=== Freed Sites ===")
+	s.addHeaderRow("Allocation Site", "Location", "Freed Objs", "Freed Bytes", "Session Refs")
 	type siteInfo struct {
 		Func, Loc          string
 		TotalObjs, TotalBytes int
 		Refs               map[string]bool
 	}
-	siteMap := make(map[string]*siteInfo)
+	emitSites := func(siteMap map[string]*siteInfo, title string) {
+		var sites []*siteInfo
+		for _, si := range siteMap { sites = append(sites, si) }
+		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalObjs > sites[j].TotalObjs })
+		for _, si := range sites {
+			var refs []string
+			for r := range si.Refs { refs = append(refs, r) }
+			sort.Strings(refs)
+			refStr := strings.Join(refs, "; ")
+			if len(refStr) > 100 { refStr = refStr[:97] + "..." }
+			s.addRow(si.Func, shortLoc(si.Loc), fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
+		}
+	}
+	freedMap := make(map[string]*siteInfo)
 	for _, gc := range gcs {
 		for _, site := range gc.FreedSites {
 			key := site.Func + "|" + site.Loc
-			si, ok := siteMap[key]
-			if !ok { si = &siteInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; siteMap[key] = si }
+			si, ok := freedMap[key]
+			if !ok { si = &siteInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; freedMap[key] = si }
 			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes; si.Refs[site.Refs] = true
 		}
+	}
+	emitSites(freedMap, "Freed")
+
+	// Alive Site Attribution
+	s.addBlank()
+	s.addRow("=== Alive Sites ===")
+	s.addHeaderRow("Allocation Site", "Location", "Alive Objs", "Alive Bytes", "Session Refs")
+	aliveMap := make(map[string]*siteInfo)
+	for _, gc := range gcs {
 		for _, site := range gc.AliveSites {
 			key := site.Func + "|" + site.Loc
-			si, ok := siteMap[key]
-			if !ok { si = &siteInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; siteMap[key] = si }
+			si, ok := aliveMap[key]
+			if !ok { si = &siteInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; aliveMap[key] = si }
 			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes; si.Refs[site.Refs] = true
 		}
 	}
-	var sites []*siteInfo
-	for _, si := range siteMap { sites = append(sites, si) }
-	sort.Slice(sites, func(i, j int) bool { return sites[i].TotalObjs > sites[j].TotalObjs })
-	for _, si := range sites {
-		var refs []string
-		for r := range si.Refs { refs = append(refs, r) }
-		sort.Strings(refs)
-		refStr := strings.Join(refs, "; ")
-		if len(refStr) > 100 { refStr = refStr[:97] + "..." }
-		s.addRow(si.Func, shortLoc(si.Loc), fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
-	}
+	emitSites(aliveMap, "Alive")
 
 	// Reprint timeline
 	if strings.Contains(strings.ToLower(data.Mode), "reprint") {
