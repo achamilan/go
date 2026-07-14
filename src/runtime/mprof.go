@@ -1220,6 +1220,35 @@ func gcDeadTracePrint() {
 		}
 	}
 
+	// First pass: accumulate totals from the session table so we know
+	// whether there is any session data to output. The totals are also
+	// used for the GC separator and freed/alive summary lines.
+	for i := range gcDeadSessionTable {
+		e := &gcDeadSessionTable[i]
+		if e.id == 0 {
+			continue
+		}
+		frees := atomic.Loaduintptr(&e.frees)
+		freeBytes := atomic.Loaduintptr(&e.freeBytes)
+		cumAllocs := atomic.Loaduintptr(&e.cumAllocs)
+		cumAllocBytes := atomic.Loaduintptr(&e.cumAllocBytes)
+		cumFrees := atomic.Loaduintptr(&e.cumFrees)
+		cumFreeBytes := atomic.Loaduintptr(&e.cumFreeBytes)
+
+		alive := uintptr(0)
+		aliveBytes := uintptr(0)
+		if cumAllocs > cumFrees {
+			alive = cumAllocs - cumFrees
+			aliveBytes = cumAllocBytes - cumFreeBytes
+		}
+
+		// Accumulate totals.
+		totalSessionFrees += frees
+		totalSessionBytes += freeBytes
+		totalSessionAlive += alive
+		totalSessionAliveBytes += aliveBytes
+	}
+
 	// Add a separator with GC cycle number so outputs are distinguishable.
 	if totalSessionFrees > 0 || totalSessionAlive > 0 {
 		appendStr("=== GC #")
@@ -1227,12 +1256,8 @@ func gcDeadTracePrint() {
 		appendStr(" ===\n")
 	}
 
-	// Per-session breakdown: read from the session table, which tracks
-	// each session independently via per-object specials. This provides
-	// accurate attribution even when multiple sessions share allocation sites.
-	// Also accumulates totalSessionFrees/Bytes/Alive/AliveBytes for the
-	// aggregated gcdeadsession:freed and gcdeadsession:alive summary lines,
-	// since bucket-level heuristic counters have been removed.
+	// Second pass: per-session breakdown output. Reads from the session table,
+	// which tracks each session independently via per-object specials.
 	hasSessionData := false
 	for i := range gcDeadSessionTable {
 		e := &gcDeadSessionTable[i]
@@ -1254,12 +1279,6 @@ func gcDeadTracePrint() {
 			alive = cumAllocs - cumFrees
 			aliveBytes = cumAllocBytes - cumFreeBytes
 		}
-
-		// Accumulate totals from session table (replaces old bucket-level heuristic).
-		totalSessionFrees += frees
-		totalSessionBytes += freeBytes
-		totalSessionAlive += alive
-		totalSessionAliveBytes += aliveBytes
 
 		// Skip sessions that were already printed in a previous GC cycle
 		// and have no new per-cycle allocation activity.

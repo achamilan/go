@@ -123,6 +123,7 @@ const (
 	PatternFullyDead                // GCDeadTraceFullyDead-like: per-site tracking
 	PatternConcurrent               // Multi-session concurrent tracking
 	PatternCustomTypes              // Custom types: struct, map, interface, string
+	PatternRePrint                  // Session re-print on end verification
 )
 
 func (p AllocPattern) String() string {
@@ -139,6 +140,8 @@ func (p AllocPattern) String() string {
 		return "concurrent"
 	case PatternCustomTypes:
 		return "customtypes"
+	case PatternRePrint:
+		return "reprint"
 	default:
 		return "unknown"
 	}
@@ -276,6 +279,8 @@ func (w *WorkerActor) doAllocBurst() {
 		w.patternConcurrent()
 	case PatternCustomTypes:
 		w.patternCustomTypes()
+	case PatternRePrint:
+		w.patternRePrint()
 	}
 }
 
@@ -373,6 +378,39 @@ func (w *WorkerActor) patternSession() {
 	// Let the session 256B die.
 	w.scratch = nil
 
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
+
+// patternRePrint: verify session re-print when endPC becomes set.
+// Flow: GC while active → GC while active (no re-print) → end → GC (re-print with end).
+func (w *WorkerActor) patternRePrint() {
+	if !w.sessionActive {
+		runtime.GcDeadSessionStart()
+		w.sessionActive = true
+	}
+
+	// Dying allocation (256B) — will be freed.
+	w.scratch = make([]byte, 256)
+	// Alive allocation (1024B) — kept referenced.
+	w.aliveRefs = append(w.aliveRefs, make([]byte, 1024))
+
+	// GC 1: session has no end → first print (printed=1, no "end:").
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+
+	// Nil the dying ref so GC 2 sees frees.
+	w.scratch = nil
+
+	// GC 2: session still active, printed=1, endPC=0 → NOT re-printed.
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+
+	// End session — endPC becomes set.
+	runtime.GcDeadSessionEnd()
+	w.sessionActive = false
+
+	// GC 3: endPC != 0, printed=1 → re-printed with "end:".
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 }
@@ -825,8 +863,10 @@ func main() {
 		_ = system.AddWorker("worker-concurrent", PatternConcurrent)
 	case "customtypes":
 		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
+	case "reprint":
+		_ = system.AddWorker("worker-reprint", PatternRePrint)
 	default:
-		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes)", *mode)
+		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint)", *mode)
 	}
 
 	// Start all actors.
