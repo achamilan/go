@@ -8,6 +8,8 @@ v2: 新增协程级会话追踪，GcDeadSessionStart()/End() 按 goroutine 隔�
 v3: 新增会话存活对象追踪，区分"已释放"和"仍存活"的会话内分配。
 v4: 新增 per-session 对象标记（span specials），支持多并发会话独立追踪。
 v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会话归属。[f75933b7]
+v6: 移除 bucket 级启发式计数，完全依赖 per-session special 和会话表。
+    修复同 bucket 非 session 分配被计入 session 释放的误判问题。[lanyy/996]
 
 
 1. 总体数据流
@@ -15,9 +17,9 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
   用户分配: make([]byte, 256)
     → mallocgc → profilealloc → mProf_Malloc(mp, p, size, typ)
         1. 采集调用栈 + 关联 bucket (原有)
-        2. 若 goroutine 在会话中 → 更新 bucket 级会话计数 (v2)
-        3. 若在会话中 → 在 span 上挂载 _KindSpecialGcDeadSession 特殊 (v4)
-        4. 若在会话中 → 解析类型名 (toRType(typ).string()) → 写入 allocBucketRefs (v5)
+        2. 若在会话中 → 在 span 上挂载 _KindSpecialGcDeadSession 特殊 (v4)
+        3. 若在会话中 → 解析类型名 (toRType(typ).string()) → 写入 allocBucketRefs (v5)
+        4. 若在会话中 → 写入会话表 allos/cumAllocs + allocBucketRefs (v6)
 
   GC sweep: 扫描 dead span
     → 遍历 span.specials
@@ -26,36 +28,35 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
         同时解析类型名 → 写入 bucketRefs (v5)
 
   GC 结束: gcDeadTracePrint
-    Phase 1: 遍历 mbuckets，收集 bucket 级会话计数 (v2/v3 兼容)
+    Phase 1: 遍历 mbuckets，收集 gcDeadFrees (无 session 数据, v6 移除 bucket 级启发式)
     Phase 1.5: 交叉引用 session bucketRefs → raw 条目，填充 sessionRefs + typeName (v4)
+              未匹配的 bucket 自动创建 raw 条目 (v6)
     Phase 1.6: 交叉引用 session allocBucketRefs → raw 条目，填充 aliveSessionRefs + typeName (v5)
+              使用 cumFrees 计算 net alive 计数 (v6)
     Phase 2: 读取 gcDeadSessionTable → 输出 per-session 分解，含 [start/end] (v4/v5)
+             同时累加 totalSessionFrees/Alive 用于汇总行 (v6)
     Phase 3: 按分配站点排序，合并 sessionRefs/aliveSessionRefs (v4/v5)
     Phase 4: 按 bytes 降序
     Phase 5: 格式化输出，site 行附加 [session #N: X objs, Y bytes @type] (v4/v5)
+             站点 freed 从 sessionRefs 计算，alive 从 aliveSessionRefs 计算 (v6)
     Phase 6: 写入输出到 stderr/文件
 
 
 2. 核心数据结构
 
   ┌─────────────────────────────────────────────────────────────────┐
-  │ bucket (保留原有 v2/v3 字段)                                     │
+  │ bucket                                                          │
   │   hash, size, nstk, stack[]     // 分配调用栈 + 大小            │
   │   └→ memRecord {                                               │
   │        active   memRecordCycle   // 已发布的 profiling 快照     │
   │        future   [3]memRecordCycle // 三周期环形缓冲             │
   │                                                                    │
-  │        // === gcdeadtrace 全局计数（保留，用于站点报告）=========   │
+  │        // === gcdeadtrace 全局计数（用于非 session 站点报告）=====  │
   │        gcDeadFrees     uintptr   // 本周期死亡对象数             │
   │        gcDeadFreeBytes uintptr   // 本周期死亡字节数             │
   │                                                                    │
-  │        // === 会话追踪计数 (v2/v3) ==============================   │
-  │        gcDeadSessionAllocs     uintptr // 会话分配次数(累计)     │
-  │        gcDeadSessionAllocBytes uintptr // 会话分配字节(累计)     │
-  │        gcDeadSessionFrees      uintptr // 会话释放数(每周期清零) │
-  │        gcDeadSessionFreeBytes  uintptr // 会话释放字节(每周期清零)│
-  │        gcDeadSessionCumFrees   uintptr // 会话释放数(累计)       │
-  │        gcDeadSessionCumFreeBytes uintptr // 会话释放字节(累计)   │
+  │        // (v6: 原 bucket 级会话追踪字段 gcDeadSessionAllocs 等    │
+  │        //  已被移除。session 数据完全从会话表汇总。)              │
   │      }                                                          │
   └─────────────────────────────────────────────────────────────────┘
 
@@ -98,13 +99,17 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
 
   ┌─────────────────────────────────────────────────────────────────┐
   │ gcDeadSessionBucketRef (mprof.go, 站点归属)                      │
-  │   bucket unsafe.Pointer  // *bucket 指针，标识分配站点            │
-  │   frees  uintptr         // 本周期该桶释放次数                    │
-  │   bytes  uintptr         // 本周期该桶释放字节数                  │
-  │   typeName string        // 类型名称，如 "[]uint8"、"*main.ListNode" (v5) │
+  │   bucket       unsafe.Pointer // *bucket 指针，标识分配站点       │
+  │   frees        uintptr        // 本周期计数（释放/分配次数）      │
+  │   bytes        uintptr        // 本周期计数（释放/分配字节数）    │
+  │   cumFrees     uintptr        // (v6) 累计释放数，用于 net alive  │
+  │   cumFreeBytes uintptr        // (v6) 累计释放字节数              │
+  │   typeName     string         // 类型名称 (v5)                    │
   │                                                                 │
   │   gcDeadRecordFree 中通过 bucket 指针匹配，O(8) 线性探测          │
-  │   每 GC 周期结束后清零 per-cycle 计数，保留 bucket 指针            │
+  │   allocBucketRefs 也使用同结构，cumFrees 由 gcDeadRecordFree      │
+  │   在释放时通过 bucket 指针匹配后累加 (v6)。                       │
+  │   每 GC 周期结束后清零 per-cycle 计数，保留 cumFrees 和指针。     │
   └─────────────────────────────────────────────────────────────────┘
 
   ┌─────────────────────────────────────────────────────────────────┐
@@ -207,15 +212,7 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
 
   签名: func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type)
 
-  在 mProf_Malloc 中新增两条记录路径：
-
-  路径 A — bucket 级会话标记 (v2/v3 兼容):
-    ┌──────────────────────────────────────────────────────────────┐
-    │ if gp.gcDeadSessionActive {                                   │
-    │     atomic.Xadduintptr(&mr.gcDeadSessionAllocs, 1)            │
-    │     atomic.Xadduintptr(&mr.gcDeadSessionAllocBytes, size)     │
-    │ }                                                             │
-    └──────────────────────────────────────────────────────────────┘
+  在 mProf_Malloc 中新增记录路径（v6 移除了 bucket 级启发式标记路径 A）：
 
   路径 B — per-session 对象标记 + 类型解析 (v4/v5):
     ┌──────────────────────────────────────────────────────────────┐
@@ -250,12 +247,15 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
     │ }                                                             │
     └──────────────────────────────────────────────────────────────┘
 
+  v6 变更：路径 A（bucket 级会话标记）已被移除。所有 session 数据的
+  freed 和 alive 计数完全从会话表(gcDeadSessionTable)汇总。详见第 13 节。
+
   关键区别：
-    - 路径 A 在 bucket 上递增，用于按分配站点的 freed/alive 报告
-    - 路径 B 在每个对象上挂载 special，当对象被 GC 释放时，
+    - v4/v5 每个对象上挂载 special，当对象被 GC 释放时，
       freeSpecial 回调 gcDeadRecordFree(ss.sessionID, size, b, typ)，
       精确地将释放归属于对应的会话
     - v5: typ 参数使 special 保存类型信息，释放时能回写 typeName
+    - v6: 不再有 bucket 级 AllocBytes > 0 启发式判断
 
 
 6. 释放时采集 — gcDeadRecordFree (v4)
@@ -282,17 +282,30 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
 
         // 跟踪每(会话, 桶)释放数，用于站点级 session 归属 (v4)
         if b != nil {
+            bp := unsafe.Pointer(b)
             for j := range e.bucketRefs {
                 if e.bucketRefs[j].bucket == bp {
                     atomic.Xadduintptr(&e.bucketRefs[j].frees, 1)
                     atomic.Xadduintptr(&e.bucketRefs[j].bytes, size)
-                    return  // typeName 已存在，无需重复写入
+                    goto updateAllocCumFrees  // v6: 继续更新 alloc 累计
                 }
             }
             // 新 bucket 插入空槽或 LRU 替换第一个
             e.bucketRefs[slot] = {bucket: bp, frees:1, bytes:size, typeName: tn}
+
+        updateAllocCumFrees:  // v6 新增：同时更新 allocBucketRefs.cumFrees
+            for j := range e.allocBucketRefs {
+                if e.allocBucketRefs[j].bucket == bp {
+                    atomic.Xadduintptr(&e.allocBucketRefs[j].cumFrees, 1)
+                    atomic.Xadduintptr(&e.allocBucketRefs[j].cumFreeBytes, size)
+                    break
+                }
+            }
         }
     }
+
+  v6 新增 updateAllocCumFrees：释放时同时追踪 allocBucketRefs 的累计释放数，
+  使得 alive 站点级计数能准确计算 net alive = allocs - cumFrees。
 
   设计要点：
     - 通过 sessionID % gcDeadMaxSessions 定位表项，O(1) 时间
@@ -316,16 +329,18 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
   七阶段流水线：
 
   Phase 1 — 收集 bucket 级原始数据（用于站点报告）
-    遍历 mbuckets 链表，读取并清零 gcDeadFrees/gcDeadSessionFrees 等
-    累积每个分配站点的 freed/alive 计数。合并相同 PC 元组的原始条目。
-    重用已有 raw 条目时清空上一周期的 sessionRefs/aliveSessionRefs，
-    防止陈旧数据残留。
+    遍历 mbuckets 链表，读取并清零 gcDeadFrees/gcDeadFreeBytes。
+    (v6: 不再读取 bucket 级会话计数器 gcDeadSession*。session 的 freed/alive
+    数据完全由 session 表提供，在 Phase 2 累加 totalSessionFrees/Alive。)
+    合并相同 PC 元组的原始条目。
 
   Phase 1.5 — 交叉引用 session bucketRefs 与 raw 条目（freed 站点归属）
     遍历 gcDeadSessionTable，对每个活跃条目的 bucketRefs：
       - 提取 bucket 的调用栈 PC
       - 在 raw 条目中按 PC 元组匹配
       - 匹配成功 → 将 (sessionID, objs, bytes, typeName) 写入 raw[].sessionRefs
+      - v6: 匹配失败且 rawCount 未超限 → 自动创建新的 raw 条目（因为 session bucket
+        可能没有非 session 的 gcDeadFrees，之前的 Phase 1 不会为其创建 raw 条目）
 
     设计要点：
       - 每个 raw 条目最多挂载 4 个 session 归属 (gcDeadSessionRefSlots)
@@ -341,23 +356,27 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
     遍历 gcDeadSessionTable，对每个活跃条目的 allocBucketRefs：
       - 提取 bucket 的调用栈 PC（过滤 runtime 帧）
       - 在 raw 条目中按 PC 元组匹配
-      - 匹配成功 → 将 (sessionID, objs, bytes, typeName) 写入 raw[].aliveSessionRefs
+      - v6: alive 计数 = br.frees - br.cumFrees (net alive = 分配 - 累计释放)
+            为 0 时跳过，不添加到 aliveSessionRefs
+      - 匹配成功 → 将 (sessionID, netAlive, netAliveBytes, typeName) 写入 raw[].aliveSessionRefs
 
     设计要点：
       - 与 Phase 1.5 对称但方向不同（分配时采集 vs 释放时采集）
-      - allocBucketRefs 中的 frees 计数实际表示"本周期分配到该桶的分配次数"
-      - aliveSessionRefs 输出为 [session #N: X objs, Y bytes @typeName] 格式
+      - v6: 使用 cumFrees 计算 net alive，避免已释放的对象出现在 alive 输出中
       - 同样有 4 路 slot 限制 (gcDeadSessionRefSlots)
+      - v6: 匹配失败时自动创建 raw 条目
 
     Phase 1.6 结束后清理 allocBucketRefs per-cycle 计数。
 
-  Phase 2 — 读取 per-session 表（v4 新增）
+  Phase 2 — 读取 per-session 表（v4 新增，v6 同时汇总 totalSessionFrees/Alive）
     遍历 gcDeadSessionTable：
       - 对每个活跃条目 (id != 0)：
         - 读取 allocs, allocBytes (per-cycle)
         - 读取 frees, freeBytes (per-cycle)
         - 计算 alive = cumAllocs - cumFrees (累计)
           aliveBytes = cumAllocBytes - cumFreeBytes
+        - v6: 累加 totalSessionFrees += frees, totalSessionBytes += freeBytes
+              totalSessionAlive += alive, totalSessionAliveBytes += aliveBytes
         - 检查 printed 标志 (v5)：若 allocs==0 且
           (alive==0 || printed==1) → 跳过（无新活动，不重复输出）
         - 若任何计数 > 0 → 输出 per-session 分解行，设 printed=1
@@ -374,19 +393,20 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
 
   Phase 3 — 符号化（PC → 函数名/文件/行号）
     按分配站点维度合并并符号化，合并时合并 sessionRefs/aliveSessionRefs（去重 sessionID）
+    (v6: 不再使用 sessionFrees/sessionBytes 等字段)
 
   Phase 4 — 排序
     按 bytes 降序
 
-  Phase 5 — 格式化输出 (v5: 新增 @type 注解 + alive 站点 session 归属)
+  Phase 5 — 格式化输出 (v6: freed/alive 计数从 sessionRefs/aliveSessionRefs 计算)
     gcdeadsession:freed: N session objs (M bytes) freed from K sites
       funcName (file:line): N session objs, M session bytes [session #N: X objs, Y bytes @typeName]
       funcName (file:line): N session objs, M session bytes [session #N: X objs, Y bytes @typeName]
-                                                      ↑ 每行末尾显示每会话归属 + 类型注解
+                                                      ↑ v6: 站点 freed = sessionRefs[].objs 之和
     gcdeadsession:alive: N session objs (M bytes) still alive from K sites
       funcName (file:line): N session objs, M session bytes [session #N: X objs, Y bytes @typeName]
       funcName (file:line): N session objs, M session bytes [session #N: X objs, Y bytes @typeName]
-                                                      ↑ v5: alive 站点也显示 session 归属 + 类型
+                                                      ↑ v6: 站点 alive = aliveSessionRefs[].objs 之和
 
     类型注解格式：
       在每会话归属的 "]" 之前添加 "@" + typeName
@@ -458,15 +478,18 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
   分配时：
     Session A goroutine (gid=7) 分配 []byte{256}:
       → mProf_Malloc: 找到 bucket X (size=256, stack=...)
-      → bucket.gcDeadSessionAllocs++ (用于站点报告)
       → gcDeadSessionTable[1].allocs++ (per-session)
       → addspecial: 挂载 special{sessionID: 1}
+      → allocBucketRefs: 记录分配站点
 
     Session B goroutine (gid=8) 分配 []byte{256}:
       → mProf_Malloc: 找到 SAME bucket X (相同 size+stack)
-      → bucket.gcDeadSessionAllocs++ (站点报告会合并)
       → gcDeadSessionTable[2].allocs++ (per-session, 不同条目)
       → addspecial: 挂载 special{sessionID: 2}
+      → allocBucketRefs: 记录分配站点
+
+    (v6: 不再有 bucket.gcDeadSessionAllocs++，
+    所有 session 数据完全通过会话表统计。)
 
   释放时（GC sweep）：
     Session A 的对象被释放:
@@ -487,6 +510,8 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
   精度对比：
     - v2/v3 (bucket 级): 会话与非会话共享同一 bucket → 过计
     - v4 (per-session special): 每个对象带有 sessionID → 精确
+    - v6: 移除 bucket 级启发式 gcDeadSessionAllocBytes > 0 判断，完全依赖 special，
+          彻底消除同 bucket 非 session 分配的误计
 
 
 10. 会话存活对象追踪 (v3/v4)
@@ -536,7 +561,7 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
     当 hash 冲突时，新 session 覆盖 id/init 字段
     gcDeadRecordFree 检查 e.id == sessionID → 旧 specials 的回调被安全忽略
 
-  最大并发: 64 (gcDeadMaxSessions)
+  最大并发: 4096 (gcDeadMaxSessions)
   Per-session 站点追踪上限: 8 (gcDeadPerSessionSites)，超过时 LRU 替换
 
 
@@ -559,6 +584,148 @@ v5: 新增类型注解 @type、会话起止位置 [start/end]、存活对象会�
   src/runtime/create_file_nounix.go  — 其他平台 (no-op)
   src/runtime/testdata/testprog/gc.go — 测试程序 (GCDeadTraceMultiSession 等)
   src/runtime/gc_test.go            — 测试函数 (TestGcDeadTraceMultiSession 等)
+
+
+13. Bucket 级启发式修复（v6）
+================================
+
+13.1 问题背景
+  在 5G 核心网 SMF 产品测试中发现：gcdeadsession:freed 总数（1,052,552）
+  远大于 per-session freed 之和（~204,531），差值约 848K（80%）。
+
+13.2 根因分析
+  mProf_Free 使用 bucket 级永久标记来判断对象是否为 session 分配：
+
+    func mProf_Free(b *bucket, size uintptr) {
+        ...
+        if mp.gcDeadSessionAllocBytes > 0 {    // ← 一旦>0，永不清零
+            atomic.Xadduintptr(&mp.gcDeadSessionFrees, 1)
+        }
+    }
+
+  gcDeadSessionAllocBytes 在 mProf_Malloc 中设置，只增不减。一旦某个 bucket
+  有过 session 分配，该 bucket 的所有后续释放（不论是否由 session goroutine
+  产生）都被计入 gcdeadsession:freed 总数。
+
+  对比：per-session 分解靠的是 special — 只有挂了 _KindSpecialGcDeadSession
+  的对象才会触发 gcDeadRecordFree，这是精确的。两者差异的来源：
+
+    Bucket "make([]byte,256)":
+      分配:
+        - 协程 A (session #1): mProf_Malloc → gcDeadSessionAllocBytes+=256
+          → mount special
+        - 协程 B (非session):   mProf_Malloc → gcDeadSessionAllocBytes 已>0
+          → 不挂 special
+      释放:
+        - 协程 A 的对象: mProf_Free 计数 + gcDeadRecordFree 计数 → 两端都计
+        - 协程 B 的对象: mProf_Free 计数, 无 gcDeadRecordFree → 仅 bucket 级计数
+                                                                  ↑ gap
+
+13.3 修复方案
+  采用"方案 A"：完全移除 bucket 级启发式计数，所有 session 数据的 freed 和
+  alive 计数完全从 session 表（gcDeadSessionTable）汇总。具体改动：
+
+  memRecord 结构体:
+    - 删除 gcDeadSessionAllocs/gcDeadSessionAllocBytes
+    - 删除 gcDeadSessionFrees/gcDeadSessionFreeBytes
+    - 删除 gcDeadSessionCumFrees/gcDeadSessionCumFreeBytes
+
+  mProf_Free:
+    - 删除 if mp.gcDeadSessionAllocBytes > 0 { ... } 代码块
+
+  mProf_Malloc:
+    - 删除 atomic.Xadduintptr(&mr.gcDeadSessionAllocs, 1) 等 bucket 级计数
+
+  gcDeadRawEntry / gcDeadSite:
+    - 删除 sessionFrees/sessionBytes/sessionAllocs/... 字段
+
+  gcDeadTracePrint:
+    - Phase 1: 不再读取 bucket 级 session 计数器
+    - Phase 1.5/1.6: 无匹配 raw 条目时自动创建
+    - Phase 2: 从 session 表累加 totalSessionFrees/Alive
+    - Phase 5: 站点 freed = sessionRefs[].objs 之和
+    - Phase 5: 站点 alive = aliveSessionRefs[].objs 之和（减去 cumFrees）
+
+  gcDeadRecordFree:
+    - 新增 allocBucketRefs.cumFrees 更新，支持 net alive 计算
+
+  gcDeadSessionBucketRef:
+    - 新增 cumFrees/cumFreeBytes 字段
+
+13.4 测试验证
+  TestGcDeadTraceBucketOvercount:
+    - 同一协程：session allocSameBucket() + 非 session allocSameBucket()
+    - 预期：freed=1 (仅 session 分配)，非 session 分配不被计入
+    - 结果：PASS
+
+  TestGcDeadTraceBucketOvercountConcurrent:
+    - 两并发 session 各 allocSameBucket() + 非 session allocSameBucket()
+    - 预期：freed=2 (两 session 各 1)，非 session 分配不被计数
+    - 结果：PASS
+
+
+14. 已知限制
+=============
+
+14.1 会话表容量限制 (gcDeadMaxSessions = 4096)
+  会话表使用固定大小数组 gcDeadSessionTable[4096]，按 sessionID % 4096 索引。
+  当并发 session 数超过 4096 时，新 session 会覆盖旧 session 的表条目，
+  旧 session 后续的释放数据丢失（gcDeadRecordFree 中 e.id != sessionID
+  检查失败，提前 return）。
+
+  丢失的数据包括：
+    - per-session freed 计数（少 1）
+    - 累计 freed 计数（cumFrees 少 1）
+    - bucketRefs 站点归属缺失
+    - alive 计数偏高（alive = cumAllocs - cumFrees，cumFrees 偏小）
+  总计层面：gcdeadsession:freed 总数偏小，alive 总数偏大。
+  安全性：e.id != sessionID 严格检查保证不会误计到其他 session。
+
+  已从 64 增大至 4096（v6），大幅降低冲突概率。如果仍有冲突，可考虑
+  改用可扩容哈希表结构。
+
+14.2 Per-Session 分配站点跟踪限制 (gcDeadPerSessionSites = 256)
+  每个 session 表条目仅有 256 个 bucketRefs + 256 个 allocBucketRefs 槽位。
+  v6 从 8 增大至 256，覆盖绝大多数 session 分配场景。超过 256 个不同站点时，
+  多余站点仍会覆盖 slot 0（LRU 近似策略），但概率极低。
+
+14.3 全局站点行归属限制 (gcDeadSessionRefSlots = 16)
+  gcdeadsession:freed 和 alived 的站点行中，per-session 归属标注最多支持 16 个
+  session。超过 16 个 session 从完全相同分配站点分配时，只有前 16 个 session
+  在该站点行显示 [session #N: ...] 标注。
+  v6 从 4 增大至 16。
+
+14.4 全局总分配站点数限制 (gcDeadTraceMaxSites = 4096)
+  每次 GC 输出最多聚合 4096 个不同分配站点。超出部分被丢弃。
+  影响 freed/alive 站点级报告，但不影响 per-session 分解输出。
+
+14.5 调用栈帧深度限制 (gcDeadTraceMaxFrames = 3)
+  分配站点区分最多截取 3 帧（跳过 runtime 帧）。两个不同调用路径在
+  非 runtime 帧前 3 层相同，则视为同一站点，计数合并。
+  影响：深层调用的站点区分能力有限。
+
+14.6 Per-Session alive 站点计数精度
+  站点级 alive 使用 allocBucketRefs.frees - allocBucketRefs.cumFrees 计算。
+  由于 frees 是 per-cycle 计数，cumFrees 是累计值，跨多个 GC 周期后
+  同一 bucket 在新周期 frees=0 而 cumFrees>0，该站点不再出现在 alive
+  输出中（正确行为）。但若 allocBucketRefs 槽位被新站点覆盖，旧站点
+  cumFrees 丢失，alive 计数轻微偏高。
+
+14.7 类型名称解析精度
+  类型名在分配时通过 toRType(typ).string() 解析。匿名结构体、泛型实例化
+  等复合类型的 string() 可能返回简化描述。且类型名仅在分配时捕获，
+  后续 GC 周期不更新。
+  影响：复合类型的 @type 注解可能不够精确。
+
+14.8 运行时启用限制
+  GODEBUG=gcdeadtrace=1 需进程启动时设置，不支持运行时动态开关。
+  启用后 MemProfileRate 自动设为 1，所有 malloc 都走 profiling 路径，
+  对性能有影响。建议仅用于诊断场景，不建议生产环境长期开启。
+
+14.9 gcdeadtracefile 路径限制
+  Windows 下 gcdeadtracefile 路径通过 CreateFileA (ANSI) 打开，
+  不支持非 ASCII 字符（中文等）。建议使用英文路径。
+  仅在 Windows 平台有此限制。
 
 
 附录: GODEBUG 使用说明

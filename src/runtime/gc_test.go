@@ -436,6 +436,96 @@ func TestGcDeadTraceFullyDead(t *testing.T) {
 	}
 }
 
+func TestGcDeadTraceBucketOvercount(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceBucketOvercount", "GODEBUG=gcdeadtrace=1")
+
+	// Should contain gcdeadsession output.
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	hasOK := false
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.HasPrefix(l, "gcdeadsession:freed:") {
+			t.Logf("freed line: %s", l)
+
+			// The freed line format: "gcdeadsession:freed: N session objs (M bytes) freed from K sites"
+			// Only 1 session object (256 bytes) should be freed. The non-session
+			// allocation from the same bucket must NOT be counted.
+			parts := strings.Split(l, " ")
+			if len(parts) >= 4 {
+				freedCount := strings.TrimSpace(parts[1])
+				if freedCount != "1" {
+					t.Errorf("expected exactly 1 session freed object, got %s (non-session alloc from same bucket was incorrectly counted)", freedCount)
+				}
+			}
+			if !strings.Contains(l, "256 bytes") {
+				t.Errorf("expected 256 bytes in freed line, got: %s", l)
+			}
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+
+	// Also verify no "2 session objs" anywhere — the non-session alloc
+	// from the same bucket should not inflate the count.
+	if strings.Contains(got, "2 session objs") {
+		t.Errorf("non-session allocation from same bucket was incorrectly counted as session freed")
+	}
+}
+
+func TestGcDeadTraceBucketOvercountConcurrent(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceBucketOvercountConcurrent", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	hasOK := false
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.HasPrefix(l, "gcdeadsession:freed:") {
+			t.Logf("freed line: %s", l)
+
+			// Two concurrent session goroutines each free 1 × 256B.
+			// Non-session alloc from same bucket = not counted.
+			parts := strings.Split(l, " ")
+			if len(parts) >= 4 {
+				freedCount := strings.TrimSpace(parts[1])
+				if freedCount != "2" {
+					t.Errorf("expected exactly 2 session freed objects (one per session), got %s (non-session alloc was incorrectly counted)", freedCount)
+				}
+			}
+			if !strings.Contains(l, "512 bytes") {
+				t.Errorf("expected 512 bytes in freed line, got: %s", l)
+			}
+		}
+		if strings.HasPrefix(l, "gcdeadsession:alive:") {
+			t.Logf("alive line: %s", l)
+			// One session goroutine A keeps 256B alive.
+			if !strings.Contains(l, "1 session objs") {
+				t.Errorf("expected 1 alive session obj, got: %s", l)
+			}
+			if !strings.Contains(l, "256 bytes") {
+				t.Errorf("expected 256 bytes alive, got: %s", l)
+			}
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+}
+
 func TestGCTestMoveStackOnNextCall(t *testing.T) {
 	if asan.Enabled {
 		t.Skip("extra allocations with -asan causes this to fail; see #70079")

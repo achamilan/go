@@ -31,6 +31,8 @@ func init() {
 	register("GCDeadTraceSession", GCDeadTraceSession)
 	register("GCDeadTraceFullyDead", GCDeadTraceFullyDead)
 	register("GCDeadTraceMultiSession", GCDeadTraceMultiSession)
+	register("GCDeadTraceBucketOvercount", GCDeadTraceBucketOvercount)
+	register("GCDeadTraceBucketOvercountConcurrent", GCDeadTraceBucketOvercountConcurrent)
 }
 
 func GCSys() {
@@ -337,6 +339,11 @@ var (
 	gcDeadMultiA2 []byte // session A alloc, stays alive
 	gcDeadMultiB1 []byte // session B alloc, will die
 	gcDeadMultiB2 []byte // session B alloc, stays alive
+
+	// gcDeadBucketOvercountConcurrent sinks for GCDeadTraceBucketOvercountConcurrent test.
+	gcDeadConcSessA1 []byte // session A alloc, will die (same bucket as non-session)
+	gcDeadConcSessA2 []byte // session A alloc, stays alive
+	gcDeadConcSessB1 []byte // session B alloc, will die (same bucket as non-session)
 )
 
 func GCDeadTrace() {
@@ -626,6 +633,109 @@ func GCDeadTraceFullyDead() {
 
 	// Drop the last overwritten local reference → remaining all-dead objects die.
 	fullyDeadTemp = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// go:noinline ensures allocSameBucket uses same bucket (same call stack + size).
+//
+//go:noinline
+func allocSameBucket() []byte {
+	return make([]byte, 256)
+}
+
+// GCDeadTraceBucketOvercount verifies that a non-session allocation at the
+// same call site as a session allocation is NOT counted as a session freed object.
+//
+// Test layout:
+//  1. Goroutine A: start session → allocSameBucket() [will die] → end session
+//  2. Same goroutine A: allocSameBucket() [will die, NOT in session] → same bucket!
+//  3. Nil the dying references
+//  4. GC
+//  5. Print "OK"
+//
+// Expected: gcdeadsession:freed shows 1 session obj (256 bytes), not 2.
+// The non-session allocSameBucket at the same call site should not be counted.
+func GCDeadTraceBucketOvercount() {
+	runtime.MemProfileRate = 1
+
+	// Step 1: Session goroutine allocates 256B that will die.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		deadSink = allocSameBucket() // session alloc, 256B, will die
+		runtime.GcDeadSessionEnd()
+	}()
+	wg.Wait()
+
+	// Step 2: Same goroutine (main) allocates from the same call site,
+	// but NOT in a session. This should NOT be counted as session freed.
+	deadSink = allocSameBucket() // non-session alloc, same bucket, will die
+
+	// Step 3: Nil the dying reference.
+	deadSink = nil
+
+	// Step 4: Force GC.
+	runtime.GC()
+
+	// Step 5: Done.
+	fmt.Println("OK")
+}
+
+// GCDeadTraceBucketOvercountConcurrent verifies same-bucket overcounting in a
+// concurrent session scenario. Two concurrent session goroutines allocate from
+// the same call site (allocSameBucket), plus a non-session allocation from the
+// same call site. The non-session alloc must not be counted as session freed.
+//
+// Goroutine A: session → allocSameBucket() [will die] → alloc256() [stays alive]
+// Goroutine B: session → allocSameBucket() [will die]
+// Main goroutine: allocSameBucket() [non-session, same bucket, will die]
+//
+// Expected: gcdeadsession:freed = 2 session objs (512 bytes) — NOT 3.
+// gcdeadsession:alive = 1 session obj (256 bytes).
+//
+//go:noinline
+func alloc256Live() []byte {
+	return make([]byte, 256)
+}
+
+func GCDeadTraceBucketOvercountConcurrent() {
+	runtime.MemProfileRate = 1
+
+	var wg sync.WaitGroup
+
+	// Goroutine A: session with one dying and one alive alloc.
+	// allocSameBucket() shares the bucket with non-session alloc.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		gcDeadConcSessA1 = allocSameBucket()  // 256B, will die
+		gcDeadConcSessA2 = alloc256Live()     // 256B, stays alive
+		runtime.GcDeadSessionEnd()
+	}()
+
+	// Goroutine B: session with one dying alloc at the same bucket.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart()
+		gcDeadConcSessB1 = allocSameBucket()  // 256B, will die
+		runtime.GcDeadSessionEnd()
+	}()
+
+	wg.Wait()
+
+	// Non-session alloc at the same bucket — should NOT be session-freed.
+	deadSink = allocSameBucket() // 256B, non-session, will die
+
+	// Nil all dying references.
+	gcDeadConcSessA1 = nil
+	gcDeadConcSessB1 = nil
+	deadSink = nil
 
 	runtime.GC()
 	fmt.Println("OK")

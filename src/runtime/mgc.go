@@ -586,6 +586,13 @@ func GC() {
 	mp := acquirem()
 	cycle := work.cycles.Load()
 	if cycle == n+1 || (gcphase == _GCmark && cycle == n+2) {
+		// gcDeadTracePrint must run after sweeping completes so that
+		// all profile specials have been freed (mProf_Free called).
+		// It runs on the calling goroutine to ensure output is produced
+		// before runtime.GC() returns (avoids process-exit race).
+		if debug.gcdeadtrace > 0 {
+			gcDeadTracePrint()
+		}
 		mProf_PostSweep()
 	}
 	releasem(mp)
@@ -1615,10 +1622,6 @@ func gcMarkTermination(stw worldStop) {
 		cn := max(int64(cq)-int64(ce), 0)
 
 		println("checkfinalizers: queue:", fn, "finalizers +", cn, "cleanups")
-	}
-
-	if debug.gcdeadtrace > 0 {
-		gcDeadTracePrint()
 	}
 
 	// Set any arena chunks that were deferred to fault.

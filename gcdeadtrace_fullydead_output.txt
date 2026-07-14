@@ -1,0 +1,10 @@
+gcdeadsession by session:
+  session #1 (gid=1): 13 allocs (2752 bytes), 11 freed (1472 bytes), 2 alive (1280 bytes) [start: D:/code/go/go/src/runtime/testdata/testprog/gc.go:608, end: D:/code/go/go/src/runtime/testdata/testprog/gc.go:635]
+gcdeadsession:freed: 11 session objs (1472 bytes) freed from 3 sites
+  main.makeMixed256 (D:/code/go/go/src/runtime/testdata/testprog/gc.go:592) < main.GCDeadTraceFullyDead (D:/code/go/go/src/runtime/testdata/testprog/gc.go:622) < main.main (D:/code/go/go/src/runtime/testdata/testprog/main.go:34): 3 session objs, 768 session bytes [session #1: 3 objs, 768 bytes @uint8]
+  main.makeFullyDead128 (D:/code/go/go/src/runtime/testdata/testprog/gc.go:587) < main.GCDeadTraceFullyDead (D:/code/go/go/src/runtime/testdata/testprog/gc.go:617) < main.main (D:/code/go/go/src/runtime/testdata/testprog/main.go:34): 3 session objs, 384 session bytes [session #1: 3 objs, 384 bytes @uint8]
+  main.makeFullyDead64 (D:/code/go/go/src/runtime/testdata/testprog/gc.go:582) < main.GCDeadTraceFullyDead (D:/code/go/go/src/runtime/testdata/testprog/gc.go:612) < main.main (D:/code/go/go/src/runtime/testdata/testprog/main.go:34): 5 session objs, 320 session bytes [session #1: 5 objs, 320 bytes @uint8]
+gcdeadsession:alive: 2 session objs (1280 bytes) still alive from 2 sites
+  main.makeMixed256 (D:/code/go/go/src/runtime/testdata/testprog/gc.go:592) < main.GCDeadTraceFullyDead (D:/code/go/go/src/runtime/testdata/testprog/gc.go:622) < main.main (D:/code/go/go/src/runtime/testdata/testprog/main.go:34): 1 session objs, 256 session bytes [session #1: 1 objs, 256 bytes @uint8]
+  main.makeAllAlive1024 (D:/code/go/go/src/runtime/testdata/testprog/gc.go:597) < main.GCDeadTraceFullyDead (D:/code/go/go/src/runtime/testdata/testprog/gc.go:630) < main.main (D:/code/go/go/src/runtime/testdata/testprog/main.go:34): 1 session objs, 1024 session bytes [session #1: 1 objs, 1024 bytes @uint8]
+OK
