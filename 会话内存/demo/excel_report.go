@@ -529,42 +529,55 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		a.AliveBytes += si.TotalBytes
 		a.Funcs[si.Func] = true
 	}
-	// Both freed & alive
+	// Both freed & alive — sorted by Freed Bytes desc
 	var bothLines []string
-	for loc, fa := range freedByLine {
-		if aa, ok := aliveByLine[loc]; ok {
+	for loc := range freedByLine {
+		if _, ok := aliveByLine[loc]; ok {
 			bothLines = append(bothLines, loc)
-			funcs := make([]string, 0, len(fa.Funcs))
-			for f := range fa.Funcs { funcs = append(funcs, f) }
-			for f := range aa.Funcs { funcs = append(funcs, f) }
-			sort.Strings(funcs)
-			fnStr := strings.Join(funcs, "; ")
-			if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
-			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-				fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes), fnStr)
 		}
+	}
+	sort.Slice(bothLines, func(i, j int) bool {
+		return freedByLine[bothLines[i]].FreedBytes > freedByLine[bothLines[j]].FreedBytes
+	})
+	for _, loc := range bothLines {
+		fa := freedByLine[loc]
+		aa := aliveByLine[loc]
+		funcs := make([]string, 0, len(fa.Funcs))
+		for f := range fa.Funcs { funcs = append(funcs, f) }
+		for f := range aa.Funcs { funcs = append(funcs, f) }
+		sort.Strings(funcs)
+		fnStr := strings.Join(funcs, "; ")
+		if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
+		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes), fnStr)
 	}
 	if len(bothLines) == 0 {
 		s.addRow("(none)")
 	}
 
-	// Freed only
+	// Freed only — sorted by Freed Bytes desc
 	s.addBlank()
 	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
 	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Functions")
-	var freedOnly int
-	for loc, fa := range freedByLine {
+	var onlyLines []string
+	for loc := range freedByLine {
 		if _, ok := aliveByLine[loc]; !ok {
-			freedOnly++
-			funcs := make([]string, 0, len(fa.Funcs))
-			for f := range fa.Funcs { funcs = append(funcs, f) }
-			sort.Strings(funcs)
-			fnStr := strings.Join(funcs, "; ")
-			if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
-			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes), fnStr)
+			onlyLines = append(onlyLines, loc)
 		}
 	}
-	if freedOnly == 0 {
+	sort.Slice(onlyLines, func(i, j int) bool {
+		return freedByLine[onlyLines[i]].FreedBytes > freedByLine[onlyLines[j]].FreedBytes
+	})
+	for _, loc := range onlyLines {
+		fa := freedByLine[loc]
+		funcs := make([]string, 0, len(fa.Funcs))
+		for f := range fa.Funcs { funcs = append(funcs, f) }
+		sort.Strings(funcs)
+		fnStr := strings.Join(funcs, "; ")
+		if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
+		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes), fnStr)
+	}
+	if len(onlyLines) == 0 {
 		s.addRow("(none)")
 	}
 
