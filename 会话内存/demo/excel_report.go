@@ -8,7 +8,7 @@
 //   excel_report.exe [file1.txt file2.txt ...]
 //
 //   If no arguments are given, scans the current directory and output/
-//   subdirectory for gcdeadtrace_*.txt files automatically.
+//   subdirectory for gcdeadtrace_*.txt / gcdeadtrace_*.log files automatically.
 //   Otherwise, processes the specified files in the given order.
 //   Each file becomes one sheet (named by its filename without .txt prefix).
 //
@@ -91,8 +91,9 @@ func parseInt(s string) int {
 func parseFile(path string) *ParsedData {
 	f, _ := os.Open(path)
 	defer f.Close()
-	mode := strings.TrimSuffix(filepath.Base(path), ".txt")
-	mode = strings.TrimPrefix(mode, "gcdeadtrace_demo_")
+	base := strings.TrimSuffix(filepath.Base(path), ".log")
+	base = strings.TrimSuffix(base, ".txt")
+	mode := strings.TrimPrefix(base, "gcdeadtrace_demo_")
 	data := &ParsedData{Mode: mode}
 	scanner := bufio.NewScanner(f)
 	var lines []string
@@ -472,7 +473,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			// Extract the first (file:line) from the call stack = actual alloc point.
 			// For simple stacks (no call chain), fall back to si.Loc.
 			loc := firstFileLine(si.Func, si.Loc)
-			s.addRow(si.Func, shortLoc(loc), fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
+			s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
 		}
 	}
 	freedMap := make(map[string]*siteInfo)
@@ -512,7 +513,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	freedByLine := make(map[string]*lineAgg)
 	aliveByLine := make(map[string]*lineAgg)
 	for _, si := range freedMap {
-		loc := shortLoc(firstFileLine(si.Func, si.Loc))
+		loc := firstFileLine(si.Func, si.Loc)
 		if loc == "" { continue }
 		a, ok := freedByLine[loc]
 		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; freedByLine[loc] = a }
@@ -521,7 +522,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		a.Funcs[si.Func] = true
 	}
 	for _, si := range aliveMap {
-		loc := shortLoc(firstFileLine(si.Func, si.Loc))
+		loc := firstFileLine(si.Func, si.Loc)
 		if loc == "" { continue }
 		a, ok := aliveByLine[loc]
 		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; aliveByLine[loc] = a }
@@ -653,17 +654,19 @@ func main() {
 	if len(os.Args) > 1 {
 		inputFiles = os.Args[1:]
 	} else {
-		// Scan current dir + output/ subdir for gcdeadtrace_*.txt
+		// Scan current dir + output/ subdir for gcdeadtrace_*.txt / *.log
 		for _, dir := range []string{".", "output"} {
-			pattern := filepath.Join(dir, "gcdeadtrace_*.txt")
-			matches, err := filepath.Glob(pattern)
-			if err == nil {
-				inputFiles = append(inputFiles, matches...)
+			for _, ext := range []string{"gcdeadtrace_*.txt", "gcdeadtrace_*.log"} {
+				pattern := filepath.Join(dir, ext)
+				matches, err := filepath.Glob(pattern)
+				if err == nil {
+					inputFiles = append(inputFiles, matches...)
+				}
 			}
 		}
 		inputFiles = unique(inputFiles)
 		if len(inputFiles) == 0 {
-			fmt.Println("  No gcdeadtrace_*.txt files found in ./ or output/")
+			fmt.Println("  No gcdeadtrace_*.txt / gcdeadtrace_*.log files found in ./ or output/")
 			os.Exit(1)
 		}
 	}
@@ -674,8 +677,9 @@ func main() {
 			fmt.Printf("  [SKIP] file not found: %s\n", inPath)
 			continue
 		}
-		// Use filename (without extension) as sheet label
-		label := strings.TrimSuffix(filepath.Base(inPath), ".txt")
+		// Use filename (without .txt/.log extension) as sheet label
+		label := strings.TrimSuffix(filepath.Base(inPath), ".log")
+		label = strings.TrimSuffix(label, ".txt")
 		fmt.Printf("  Parsing %s ... ", label)
 		data := parseFile(inPath)
 		allData = append(allData, data)
