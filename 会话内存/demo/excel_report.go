@@ -647,7 +647,59 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 	s := &xlsxSheet{name: name, colWidths: make([]float64, 20)}
 	gcs := data.GCCycles
 
-	// Gather completed sessions (start && end present)
+	// Identify completed session IDs (sessions with both Start and End in any GC cycle)
+	compIDs := make(map[int]bool)
+	for _, gc := range gcs {
+		for _, se := range gc.Sessions {
+			if se.Start != "" && se.End != "" {
+				compIDs[se.ID] = true
+			}
+		}
+	}
+
+	if len(compIDs) == 0 {
+		s.addRow("Mode:", data.Mode+" (completed sessions only)")
+		s.addRow("Completed Sessions: 0")
+		return s
+	}
+
+	// Helper: filter a site slice to only include refs referencing completed sessions
+	filterSites := func(sites []SiteLine) []SiteLine {
+		var out []SiteLine
+		for _, st := range sites {
+			for id := range compIDs {
+				if strings.Contains(st.Refs, fmt.Sprintf("session #%d", id)) {
+					out = append(out, st)
+					break
+				}
+			}
+		}
+		return out
+	}
+
+	// Build filtered GC blocks (only completed sessions + their sites)
+	type simpleGC struct {
+		GC    int
+		Sessions []SessionEntry
+		FreedSites, AliveSites []SiteLine
+	}
+	var filtGCs []simpleGC
+	for _, gc := range gcs {
+		var compSess []SessionEntry
+		for _, se := range gc.Sessions {
+			if compIDs[se.ID] {
+				compSess = append(compSess, se)
+			}
+		}
+		if len(compSess) == 0 { continue }
+		filtGCs = append(filtGCs, simpleGC{
+			GC: gc.GC, Sessions: compSess,
+			FreedSites: filterSites(gc.FreedSites),
+			AliveSites: filterSites(gc.AliveSites),
+		})
+	}
+
+	// ── Stats & session detail ──
 	type sessInfo struct {
 		ID, GID                      int
 		GCs                          []int
@@ -656,23 +708,21 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 		MaxAlive, MaxAliveBytes      int
 	}
 	compMap := make(map[int]*sessInfo)
-	totalFreedObjs, totalFreedBytes := 0, 0
-	for _, gc := range gcs {
-		for _, se := range gc.Sessions {
-			if se.Start == "" || se.End == "" { continue }
+	for _, fg := range filtGCs {
+		for _, se := range fg.Sessions {
 			si, ok := compMap[se.ID]
 			if !ok {
 				si = &sessInfo{ID: se.ID, GID: se.GID, Start: se.Start, End: se.End}
 				compMap[se.ID] = si
 			}
-			si.GCs = append(si.GCs, gc.GC)
+			si.GCs = append(si.GCs, fg.GC)
 			si.CumAllocs += se.Allocs
 			si.CumFrees += se.Frees
 			si.CumFreeBytes += se.FreeBytes
 			if se.Alive > si.MaxAlive { si.MaxAlive = se.Alive; si.MaxAliveBytes = se.AliveBytes }
 		}
 	}
-	// Compute totals from completed session data
+	totalFreedObjs, totalFreedBytes := 0, 0
 	for _, si := range compMap {
 		totalFreedObjs += si.CumFrees
 		totalFreedBytes += si.CumFreeBytes
@@ -684,7 +734,21 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 	s.addRow("Total Freed Bytes:", fmt.Sprintf("%d (%.2f MB)", totalFreedBytes, float64(totalFreedBytes)/1024/1024))
 	s.addBlank()
 
-	// Session detail
+	// Per-GC Summary
+	s.addHeaderRow("GC", "Sessions", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes")
+	for _, fg := range filtGCs {
+		fO, fB, aO, aB := 0, 0, 0, 0
+		for _, se := range fg.Sessions {
+			fO += se.Frees; fB += se.FreeBytes
+			aO += se.Alive; aB += se.AliveBytes
+		}
+		s.addRow(fmt.Sprint(fg.GC), fmt.Sprint(len(fg.Sessions)),
+			fmt.Sprint(fO), fmt.Sprint(fB),
+			fmt.Sprint(aO), fmt.Sprint(aB))
+	}
+	s.addBlank()
+
+	// Session Detail
 	s.addHeaderRow("Session", "GID", "GCs", "Start", "End", "Total Allocs", "Total Frees", "Max Alive")
 	var sorted []int
 	for id := range compMap { sorted = append(sorted, id) }
@@ -698,6 +762,147 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 			shortLoc(si.Start), shortLoc(si.End),
 			fmt.Sprint(si.CumAllocs), fmt.Sprint(si.CumFrees), fmt.Sprint(si.MaxAlive))
 	}
+
+	// ── Freed Sites ──
+	type siteInfo struct {
+		Func, Loc          string
+		TotalObjs, TotalBytes int
+		Refs               map[string]bool
+	}
+	emitSites := func(siteMap map[string]*siteInfo) {
+		var sites []*siteInfo
+		tObjs, tBytes := 0, 0
+		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
+		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalObjs > sites[j].TotalObjs })
+		for _, si := range sites {
+			var refs []string
+			for r := range si.Refs { refs = append(refs, r) }
+			sort.Strings(refs)
+			refStr := strings.Join(refs, "; ")
+			if len(refStr) > 1000 { refStr = refStr[:997] + "..." }
+			loc := firstFileLine(si.Func, si.Loc)
+			s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
+		}
+		s.addRow("Total", "", fmt.Sprint(tObjs), fmt.Sprintf("%d (%.2f MB)", tBytes, float64(tBytes)/1024/1024), "")
+	}
+	s.addBlank()
+	s.addRow("=== Freed Sites ===")
+	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
+	freedMap := make(map[string]*siteInfo)
+	for _, fg := range filtGCs {
+		for _, st := range fg.FreedSites {
+			key := st.Func + "|" + st.Loc
+			si, ok := freedMap[key]
+			if !ok { si = &siteInfo{Func: st.Func, Loc: st.Loc, Refs: make(map[string]bool)}; freedMap[key] = si }
+			si.TotalObjs += st.Objs; si.TotalBytes += st.Bytes; si.Refs[st.Refs] = true
+		}
+	}
+	emitSites(freedMap)
+
+	// ── Alive Sites ──
+	s.addBlank()
+	s.addRow("=== Alive Sites ===")
+	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Alive Objs", "Alive Bytes", "Session Refs")
+	aliveMap := make(map[string]*siteInfo)
+	for _, fg := range filtGCs {
+		for _, st := range fg.AliveSites {
+			key := st.Func + "|" + st.Loc
+			si, ok := aliveMap[key]
+			if !ok { si = &siteInfo{Func: st.Func, Loc: st.Loc, Refs: make(map[string]bool)}; aliveMap[key] = si }
+			si.TotalObjs += st.Objs; si.TotalBytes += st.Bytes; si.Refs[st.Refs] = true
+		}
+	}
+	emitSites(aliveMap)
+
+	// ── Cross-reference by Alloc File:Line ──
+	type lineAgg struct {
+		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
+		Funcs                                        map[string]bool
+	}
+	freedByLine := make(map[string]*lineAgg)
+	aliveByLine := make(map[string]*lineAgg)
+	for _, si := range freedMap {
+		loc := firstFileLine(si.Func, si.Loc)
+		if loc == "" { continue }
+		a, ok := freedByLine[loc]
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; freedByLine[loc] = a }
+		a.FreedObjs += si.TotalObjs
+		a.FreedBytes += si.TotalBytes
+		a.Funcs[si.Func] = true
+	}
+	for _, si := range aliveMap {
+		loc := firstFileLine(si.Func, si.Loc)
+		if loc == "" { continue }
+		a, ok := aliveByLine[loc]
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; aliveByLine[loc] = a }
+		a.AliveObjs += si.TotalObjs
+		a.AliveBytes += si.TotalBytes
+		a.Funcs[si.Func] = true
+	}
+	// Both
+	s.addBlank()
+	s.addRow("=== Alloc File:Line in Both Freed & Alive ===")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "#Stacks", "Call Stacks")
+	var bothLines []string
+	for loc := range freedByLine {
+		if _, ok := aliveByLine[loc]; ok { bothLines = append(bothLines, loc) }
+	}
+	sort.Slice(bothLines, func(i, j int) bool {
+		return freedByLine[bothLines[i]].FreedBytes > freedByLine[bothLines[j]].FreedBytes
+	})
+	for _, loc := range bothLines {
+		fa := freedByLine[loc]; aa := aliveByLine[loc]
+		funcs := make([]string, 0, len(fa.Funcs))
+		for f := range fa.Funcs { funcs = append(funcs, f) }
+		for f := range aa.Funcs { funcs = append(funcs, f) }
+		sort.Strings(funcs)
+		fnStr := strings.Join(funcs, "; ")
+		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
+		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
+			fmt.Sprint(len(funcs)), fnStr)
+	}
+	if len(bothLines) > 0 {
+		tFO, tFB, tAO, tAB := 0, 0, 0, 0
+		for _, loc := range bothLines {
+			fa := freedByLine[loc]; aa := aliveByLine[loc]
+			tFO += fa.FreedObjs; tFB += fa.FreedBytes
+			tAO += aa.AliveObjs; tAB += aa.AliveBytes
+		}
+		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024),
+			fmt.Sprint(tAO), fmt.Sprintf("%d (%.2f MB)", tAB, float64(tAB)/1024/1024), "", "")
+	} else {
+		s.addRow("(none)")
+	}
+	// Freed Only
+	s.addBlank()
+	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
+	var onlyLines []string
+	for loc := range freedByLine {
+		if _, ok := aliveByLine[loc]; !ok { onlyLines = append(onlyLines, loc) }
+	}
+	sort.Slice(onlyLines, func(i, j int) bool {
+		return freedByLine[onlyLines[i]].FreedBytes > freedByLine[onlyLines[j]].FreedBytes
+	})
+	for _, loc := range onlyLines {
+		fa := freedByLine[loc]
+		funcs := make([]string, 0, len(fa.Funcs))
+		for f := range fa.Funcs { funcs = append(funcs, f) }
+		sort.Strings(funcs)
+		fnStr := strings.Join(funcs, "; ")
+		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
+		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+			fmt.Sprint(len(funcs)), fnStr)
+	}
+	if len(onlyLines) > 0 {
+		tFO, tFB := 0, 0
+		for _, loc := range onlyLines { fa := freedByLine[loc]; tFO += fa.FreedObjs; tFB += fa.FreedBytes }
+		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
+	} else {
+		s.addRow("(none)")
+	}
+
 	return s
 }
 
