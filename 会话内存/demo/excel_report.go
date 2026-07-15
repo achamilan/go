@@ -462,7 +462,8 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 	emitSites := func(siteMap map[string]*siteInfo, title string) {
 		var sites []*siteInfo
-		for _, si := range siteMap { sites = append(sites, si) }
+		tObjs, tBytes := 0, 0
+		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
 		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalObjs > sites[j].TotalObjs })
 		for _, si := range sites {
 			var refs []string
@@ -475,6 +476,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			loc := firstFileLine(si.Func, si.Loc)
 			s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
 		}
+		s.addRow("Total", "", fmt.Sprint(tObjs), fmt.Sprintf("%d (%.2f MB)", tBytes, float64(tBytes)/1024/1024), "")
 	}
 	freedMap := make(map[string]*siteInfo)
 	for _, gc := range gcs {
@@ -555,6 +557,17 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 	if len(bothLines) == 0 {
 		s.addRow("(none)")
+	} else {
+		// Summary row
+		tFO, tFB, tAO, tAB := 0, 0, 0, 0
+		for _, loc := range bothLines {
+			fa := freedByLine[loc]
+			aa := aliveByLine[loc]
+			tFO += fa.FreedObjs; tFB += fa.FreedBytes
+			tAO += aa.AliveObjs; tAB += aa.AliveBytes
+		}
+		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024),
+			fmt.Sprint(tAO), fmt.Sprintf("%d (%.2f MB)", tAB, float64(tAB)/1024/1024), "", "")
 	}
 
 	// Freed only — sorted by Freed Bytes desc
@@ -582,6 +595,14 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 	if len(onlyLines) == 0 {
 		s.addRow("(none)")
+	} else {
+		// Summary row
+		tFO, tFB := 0, 0
+		for _, loc := range onlyLines {
+			fa := freedByLine[loc]
+			tFO += fa.FreedObjs; tFB += fa.FreedBytes
+		}
+		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
 	}
 
 	// Reprint timeline
