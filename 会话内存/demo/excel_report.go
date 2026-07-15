@@ -642,6 +642,65 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	return s
 }
 
+func buildCompletedSheet(data *ParsedData) *xlsxSheet {
+	name := data.Mode + " (end)"
+	s := &xlsxSheet{name: name, colWidths: make([]float64, 20)}
+	gcs := data.GCCycles
+
+	// Gather completed sessions (start && end present)
+	type sessInfo struct {
+		ID, GID                      int
+		GCs                          []int
+		Start, End                   string
+		CumAllocs, CumFrees, CumFreeBytes int
+		MaxAlive, MaxAliveBytes      int
+	}
+	compMap := make(map[int]*sessInfo)
+	totalFreedObjs, totalFreedBytes := 0, 0
+	for _, gc := range gcs {
+		for _, se := range gc.Sessions {
+			if se.Start == "" || se.End == "" { continue }
+			si, ok := compMap[se.ID]
+			if !ok {
+				si = &sessInfo{ID: se.ID, GID: se.GID, Start: se.Start, End: se.End}
+				compMap[se.ID] = si
+			}
+			si.GCs = append(si.GCs, gc.GC)
+			si.CumAllocs += se.Allocs
+			si.CumFrees += se.Frees
+			si.CumFreeBytes += se.FreeBytes
+			if se.Alive > si.MaxAlive { si.MaxAlive = se.Alive; si.MaxAliveBytes = se.AliveBytes }
+		}
+	}
+	// Compute totals from completed session data
+	for _, si := range compMap {
+		totalFreedObjs += si.CumFrees
+		totalFreedBytes += si.CumFreeBytes
+	}
+
+	s.addRow("Mode:", data.Mode+" (completed sessions only)")
+	s.addRow("Completed Sessions:", fmt.Sprint(len(compMap)))
+	s.addRow("Total Freed:", fmt.Sprint(totalFreedObjs))
+	s.addRow("Total Freed Bytes:", fmt.Sprintf("%d (%.2f MB)", totalFreedBytes, float64(totalFreedBytes)/1024/1024))
+	s.addBlank()
+
+	// Session detail
+	s.addHeaderRow("Session", "GID", "GCs", "Start", "End", "Total Allocs", "Total Frees", "Max Alive")
+	var sorted []int
+	for id := range compMap { sorted = append(sorted, id) }
+	sort.Ints(sorted)
+	for _, id := range sorted {
+		si := compMap[id]
+		gcStrs := make([]string, len(si.GCs))
+		for i, g := range si.GCs { gcStrs[i] = fmt.Sprint(g) }
+		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(si.GID),
+			strings.Join(gcStrs, ","),
+			shortLoc(si.Start), shortLoc(si.End),
+			fmt.Sprint(si.CumAllocs), fmt.Sprint(si.CumFrees), fmt.Sprint(si.MaxAlive))
+	}
+	return s
+}
+
 func shortLoc(loc string) string {
 	if idx := strings.Index(loc, ":"); idx >= 0 {
 		base := filepath.Base(loc[:idx])
@@ -724,6 +783,9 @@ func main() {
 	for _, d := range allData {
 		builder.sheets = append(builder.sheets, *buildModeSheet(d))
 	}
+	for _, d := range allData {
+		builder.sheets = append(builder.sheets, *buildCompletedSheet(d))
+	}
 
 	outPath := "gcdeadtrace_report.xlsx"
 	fmt.Printf("\n  Writing %s ... ", outPath)
@@ -733,7 +795,7 @@ func main() {
 	}
 	info, _ := os.Stat(outPath)
 	fmt.Printf("done (%d bytes)\n", info.Size())
-	fmt.Printf("\n  %d file(s) → %d sheet(s)\n", len(inputFiles), len(allData)+1)
+	fmt.Printf("\n  %d file(s) → %d sheet(s)\n", len(inputFiles), len(builder.sheets))
 	fmt.Println("  Open gcdeadtrace_report.xlsx in Excel.")
 }
 
