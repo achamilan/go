@@ -511,6 +511,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	type lineAgg struct {
 		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
 		Funcs                                        map[string]bool
+		Types                                        map[string]bool
 	}
 	freedByLine := make(map[string]*lineAgg)
 	aliveByLine := make(map[string]*lineAgg)
@@ -518,10 +519,11 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		loc := firstFileLine(si.Func, si.Loc)
 		if loc == "" { continue }
 		a, ok := freedByLine[loc]
-		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; freedByLine[loc] = a }
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool), Types: make(map[string]bool)}; freedByLine[loc] = a }
 		a.FreedObjs += si.TotalObjs
 		a.FreedBytes += si.TotalBytes
 		a.Funcs[si.Func] = true
+		for _, t := range extractTypes(si.Refs) { a.Types[t] = true }
 	}
 	for _, si := range aliveMap {
 		loc := firstFileLine(si.Func, si.Loc)
@@ -573,7 +575,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	// Freed only — sorted by Freed Bytes desc
 	s.addBlank()
 	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
-	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
+	s.addHeaderRow("Alloc File:Line", "Type", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
 	var onlyLines []string
 	for loc := range freedByLine {
 		if _, ok := aliveByLine[loc]; !ok {
@@ -585,12 +587,16 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	})
 	for _, loc := range onlyLines {
 		fa := freedByLine[loc]
+		types := make([]string, 0, len(fa.Types))
+		for t := range fa.Types { types = append(types, t) }
+		sort.Strings(types)
+		typeStr := strings.Join(types, "; ")
 		funcs := make([]string, 0, len(fa.Funcs))
 		for f := range fa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
 		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
-		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+		s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
 			fmt.Sprint(len(funcs)), fnStr)
 	}
 	if len(onlyLines) == 0 {
@@ -602,7 +608,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			fa := freedByLine[loc]
 			tFO += fa.FreedObjs; tFB += fa.FreedBytes
 		}
-		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
+		s.addRow("Total", "", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
 	}
 
 	// Reprint timeline
@@ -818,6 +824,7 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 	type lineAgg struct {
 		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
 		Funcs                                        map[string]bool
+		Types                                        map[string]bool
 	}
 	freedByLine := make(map[string]*lineAgg)
 	aliveByLine := make(map[string]*lineAgg)
@@ -825,10 +832,11 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 		loc := firstFileLine(si.Func, si.Loc)
 		if loc == "" { continue }
 		a, ok := freedByLine[loc]
-		if !ok { a = &lineAgg{Funcs: make(map[string]bool)}; freedByLine[loc] = a }
+		if !ok { a = &lineAgg{Funcs: make(map[string]bool), Types: make(map[string]bool)}; freedByLine[loc] = a }
 		a.FreedObjs += si.TotalObjs
 		a.FreedBytes += si.TotalBytes
 		a.Funcs[si.Func] = true
+		for _, t := range extractTypes(si.Refs) { a.Types[t] = true }
 	}
 	for _, si := range aliveMap {
 		loc := firstFileLine(si.Func, si.Loc)
@@ -877,7 +885,7 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 	// Freed Only
 	s.addBlank()
 	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
-	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
+	s.addHeaderRow("Alloc File:Line", "Type", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
 	var onlyLines []string
 	for loc := range freedByLine {
 		if _, ok := aliveByLine[loc]; !ok { onlyLines = append(onlyLines, loc) }
@@ -887,12 +895,16 @@ func buildCompletedSheet(data *ParsedData) *xlsxSheet {
 	})
 	for _, loc := range onlyLines {
 		fa := freedByLine[loc]
+		types := make([]string, 0, len(fa.Types))
+		for t := range fa.Types { types = append(types, t) }
+		sort.Strings(types)
+		typeStr := strings.Join(types, "; ")
 		funcs := make([]string, 0, len(fa.Funcs))
 		for f := range fa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
 		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
-		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+		s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
 			fmt.Sprint(len(funcs)), fnStr)
 	}
 	if len(onlyLines) > 0 {
@@ -931,6 +943,24 @@ func firstFileLine(stack, fallback string) string {
 		return fallback
 	}
 	return stack[start : start+end]
+}
+
+// extractTypes extracts unique @type annotations from a map of ref strings.
+// Ref format: "[session #N: X objs, Y bytes @type]"
+func extractTypes(refs map[string]bool) []string {
+	seen := make(map[string]bool)
+	for r := range refs {
+		idx := strings.Index(r, "@")
+		if idx < 0 { continue }
+		t := strings.TrimRight(r[idx+1:], " ]")
+		if t != "" {
+			seen[t] = true
+		}
+	}
+	var types []string
+	for t := range seen { types = append(types, t) }
+	sort.Strings(types)
+	return types
 }
 
 // ── main ───────────────────────────────────────────────────────────
