@@ -505,7 +505,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	// Cross-reference by Alloc File:Line
 	s.addBlank()
 	s.addRow("=== Alloc File:Line in Both Freed & Alive ===")
-	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "Functions")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "#Stacks", "Call Stacks")
 	type lineAgg struct {
 		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
 		Funcs                                        map[string]bool
@@ -548,9 +548,10 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		for f := range aa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
+		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
 		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes), fnStr)
+			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
+			fmt.Sprint(len(funcs)), fnStr)
 	}
 	if len(bothLines) == 0 {
 		s.addRow("(none)")
@@ -559,7 +560,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	// Freed only — sorted by Freed Bytes desc
 	s.addBlank()
 	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
-	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Functions")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
 	var onlyLines []string
 	for loc := range freedByLine {
 		if _, ok := aliveByLine[loc]; !ok {
@@ -575,8 +576,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		for f := range fa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 200 { fnStr = fnStr[:197] + "..." }
-		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes), fnStr)
+		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
+		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+			fmt.Sprint(len(funcs)), fnStr)
 	}
 	if len(onlyLines) == 0 {
 		s.addRow("(none)")
