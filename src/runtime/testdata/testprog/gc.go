@@ -349,7 +349,7 @@ var (
 func GCDeadTrace() {
 	runtime.MemProfileRate = 1 // profile every allocation
 
-	runtime.GcDeadSessionStart()
+	runtime.GcDeadSessionStart(1)
 
 	// Allocate garbage that escapes to the heap via the global deadSink.
 	// Previous iteration's value becomes unreferenced and dies.
@@ -358,7 +358,7 @@ func GCDeadTrace() {
 	}
 	deadSink = nil // last iteration's allocation also dies
 
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(1)
 
 	live := make([]byte, 1024) // keep one allocation live
 	runtime.GC()               // force GC (sync sweep)
@@ -449,7 +449,7 @@ func makeDeadLargeBlocks() *DataBlock {
 func GCDeadTraceComplex() {
 	runtime.MemProfileRate = 1
 
-	runtime.GcDeadSessionStart()
+	runtime.GcDeadSessionStart(2)
 
 	// Phase 1: Live blocks — stored in global, will appear in gcdeadsession:alive.
 	// Same allocation function (buildBlockList), different caller.
@@ -476,7 +476,7 @@ func GCDeadTraceComplex() {
 		globalLiveCache[i] = 0xAB
 	}
 
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(2)
 
 	// Phase 6: Release dead objects.
 	deadSmall = nil
@@ -501,10 +501,10 @@ func GCDeadTraceSession() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(101)
 		gcDeadSessionSink = make([]byte, 256)  // will die
 		gcDeadAliveSink = make([]byte, 1024)   // will stay alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(101)
 	}()
 	wg.Wait()
 
@@ -545,23 +545,23 @@ func GCDeadTraceMultiSession() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(201)
 		gcDeadMultiA1 = make([]byte, 256)  // will die
 		gcDeadMultiA1 = make([]byte, 256)  // will die (overwritten)
 		gcDeadMultiA1 = make([]byte, 256)  // will die (overwritten)
 		gcDeadMultiA2 = make([]byte, 1024) // will stay alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(201)
 	}()
 
 	// Session goroutine B: 2 × 256B freed, 1 × 512B alive.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(202)
 		gcDeadMultiB1 = make([]byte, 256)  // will die
 		gcDeadMultiB1 = make([]byte, 256)  // will die (overwritten)
 		gcDeadMultiB2 = make([]byte, 512)  // will stay alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(202)
 	}()
 
 	wg.Wait()
@@ -605,7 +605,7 @@ var (
 func GCDeadTraceFullyDead() {
 	runtime.MemProfileRate = 1
 
-	runtime.GcDeadSessionStart()
+	runtime.GcDeadSessionStart(3)
 
 	// Call site A: 5 × 64B, ALL die (overwritten + nil'd before GC).
 	for i := 0; i < 5; i++ {
@@ -629,7 +629,7 @@ func GCDeadTraceFullyDead() {
 	// Call site D: 1 × 1024B, ALL survive (kept via global).
 	globalLiveCache = makeAllAlive1024()
 
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(3)
 
 	// Drop the last overwritten local reference → remaining all-dead objects die.
 	fullyDeadTemp = nil
@@ -665,9 +665,9 @@ func GCDeadTraceBucketOvercount() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(301)
 		deadSink = allocSameBucket() // session alloc, 256B, will die
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(301)
 	}()
 	wg.Wait()
 
@@ -712,19 +712,19 @@ func GCDeadTraceBucketOvercountConcurrent() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(401)
 		gcDeadConcSessA1 = allocSameBucket()  // 256B, will die
 		gcDeadConcSessA2 = alloc256Live()     // 256B, stays alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(401)
 	}()
 
 	// Goroutine B: session with one dying alloc at the same bucket.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(402)
 		gcDeadConcSessB1 = allocSameBucket()  // 256B, will die
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(402)
 	}()
 
 	wg.Wait()

@@ -354,7 +354,7 @@ func (w *WorkerActor) allocLargeBlocks(n, size int) [][]byte {
 // patternSession: TestGcDeadTraceSession-like — uses GcDeadSession tracking.
 func (w *WorkerActor) patternSession() {
 	if !w.sessionActive {
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(1001)
 		w.sessionActive = true
 	}
 
@@ -369,7 +369,7 @@ func (w *WorkerActor) patternSession() {
 	atomic.AddInt64(&w.stats.SessionBytes, 1024)
 
 	// End session — only session allocations are tracked.
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(1001)
 	w.sessionActive = false
 
 	// Non-session allocation (not in gcdeadsession output).
@@ -386,7 +386,7 @@ func (w *WorkerActor) patternSession() {
 // Flow: GC while active → GC while active (no re-print) → end → GC (re-print with end).
 func (w *WorkerActor) patternRePrint() {
 	if !w.sessionActive {
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(1002)
 		w.sessionActive = true
 	}
 
@@ -407,7 +407,7 @@ func (w *WorkerActor) patternRePrint() {
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 
 	// End session — endPC becomes set.
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(1002)
 	w.sessionActive = false
 
 	// GC 3: endPC != 0, printed=1 → re-printed with "end:".
@@ -417,7 +417,7 @@ func (w *WorkerActor) patternRePrint() {
 
 // patternFullyDead: TestGcDeadTraceFullyDead-like — per-site fully dead detection.
 func (w *WorkerActor) patternFullyDead() {
-	runtime.GcDeadSessionStart()
+	runtime.GcDeadSessionStart(2001)
 
 	// Site A: 5 × 64B, ALL die.
 	for i := 0; i < 5; i++ {
@@ -443,7 +443,7 @@ func (w *WorkerActor) patternFullyDead() {
 	atomic.AddInt64(&w.stats.DeadAllocs, 2)
 	atomic.AddInt64(&w.stats.DeadBytes, 2*256)
 
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(2001)
 
 	w.scratch = nil
 	runtime.GC()
@@ -478,23 +478,23 @@ func (w *WorkerActor) patternConcurrent() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(3001)
 		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
 		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
 		concurrentSinkA1 = make([]byte, 256)  // nil'd below → dies
 		concurrentSinkA2 = make([]byte, 1024) // kept alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(3001)
 	}()
 
 	// Session goroutine B: 2 × 256B (freed) + 1 × 512B (alive).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart()
+		runtime.GcDeadSessionStart(3002)
 		concurrentSinkB1 = make([]byte, 256) // overwritten → dies
 		concurrentSinkB1 = make([]byte, 256) // nil'd below → dies
 		concurrentSinkB2 = make([]byte, 512) // kept alive
-		runtime.GcDeadSessionEnd()
+		runtime.GcDeadSessionEnd(3002)
 	}()
 
 	wg.Wait()
@@ -516,7 +516,7 @@ func (w *WorkerActor) patternConcurrent() {
 // patternCustomTypes: tests gcdeadtrace tracking of various Go types.
 // Allocations: struct (new), slice (make), map (make), interface (&struct), string (conversion).
 func (w *WorkerActor) patternCustomTypes() {
-	runtime.GcDeadSessionStart()
+	runtime.GcDeadSessionStart(4001)
 
 	// 1. Struct allocation — ListNode via new(), nested make([]byte, size)
 	ctListHead = ctAllocListNode(1, 128) // alive
@@ -537,7 +537,7 @@ func (w *WorkerActor) patternCustomTypes() {
 	// 4. Interface allocation via &intProcessor{}
 	ctProcessor = ctAllocProcessor(42) // alive
 
-	runtime.GcDeadSessionEnd()
+	runtime.GcDeadSessionEnd(4001)
 
 	// Drop dead references before GC
 	ctScratchStr = ""
