@@ -18,34 +18,49 @@
 
 ### ① Session 诊断
 
-**思路**：GODEBUG=gcdeadtrace=1 开启运行时追踪，session 分配的对象挂 special，GC 后输出 per-session freed / alive 统计。从中找到 "fully dead"（每次会话结束都释放完）的分配站点作为候选。
+**思路**：GODEBUG=gcdeadtrace=1 开启运行时追踪，session 内分配的对象挂 special 标记，每次 GC 后输出 per-session freed / alive 统计。从中找到 "fully dead"（每次会话结束都释放完）的分配站点作为候选。
 
-**风险**：业务需人工标 session 边界；不同执行路径表现不同，单次采集可能不全。
+**风险**：
+- **业务要人工标 session 边界** — 开发得自己去代码里找哪些地方是 session 开始、哪些是结束，然后插标记。业务逻辑复杂的话很容易标错，标宽了把不属于 session 的分配也圈进来，标窄了漏掉本该优化的点。而且每个 session 模式的边界可能都不一样，得一个一个分析。
+- **不同路径下内存表现不一样** — 同一个分配站点，走 A 路径可能每次都释放了，走 B 路径可能就有残留。单次测试跑出来的"fully dead"换个场景就不一定成立了。测试覆盖不全的话，cfg 里配的站点放到生产可能并不 fully dead。
+
+---
 
 ### ② 配置导出
 
-**思路**：excel_report 解析 gcdeadtrace 输出中的 "Only in Freed" 站点，提取 file:line、type、size、noscan，去重后生成 alloc_sites.cfg。
+**思路**：excel_report 解析 gcdeadtrace 输出中的 "Only in Freed" 站点，提取 file:line、type、size、noscan 标志，去重后生成 alloc_sites.cfg。
 
-**风险**：cfg 与行号绑定，改代码后可能失效，需重采。
+**风险**：
+- **cfg 和源码行号绑定，一改代码就废** — cfg 里记录的是 file:line，但业务代码频繁迭代，增删几行后行号就对不上了。到时候编译器拿着 cfg 去源码里找，找不到对应行就只能跳过，相当于这个优化白配了。而且每次改完代码都得重新跑一遍 gcdeadtrace → 重新导出 cfg → 重新编译，流程很重。
+
+---
 
 ### ③ 分配替换
 
-**思路**：编译器 Walk 阶段查 cfg 匹配 file:line，将 make/new 替换为 sessionalloc。备选：linkname 拦截 runtime.newobject 运行时切换。
+**思路**：编译器 Walk 阶段查 cfg 匹配 file:line，把匹配的 make/new 替换成 sessionalloc 调用。备选方案是通过 //go:linkname 拦截 runtime.newobject，运行时动态切换分配目标。
 
-**风险**：方式待定（改编译器 vs linkname）；含指针类型需传递 type 给运行时处理 GC 扫描。
+**风险**：
+- **改编译器还是用 linkname，还没想好** — 改编译器最彻底，可以精确按站点替换，但每个 Go 版本升级都要跟着改，维护成本高。linkname 不用改编译器，但只能全局 hook，没法做到"这个 make 走 arena、那个 make 走堆"。而且 linkname 本身也不是官方稳定的接口。
+- **含指针类型扔 arena 里，GC 还认不认** — 替换的时候不光要把分配目标改了，还得告诉运行时这个 arena 里的对象含指针，GC 要去扫描。如果不传 type 信息，GC 不知道 arena 里有指针，就不会去扫，引用的对象就可能被误回收。
+
+---
 
 ### ④ 运行时 Arena
 
-**思路**：预分配内存池，session 开始从中分配，结束整块释放。关键设计点待定：bump / slab 分配方式、含指针对象的 GC 注册策略、内存大小策略。
+**思路**：预分配一块内存池，session 开始时从里面分配对象，session 结束时整块释放，不一个个 free。关键设计还没定：用 bump allocator 还是 slab、含指针对象怎么注册 GC、内存池多大、不够了怎么办。
 
-**风险**：含指针进 arena 后 GC 扫不到是核心问题；Reset 后外部引用难检测。
+**风险**：
+- **含指针对象放 arena，GC 扫不到是最大的坑** — bump allocator 分配的内存在 GC 看来就是一块普通内存，不知道里面有指针。如果不对这块内存做特殊处理（比如注册到 GC 扫描队列），GC Mark 阶段就不会扫描它，里面的指针引用的对象就可能被误回收，导致各种野指针 crash。而且这个 crash 还是随机的，只有 GC 触发并且碰巧回收了那块内存才会出现，很难复现。
+- **session 结束了，但外面还有人拿着对象的引用** — 虽然 cfg 选的是"fully dead"站点，但保不齐哪个地方还存着 arena 里对象的指针。session 结束 Reset 之后，这些指针就成了 dangling pointer，谁用谁崩。而且这属于业务代码问题，运行时很难自动检测。
+
+---
 
 ### 安全兜底（待定）
 
-- 含指针对象 GC 扫描保障
-- cfg 配置错误的编译/运行时检测
-- 生产问题定位手段（如内存填 pattern）
-- 灰度安全回退机制
+- 含指针放 arena → GC 扫描怎么保障，要不要做运行时断言
+- cfg 配错了（行号不对、type 不对、noscan 标错了）→ 编译阶段能发现多少，运行时能不能补救
+- 生产上出了问题怎么定位 — 比如在 arena 内存里填特殊 pattern，crash 时看 dump 能不能识别出来
+- 灰度怎么安全回退 — 是不是要搞个 GOEXPERIMENT 开关，出问题关掉就走回老路径
 
 ---
 

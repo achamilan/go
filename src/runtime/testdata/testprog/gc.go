@@ -706,6 +706,8 @@ func GCDeadTraceBucketOvercountConcurrent() {
 	runtime.MemProfileRate = 1
 
 	var wg sync.WaitGroup
+	var startWg sync.WaitGroup
+	startWg.Add(2)
 
 	// Goroutine A: session with one dying and one alive alloc.
 	// allocSameBucket() shares the bucket with non-session alloc.
@@ -713,18 +715,21 @@ func GCDeadTraceBucketOvercountConcurrent() {
 	go func() {
 		defer wg.Done()
 		runtime.GcDeadSessionStart(401)
+		startWg.Done()
+		startWg.Wait()
 		gcDeadConcSessA1 = allocSameBucket()  // 256B, will die
 		gcDeadConcSessA2 = alloc256Live()     // 256B, stays alive
-		runtime.GcDeadSessionEnd(401)
 	}()
 
-	// Goroutine B: session with one dying alloc at the same bucket.
+	// Goroutine B: joins the same session 401 from a different call site.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runtime.GcDeadSessionStart(402)
+		runtime.GcDeadSessionStart(401)
+		startWg.Done()
+		startWg.Wait()
 		gcDeadConcSessB1 = allocSameBucket()  // 256B, will die
-		runtime.GcDeadSessionEnd(402)
+		runtime.GcDeadSessionEnd(401)
 	}()
 
 	wg.Wait()

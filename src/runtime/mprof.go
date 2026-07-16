@@ -652,17 +652,25 @@ type gcDeadSessionRef struct {
 	typeName  string
 }
 
+const gcDeadMaxStartSites = 8
+
+// startSite records a goroutine's Start call site for multi-goroutine sessions.
+type gcDeadStartSite struct {
+	goid uint64
+	pc   uintptr
+}
+
 // gcDeadSessionInfo tracks per-session allocation and free data.
 // Entries persist after the session ends so that freed objects can still
 // be attributed to the correct session.
 type gcDeadSessionInfo struct {
 	id         uint64
-	goid       uint64   // first goroutine ID to join this session (reference only)
-	startPC    uintptr  // PC of the first GcDeadSessionStart caller
 	endPC      uintptr  // PC of the GcDeadSessionEnd caller (0 if session hasn't ended)
 	printed    uint32   // 0=unprinted, 1=printed without end (re-print when end arrives), 2=printed with end
 	ended      bool     // End has been called — no more allocs accepted
 	joinCount  int32    // number of goroutines that have joined this session
+	numStartSites int32 // number of start sites recorded (accessed atomically)
+	startSites [gcDeadMaxStartSites]gcDeadStartSite // all goroutines' Start call sites
 	allocs     uintptr  // session allocs this GC cycle
 	allocBytes uintptr
 	frees      uintptr  // freed this GC cycle (from specials)
@@ -1291,9 +1299,11 @@ func gcDeadTracePrint() {
 		// and have no new per-cycle allocation activity.
 		// Re-print a session if it was previously printed without an end
 		// (printed==1) and now has an end (endPC!=0).
+		// Also re-print if session is already done (printed==2) but has
+		// residual frees in this cycle (e.g. previously alive objects freed).
 		printed := atomic.Load(&e.printed)
 		endPC := e.endPC
-		if allocs > 0 || (alive > 0 && printed == 0) || (endPC != 0 && printed == 1) {
+		if allocs > 0 || (alive > 0 && printed == 0) || (endPC != 0 && printed == 1) || (frees > 0 && printed == 2) {
 			if !hasSessionData {
 				appendStr("gcdeadsession by session:\n")
 				hasSessionData = true
@@ -1325,9 +1335,24 @@ func gcDeadTracePrint() {
 			appendUintptr(aliveBytes)
 			appendStr(" bytes)")
 			// Append start/end location if available.
-			if e.startPC != 0 {
-				appendStr(" [start: ")
-				appendPCLoc(e.startPC)
+			numSites := atomic.Loadint32(&e.numStartSites)
+			if numSites > 0 {
+				appendStr(" [")
+				for j := int32(0); j < numSites; j++ {
+					site := e.startSites[j]
+					if j == 0 {
+						appendStr("first: ")
+					} else {
+						appendStr(", join: ")
+					}
+					appendPCLoc(site.pc)
+					appendStr(" (gid=")
+					var tmp2 [20]byte
+					b2 := itoa(tmp2[:], site.goid)
+					m := copy(buf[n:], b2)
+					n += m
+					appendStr(")")
+				}
 				if e.endPC != 0 {
 					appendStr(", end: ")
 					appendPCLoc(e.endPC)
@@ -1546,12 +1571,16 @@ func GcDeadSessionStart(id uint64) {
 	// If this is the first time this sessionId is being used, initialize entry.
 	if e.id != id {
 		e.id = id
-		e.goid = gp.goid
-		e.startPC = sys.GetCallerPC()
 		e.endPC = 0
 		e.ended = false
 		e.printed = 0
 		e.joinCount = 0
+		e.numStartSites = 1
+		e.startSites[0] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
+		// Clear remaining start site slots.
+		for j := 1; j < gcDeadMaxStartSites; j++ {
+			e.startSites[j] = gcDeadStartSite{}
+		}
 		e.allocs = 0
 		e.allocBytes = 0
 		e.frees = 0
@@ -1566,6 +1595,18 @@ func GcDeadSessionStart(id uint64) {
 		}
 		for j := range e.allocBucketRefs {
 			e.allocBucketRefs[j] = gcDeadSessionBucketRef{}
+		}
+	} else {
+		// Joining goroutine: record its start site via CAS loop.
+		for {
+			n := atomic.Loadint32(&e.numStartSites)
+			if n >= gcDeadMaxStartSites {
+				break
+			}
+			if atomic.Casint32(&e.numStartSites, n, n+1) {
+				e.startSites[n] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
+				break
+			}
 		}
 	}
 

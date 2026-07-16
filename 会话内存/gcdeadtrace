@@ -590,7 +590,7 @@ v6: 移除 bucket 级启发式计数，完全依赖 per-session special 和会�
 ================================
 
 13.1 问题背景
-  在 5G 核心网 SMF 产品测试中发现：gcdeadsession:freed 总数（1,052,552）
+  在测试中发现：gcdeadsession:freed 总数（1,052,552）
   远大于 per-session freed 之和（~204,531），差值约 848K（80%）。
 
 13.2 根因分析
