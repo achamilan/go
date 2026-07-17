@@ -491,7 +491,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 					if e.allocBucketRefs[j].bucket == bp {
 						atomic.Xadduintptr(&e.allocBucketRefs[j].frees, 1)
 						atomic.Xadduintptr(&e.allocBucketRefs[j].bytes, size)
-						goto done
+						goto done2
 					}
 				}
 				for j := range e.allocBucketRefs {
@@ -500,7 +500,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 						e.allocBucketRefs[j].frees = 1
 						e.allocBucketRefs[j].bytes = size
 						e.allocBucketRefs[j].typeName = tn
-						goto done
+						goto done2
 					}
 				}
 				// All slots full: overwrite first (LRU-approximate).
@@ -508,7 +508,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				e.allocBucketRefs[0].frees = 1
 				e.allocBucketRefs[0].bytes = size
 				e.allocBucketRefs[0].typeName = tn
-			done:
+			done2:
 			}
 		}
 	}
@@ -1552,7 +1552,7 @@ func gcDeadTracePrint() {
 //
 // Use GODEBUG=gcdeadtracefile=<path> to save output to a file.
 func GcDeadSessionStart(id uint64) {
-	if debug.gcdeadtrace == 0 {
+	if debug.gcdeadsession == 0 && debug.gcdeadtrace == 0 {
 		return
 	}
 	gp := getg().m.curg
@@ -1612,14 +1612,25 @@ func GcDeadSessionStart(id uint64) {
 
 	gp.gcDeadSessionActive = true
 	gp.gcDeadSessionID = id
-	atomic.Xaddint32(&e.joinCount, 1)
 
-	// Ensure all allocations are profiled for accurate session tracking.
-	// MemProfileRate is set to 1 on first session start so that every
-	// allocation reaches mProf_Malloc and session counters are updated.
-	if gcDeadSessionCount.Add(1) == 1 {
-		gcDeadSavedRate = MemProfileRate
-		MemProfileRate = 1
+	if debug.gcdeadtrace > 0 {
+		atomic.Xaddint32(&e.joinCount, 1)
+
+		// Ensure all allocations are profiled for accurate session tracking.
+		// MemProfileRate is set to 1 on first session start so that every
+		// allocation reaches mProf_Malloc and session counters are updated.
+		if gcDeadSessionCount.Add(1) == 1 {
+			gcDeadSavedRate = MemProfileRate
+			MemProfileRate = 1
+		}
+
+		// Print session start location.
+		pc := sys.GetCallerPC()
+		f := findfunc(pc)
+		if f.valid() {
+			file, line := funcline(f, pc)
+			print("runtime: gcdeadsession: session ", id, " started at ", file, ":", line, "\n")
+		}
 	}
 }
 
@@ -1628,7 +1639,7 @@ func GcDeadSessionStart(id uint64) {
 // Has no effect if the session is already ended or if GODEBUG=gcdeadtrace=0.
 // Can only be called once per sessionId — subsequent calls are no-ops.
 func GcDeadSessionEnd(id uint64) {
-	if debug.gcdeadtrace == 0 {
+	if debug.gcdeadsession == 0 && debug.gcdeadtrace == 0 {
 		return
 	}
 	gp := getg().m.curg
@@ -1651,9 +1662,23 @@ func GcDeadSessionEnd(id uint64) {
 	gp.gcDeadSessionID = 0
 
 	// Adjust global session count by all goroutines that joined this session.
-	jc := atomic.Xchgint32(&e.joinCount, 0)
-	if gcDeadSessionCount.Add(-jc) <= 0 {
-		MemProfileRate = gcDeadSavedRate
+	if debug.gcdeadtrace > 0 {
+		jc := atomic.Xchgint32(&e.joinCount, 0)
+		if gcDeadSessionCount.Add(-jc) <= 0 {
+			MemProfileRate = gcDeadSavedRate
+		}
+
+		// Print session end location.
+		pc := sys.GetCallerPC()
+		f := findfunc(pc)
+		if f.valid() {
+			file, line := funcline(f, pc)
+			print("runtime: gcdeadsession: session ", id, " ended at ", file, ":", line, "\n")
+		}
+
+		// Force a full GC to immediately collect and report
+		// session allocation data.
+		GC()
 	}
 }
 

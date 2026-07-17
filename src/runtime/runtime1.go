@@ -318,6 +318,7 @@ var debug struct {
 	gctrace                  int32
 	gcdeadtrace              int32
 	gcdeadtracefile          string
+	gcdeadsession            int32
 	invalidptr               int32
 	madvdontneed             int32 // for Linux; issue 28466
 	scavtrace                int32
@@ -387,6 +388,7 @@ var dbgvars = []*dbgVar{
 	{name: "gcstoptheworld", value: &debug.gcstoptheworld},
 	{name: "gctrace", value: &debug.gctrace},
 	{name: "gcdeadtrace", value: &debug.gcdeadtrace},
+	{name: "gcdeadsession", value: &debug.gcdeadsession},
 	{name: "harddecommit", value: &debug.harddecommit},
 	{name: "inittrace", value: &debug.inittrace},
 	{name: "invalidptr", value: &debug.invalidptr},
