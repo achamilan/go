@@ -500,12 +500,14 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 					if e.allocBucketRefs[j].bucket == bp {
 						atomic.Xadduintptr(&e.allocBucketRefs[j].frees, 1)
 						atomic.Xadduintptr(&e.allocBucketRefs[j].bytes, size)
+						e.allocBucketRefs[j].goid = gp.goid
 						goto done2
 					}
 				}
 				for j := range e.allocBucketRefs {
 					if e.allocBucketRefs[j].bucket == nil {
 						e.allocBucketRefs[j].bucket = bp
+						e.allocBucketRefs[j].goid = gp.goid
 						e.allocBucketRefs[j].frees = 1
 						e.allocBucketRefs[j].bytes = size
 						e.allocBucketRefs[j].typeName = tn
@@ -514,6 +516,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				}
 				// All slots full: overwrite first (LRU-approximate).
 				e.allocBucketRefs[0].bucket = bp
+				e.allocBucketRefs[0].goid = gp.goid
 				e.allocBucketRefs[0].frees = 1
 				e.allocBucketRefs[0].bytes = size
 				e.allocBucketRefs[0].typeName = tn
@@ -645,6 +648,7 @@ const gcDeadPerSessionSites = 256
 // enabling per-site output lines to show which session freed the objects.
 type gcDeadSessionBucketRef struct {
 	bucket       unsafe.Pointer // *bucket
+	goid         uint64         // last goroutine that freed/allocated at this (session, bucket)
 	frees        uintptr        // per-cycle alloc/free ref count
 	bytes        uintptr        // per-cycle bytes
 	cumFrees     uintptr        // cumulative frees at this bucket from this session
@@ -657,6 +661,7 @@ const gcDeadSessionRefSlots = 16
 // Session attribution for a single site line in gcDeadTracePrint output.
 type gcDeadSessionRef struct {
 	sessionID uint64
+	goid      uint64 // goroutine that allocated/freed these objects
 	objs      uintptr // count of objects (freed or alive depending on context)
 	bytes     uintptr
 	typeName  string
@@ -752,6 +757,7 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 			if e.bucketRefs[j].bucket == bp {
 				atomic.Xadduintptr(&e.bucketRefs[j].frees, 1)
 				atomic.Xadduintptr(&e.bucketRefs[j].bytes, size)
+				e.bucketRefs[j].goid = goid
 				goto updateAllocCumFrees
 			}
 		}
@@ -761,6 +767,7 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 				// Store the bucket pointer with release store; subsequent
 				// loads in gcDeadTracePrint will observe it.
 				e.bucketRefs[j].bucket = bp
+				e.bucketRefs[j].goid = goid
 				e.bucketRefs[j].frees = 1
 				e.bucketRefs[j].bytes = size
 				e.bucketRefs[j].typeName = tn
@@ -769,6 +776,7 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 		}
 		// All slots full: write into first slot (approximate fallback).
 		e.bucketRefs[0].bucket = bp
+		e.bucketRefs[0].goid = goid
 		e.bucketRefs[0].frees = 1
 		e.bucketRefs[0].bytes = size
 		e.bucketRefs[0].typeName = tn
@@ -967,6 +975,7 @@ func gcDeadTracePrint() {
 				if r.numSessionRefs < len(r.sessionRefs) {
 					ns := r.numSessionRefs
 					r.sessionRefs[ns].sessionID = se.id
+					r.sessionRefs[ns].goid = br.goid
 					r.sessionRefs[ns].objs = br.frees
 					r.sessionRefs[ns].bytes = br.bytes
 					r.sessionRefs[ns].typeName = br.typeName
@@ -982,6 +991,7 @@ func gcDeadTracePrint() {
 				}
 				r := &raw[rawCount]
 				r.sessionRefs[0].sessionID = se.id
+				r.sessionRefs[0].goid = br.goid
 				r.sessionRefs[0].objs = br.frees
 				r.sessionRefs[0].bytes = br.bytes
 				r.sessionRefs[0].typeName = br.typeName
@@ -1062,6 +1072,7 @@ func gcDeadTracePrint() {
 					if r.numAliveSessionRefs < len(r.aliveSessionRefs) {
 						ns := r.numAliveSessionRefs
 						r.aliveSessionRefs[ns].sessionID = se.id
+						r.aliveSessionRefs[ns].goid = br.goid
 						r.aliveSessionRefs[ns].objs = aliveObjs
 						r.aliveSessionRefs[ns].bytes = aliveBytes
 						r.aliveSessionRefs[ns].typeName = br.typeName
@@ -1090,6 +1101,7 @@ func gcDeadTracePrint() {
 					}
 					r := &raw[rawCount]
 					r.aliveSessionRefs[0].sessionID = se.id
+					r.aliveSessionRefs[0].goid = br.goid
 					r.aliveSessionRefs[0].objs = aliveObjs
 					r.aliveSessionRefs[0].bytes = aliveBytes
 					r.aliveSessionRefs[0].typeName = br.typeName
@@ -1502,6 +1514,14 @@ func gcDeadTracePrint() {
 					appendStr(" @")
 					appendStr(r.typeName)
 				}
+				if r.goid != 0 {
+					appendStr(" (gid=")
+					var gidbuf [20]byte
+					b := itoa(gidbuf[:], r.goid)
+					m := copy(buf[n:], b)
+					n += m
+					appendStr(")")
+				}
 				appendStr("]")
 			}
 			appendStr("\n")
@@ -1574,6 +1594,14 @@ func gcDeadTracePrint() {
 				if r.typeName != "" {
 					appendStr(" @")
 					appendStr(r.typeName)
+				}
+				if r.goid != 0 {
+					appendStr(" (gid=")
+					var gidbuf [20]byte
+					b := itoa(gidbuf[:], r.goid)
+					m := copy(buf[n:], b)
+					n += m
+					appendStr(")")
 				}
 				appendStr("]")
 			}
