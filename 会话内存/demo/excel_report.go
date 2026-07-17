@@ -73,10 +73,12 @@ type ParsedData struct {
 // ── parsing ────────────────────────────────────────────────────────
 
 var (
+	// session #1003: 3 allocs (1328 bytes), 0 freed (0 bytes), 3 alive (1328 bytes) [first: main.go:361 (gid=10), end: main.go:372]
 	sessionRe = regexp.MustCompile(
-		`\s*session #(\d+) \(gid=(\d+)\): (\d+) allocs \((\d+) bytes\), (\d+) freed \((\d+) bytes\), (\d+) alive \((\d+) bytes\)` +
-			`\s*(?:\[start: ([^]]+?)(?:, end: ([^]]+?))?\])?\s*`,
+		`\s*session #(\d+):\s*(\d+) allocs \((\d+) bytes\),\s*(\d+) freed \((\d+) bytes\),\s*(\d+) alive \((\d+) bytes\)` +
+			`(?:\s*\[first: (.+?) \(gid=(\d+)\)(.*?)\])?`,
 	)
+	endRe = regexp.MustCompile(`, end: (\S+)`)
 	freedSumRe = regexp.MustCompile(`gcdeadsession:freed:\s*(\d+) session objs \((\d+) bytes\) freed from (\d+) sites`)
 	aliveSumRe = regexp.MustCompile(`gcdeadsession:alive:\s*(\d+) session objs \((\d+) bytes\) still alive from (\d+) sites`)
 	gcHeaderRe = regexp.MustCompile(`=== GC #(\d+) ===`)
@@ -113,13 +115,21 @@ func parseFile(path string) *ParsedData {
 		for i < len(lines) && !gcHeaderRe.MatchString(lines[i]) {
 			line := lines[i]
 			if sm := sessionRe.FindStringSubmatch(line); sm != nil {
-				block.Sessions = append(block.Sessions, SessionEntry{
-					ID: parseInt(sm[1]), GID: parseInt(sm[2]),
-					Allocs: parseInt(sm[3]), AllocBytes: parseInt(sm[4]),
-					Frees: parseInt(sm[5]), FreeBytes: parseInt(sm[6]),
-					Alive: parseInt(sm[7]), AliveBytes: parseInt(sm[8]),
-					Start: sm[9], End: sm[10],
-				})
+				se := SessionEntry{
+					ID: parseInt(sm[1]),
+					Allocs: parseInt(sm[2]), AllocBytes: parseInt(sm[3]),
+					Frees: parseInt(sm[4]), FreeBytes: parseInt(sm[5]),
+					Alive: parseInt(sm[6]), AliveBytes: parseInt(sm[7]),
+				}
+				// Extract [first: ... (gid=N), ...] from inline continuation
+				if sm[8] != "" {
+					se.Start = sm[8]           // e.g. "main.go:361"
+					se.GID = parseInt(sm[9])    // e.g. 18
+					if em := endRe.FindStringSubmatch(sm[10]); em != nil {
+						se.End = em[1]          // e.g. "main.go:372"
+					}
+				}
+				block.Sessions = append(block.Sessions, se)
 				i++; continue
 			}
 			if fm := freedSumRe.FindStringSubmatch(line); fm != nil {
@@ -1001,8 +1011,11 @@ func main() {
 		data := parseFile(inPath)
 		allData = append(allData, data)
 		if len(data.GCCycles) > 0 {
-			sessCount := len(data.GCCycles[0].Sessions)
-			fmt.Printf("%d GC cycles, up to %d sessions/cycle\n", len(data.GCCycles), sessCount)
+			maxSess := 0
+			for _, gc := range data.GCCycles {
+				if len(gc.Sessions) > maxSess { maxSess = len(gc.Sessions) }
+			}
+			fmt.Printf("%d GC cycles, up to %d sessions/cycle\n", len(data.GCCycles), maxSess)
 		} else {
 			fmt.Println("0 GC cycles")
 		}
