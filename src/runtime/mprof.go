@@ -479,6 +479,15 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				atomic.Xadduintptr(&e.cumAllocs, 1)
 				atomic.Xadduintptr(&e.cumAllocBytes, size)
 
+				// Update per-goroutine alloc stats.
+				for j := range e.goroutineStats {
+					if e.goroutineStats[j].goid == gp.goid {
+						atomic.Xadduintptr(&e.goroutineStats[j].allocs, 1)
+						atomic.Xadduintptr(&e.goroutineStats[j].allocBytes, size)
+						break
+					}
+				}
+
 				// Resolve type name for alive output.
 				tn := ""
 				if typ != nil {
@@ -536,6 +545,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				unlock(&mheap_.speciallock)
 				ss.special.kind = _KindSpecialGcDeadSession
 				ss.sessionID = gp.gcDeadSessionID
+				ss.goid = gp.goid // store goroutine ID for per-goroutine attribution
 				ss.b = b // store bucket for per-site session attribution in freed output
 				ss.typ = typ // store type for type name in freed output
 				if !addspecial(p, &ss.special, false) {
@@ -660,6 +670,15 @@ type gcDeadStartSite struct {
 	pc   uintptr
 }
 
+// gcDeadGoroutineStat tracks per-goroutine allocation and free counts within a session.
+type gcDeadGoroutineStat struct {
+	goid       uint64
+	allocs     uintptr
+	allocBytes uintptr
+	frees      uintptr
+	freeBytes  uintptr
+}
+
 // gcDeadSessionInfo tracks per-session allocation and free data.
 // Entries persist after the session ends so that freed objects can still
 // be attributed to the correct session.
@@ -680,6 +699,10 @@ type gcDeadSessionInfo struct {
 	cumFrees   uintptr
 	cumFreeBytes uintptr
 
+	// Per-goroutine alloc/free counts within this session.
+	// Indexed by matching goid from startSites.
+	goroutineStats [gcDeadMaxStartSites]gcDeadGoroutineStat
+
 	// Per-bucket freed tracking, populated by gcDeadRecordFree.
 	// Used in gcDeadTracePrint to append session info to site lines.
 	bucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef
@@ -695,7 +718,7 @@ var gcDeadSessionTable [gcDeadMaxSessions]gcDeadSessionInfo
 // gcDeadRecordFree attributes a freed object to its session via sessionID and
 // to its allocation site via bucket pointer.
 // Called from freeSpecial when a _KindSpecialGcDeadSession special is freed.
-func gcDeadRecordFree(sessionID uint64, size uintptr, b *bucket, typ *_type) {
+func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, typ *_type) {
 	idx := sessionID % gcDeadMaxSessions
 	e := &gcDeadSessionTable[idx]
 	if e.id != sessionID {
@@ -705,6 +728,15 @@ func gcDeadRecordFree(sessionID uint64, size uintptr, b *bucket, typ *_type) {
 	atomic.Xadduintptr(&e.freeBytes, size)
 	atomic.Xadduintptr(&e.cumFrees, 1)
 	atomic.Xadduintptr(&e.cumFreeBytes, size)
+
+	// Update per-goroutine freed stats.
+	for j := range e.goroutineStats {
+		if e.goroutineStats[j].goid == goid {
+			atomic.Xadduintptr(&e.goroutineStats[j].frees, 1)
+			atomic.Xadduintptr(&e.goroutineStats[j].freeBytes, size)
+			break
+		}
+	}
 
 	// Resolve type name for freed output.
 	tn := ""
@@ -1359,6 +1391,34 @@ func gcDeadTracePrint() {
 				}
 				appendStr("]")
 			}
+			// Append per-goroutine alloc/free breakdown.
+			for j := range e.goroutineStats {
+				gs := &e.goroutineStats[j]
+				if gs.goid == 0 {
+					continue
+				}
+				ga := atomic.Loaduintptr(&gs.allocs)
+				gab := atomic.Loaduintptr(&gs.allocBytes)
+				gf := atomic.Loaduintptr(&gs.frees)
+				gfb := atomic.Loaduintptr(&gs.freeBytes)
+				if ga == 0 && gf == 0 {
+					continue
+				}
+				appendStr("\n    gid=")
+				var tmp2 [20]byte
+				b2 := itoa(tmp2[:], gs.goid)
+				m := copy(buf[n:], b2)
+				n += m
+				appendStr(": ")
+				appendUintptr(ga)
+				appendStr(" allocs (")
+				appendUintptr(gab)
+				appendStr(" bytes), ")
+				appendUintptr(gf)
+				appendStr(" freed (")
+				appendUintptr(gfb)
+				appendStr(" bytes)")
+			}
 			appendStr("\n")
 		}
 
@@ -1596,6 +1656,11 @@ func GcDeadSessionStart(id uint64) {
 		for j := range e.allocBucketRefs {
 			e.allocBucketRefs[j] = gcDeadSessionBucketRef{}
 		}
+		// Clear goroutine stats from any previous session.
+		for j := range e.goroutineStats {
+			e.goroutineStats[j] = gcDeadGoroutineStat{}
+		}
+		e.goroutineStats[0].goid = gp.goid
 	} else {
 		// Joining goroutine: record its start site via CAS loop.
 		for {
@@ -1607,6 +1672,27 @@ func GcDeadSessionStart(id uint64) {
 				e.startSites[n] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
 				break
 			}
+		}
+		// Register goroutine in stats table if not already present.
+		found := false
+		for j := range e.goroutineStats {
+			if e.goroutineStats[j].goid == gp.goid {
+				found = true
+				break
+			}
+			if e.goroutineStats[j].goid == 0 {
+				e.goroutineStats[j].goid = gp.goid
+				found = true
+				break
+			}
+		}
+		if !found {
+			// All slots full: overwrite first (LRU-approximate).
+			e.goroutineStats[0].goid = gp.goid
+			e.goroutineStats[0].allocs = 0
+			e.goroutineStats[0].allocBytes = 0
+			e.goroutineStats[0].frees = 0
+			e.goroutineStats[0].freeBytes = 0
 		}
 	}
 

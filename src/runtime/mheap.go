@@ -2750,6 +2750,7 @@ type specialGcDeadSession struct {
 	_         sys.NotInHeap
 	special   special
 	sessionID uint64
+	goid      uint64  // allocating goroutine ID, for per-goroutine attribution
 	b         *bucket // allocation site bucket for per-site session attribution
 	typ       *_type  // type of the allocated object, for type name in output
 }
@@ -2861,7 +2862,7 @@ func freeSpecial(s *special, p unsafe.Pointer, size uintptr) {
 		unlock(&mheap_.speciallock)
 	case _KindSpecialGcDeadSession:
 		ss := (*specialGcDeadSession)(unsafe.Pointer(s))
-		gcDeadRecordFree(ss.sessionID, size, ss.b, ss.typ)
+		gcDeadRecordFree(ss.sessionID, ss.goid, size, ss.b, ss.typ)
 		lock(&mheap_.speciallock)
 		mheap_.specialGcDeadSessionAlloc.free(unsafe.Pointer(ss))
 		unlock(&mheap_.speciallock)
