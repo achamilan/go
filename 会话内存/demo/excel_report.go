@@ -956,15 +956,31 @@ func firstFileLine(stack, fallback string) string {
 }
 
 // extractTypes extracts unique @type annotations from a map of ref strings.
-// Ref format: "[session #N: X objs, Y bytes @type]"
+// Refs can contain multiple [session ...] blocks, e.g.:
+//
+//	"[session #3001: 1 objs, 256 bytes @uint8 (gid=18)] [session #3001: 1 objs, 256 bytes @uint8 (gid=19)]"
+//
+// Each block may also omit the type entirely, e.g. "[session #4002: 1 objs, 32 bytes (gid=6)]".
 func extractTypes(refs map[string]bool) []string {
 	seen := make(map[string]bool)
 	for r := range refs {
-		idx := strings.Index(r, "@")
-		if idx < 0 { continue }
-		t := strings.TrimRight(r[idx+1:], " ]")
-		if t != "" {
-			seen[t] = true
+		// Split by "] [" to handle multiple [session ...] blocks in one ref string.
+		parts := strings.Split(r, "] [")
+		for _, part := range parts {
+			atIdx := strings.Index(part, "@")
+			if atIdx < 0 {
+				continue
+			}
+			rest := part[atIdx+1:]
+			// Type ends at the first space, ], or end of string.
+			end := strings.IndexAny(rest, " ]")
+			if end < 0 {
+				end = len(rest)
+			}
+			t := rest[:end]
+			if t != "" {
+				seen[t] = true
+			}
 		}
 	}
 	var types []string
