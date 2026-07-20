@@ -519,6 +519,46 @@ func TestGcDeadTraceBucketOvercountConcurrent(t *testing.T) {
 	}
 }
 
+// TestGcDeadTraceStartAfterEnd verifies that after a shared session is ended
+// by one goroutine, other goroutines can start new sessions.
+// See issue: joinCount was per-goroutine and gcDeadSessionActive was not cleared.
+func TestGcDeadTraceStartAfterEnd(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceStartAfterEnd", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "gcdeadsession by session:") {
+		t.Fatalf("expected gcdeadsession by session output, got:\n%s", got)
+	}
+
+	// Verify both sessions appear in output — session 502 proves g2 could
+	// start a new session after g1 ended the shared session 501.
+	hasOK := false
+	hasSession501 := false
+	hasSession502 := false
+	for _, l := range strings.Split(got, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.Contains(l, "session #501:") {
+			hasSession501 = true
+		}
+		if strings.Contains(l, "session #502:") {
+			t.Logf("found session 502 in output: %s", l)
+			hasSession502 = true
+		}
+	}
+
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end")
+	}
+	if !hasSession501 {
+		t.Errorf("expected session #501 in output")
+	}
+	if !hasSession502 {
+		t.Errorf("expected session #502 in output — this means g2 could not start a new session after g1 ended the shared session 501")
+	}
+}
+
 func TestGCTestMoveStackOnNextCall(t *testing.T) {
 	if asan.Enabled {
 		t.Skip("extra allocations with -asan causes this to fail; see #70079")

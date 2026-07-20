@@ -33,6 +33,7 @@ func init() {
 	register("GCDeadTraceMultiSession", GCDeadTraceMultiSession)
 	register("GCDeadTraceBucketOvercount", GCDeadTraceBucketOvercount)
 	register("GCDeadTraceBucketOvercountConcurrent", GCDeadTraceBucketOvercountConcurrent)
+	register("GCDeadTraceStartAfterEnd", GCDeadTraceStartAfterEnd)
 }
 
 func GCSys() {
@@ -344,6 +345,11 @@ var (
 	gcDeadConcSessA1 []byte // session A alloc, will die (same bucket as non-session)
 	gcDeadConcSessA2 []byte // session A alloc, stays alive
 	gcDeadConcSessB1 []byte // session B alloc, will die (same bucket as non-session)
+
+	// gcDeadStartAfterEnd sinks for GCDeadTraceStartAfterEnd test.
+	gcDeadAfterEndS1Alive []byte // session 501 alloc from g1, stays alive
+	gcDeadAfterEndS1Die   []byte // session 501 alloc from g2, will die
+	gcDeadAfterEndS2Alive []byte // session 502 alloc from g2, stays alive
 )
 
 func GCDeadTrace() {
@@ -741,6 +747,54 @@ func GCDeadTraceBucketOvercountConcurrent() {
 	gcDeadConcSessA1 = nil
 	gcDeadConcSessB1 = nil
 	deadSink = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadTraceStartAfterEnd verifies that after one goroutine calls End on a
+// shared session, all goroutines in that session are properly cleaned up so
+// they can subsequently start new sessions.
+//
+// Previously, joinCount was incremented per-goroutine and only the calling
+// goroutine's gcDeadSessionActive was cleared on End. This meant joining
+// goroutines could never start a new session.
+func GCDeadTraceStartAfterEnd() {
+	runtime.MemProfileRate = 1
+
+	var wg sync.WaitGroup
+	var g2Joined sync.WaitGroup
+	g2Joined.Add(1)
+
+	// Goroutine 1: starts session 501, waits for g2 to join, then ends.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(501)
+		gcDeadAfterEndS1Alive = alloc256Live() // Session 501 alloc, stays alive
+		g2Joined.Done()                        // signal g2: session 501 is active
+		runtime.GcDeadSessionEnd(501)          // End — should also clear g2's state
+	}()
+
+	// Goroutine 2: joins session 501, then after g1's End, starts session 502.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(501)         // Join session 501
+		gcDeadAfterEndS1Die = allocSameBucket() // Session 501 alloc, will die
+		g2Joined.Wait()                         // wait for g1 to End(501)
+
+		// After g1's End(501), our fix should allow starting a new session.
+		// Previously this was blocked (gcDeadSessionActive was still true).
+		runtime.GcDeadSessionStart(502)
+		gcDeadAfterEndS2Alive = alloc256Live() // Session 502 alloc, stays alive
+		runtime.GcDeadSessionEnd(502)
+	}()
+
+	wg.Wait()
+
+	// Nil dying references.
+	gcDeadAfterEndS1Die = nil
 
 	runtime.GC()
 	fmt.Println("OK")
