@@ -1449,6 +1449,18 @@ func gcDeadTracePrint() {
 			atomic.Storeuintptr(&e.allocBytes, 0)
 			atomic.Storeuintptr(&e.frees, 0)
 			atomic.Storeuintptr(&e.freeBytes, 0)
+			// Also reset per-cycle per-goroutine counters so that the
+			// goroutine-level allocs/frees match the session-level
+			// allocs/frees (both are per-cycle, not cumulative).
+			for j := range e.goroutineStats {
+				gs := &e.goroutineStats[j]
+				if gs.goid != 0 {
+					atomic.Storeuintptr(&gs.allocs, 0)
+					atomic.Storeuintptr(&gs.allocBytes, 0)
+					atomic.Storeuintptr(&gs.frees, 0)
+					atomic.Storeuintptr(&gs.freeBytes, 0)
+				}
+			}
 		}
 		}
 	}
