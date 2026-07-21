@@ -460,12 +460,30 @@ func (w *WorkerActor) allocSiteB() []byte { return make([]byte, 128) }
 //go:noinline
 func (w *WorkerActor) allocSiteC() []byte { return make([]byte, 256) }
 
-// patternConcurrent: two concurrent sessions allocating from the same call site.
-// Each session's allocations/frees should be tracked independently in the
-// per-session breakdown output.
+// concurrentAllocWorker is a shared function so both goroutines have the exact
+// same call stack when calling allocSiteC — they map to the same raw entry and
+// their distinct goids appear as separate [session #3001: ... (gid=N)] lines.
+func concurrentAllocWorker(w *WorkerActor, a1 *[]byte, a2 *[]byte, size2 int, startBarrier, allocBarrier *sync.WaitGroup, wg *sync.WaitGroup) {
+	defer wg.Done()
+	runtime.GcDeadSessionStart(3001)
+	startBarrier.Done()
+	startBarrier.Wait() // wait for both goroutines to start the session
+	*a1 = w.allocSiteC()                    // same site, same call stack for both goroutines
+	*a2 = make([]byte, size2)               // alive, different size per goroutine
+	allocBarrier.Done()
+	allocBarrier.Wait() // wait for both goroutines to finish allocating
+	runtime.GcDeadSessionEnd(3001)
+}
+
+// patternConcurrent: single session 3001 shared by two goroutines via a shared
+// allocation function. Tests that the same session+site with different goids
+// produces separate [session #3001: ... (gid=N)] [session #3001: ... (gid=M)] lines
+// under a single site heading.
 //
-// Session A: 3 × 256B (freed) + 1 × 1024B (alive)
-// Session B: 2 × 256B (freed) + 1 × 512B (alive)
+// Session 3001:
+//   gid-A: 1 × allocSiteC (freed) + 1 × 1024B (alive)
+//   gid-B: 1 × allocSiteC (freed) + 1 × 512B  (alive)
+//   → allocSiteC line shows [session #3001: ... (gid=A)] [session #3001: ... (gid=B)]
 func (w *WorkerActor) patternConcurrent() {
 	// Reset sinks from previous burst so prior allocations die.
 	concurrentSinkA1 = nil
@@ -474,35 +492,14 @@ func (w *WorkerActor) patternConcurrent() {
 	concurrentSinkB2 = nil
 
 	var wg sync.WaitGroup
-	var startWg sync.WaitGroup
-	startWg.Add(2)
+	var startBarrier sync.WaitGroup
+	var allocBarrier sync.WaitGroup
+	startBarrier.Add(2)
+	allocBarrier.Add(2)
 
-	// Session goroutine A: 3 × 256B (freed) + 1 × 1024B (alive).
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runtime.GcDeadSessionStart(3001)
-		startWg.Done()
-		startWg.Wait() // wait for all goroutines to Start
-		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
-		concurrentSinkA1 = make([]byte, 256)  // overwritten → dies
-		concurrentSinkA1 = make([]byte, 256)  // nil'd below → dies
-		concurrentSinkA2 = make([]byte, 1024) // kept alive
-	}()
-
-	// Session goroutine B: joins the same session 3001 from a different call site.
-	// 2 × 256B (freed) + 1 × 512B (alive).
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		runtime.GcDeadSessionStart(3001)
-		startWg.Done()
-		startWg.Wait() // wait for all goroutines to Start
-		concurrentSinkB1 = make([]byte, 256) // overwritten → dies
-		concurrentSinkB1 = make([]byte, 256) // nil'd below → dies
-		concurrentSinkB2 = make([]byte, 512) // kept alive
-		runtime.GcDeadSessionEnd(3001)
-	}()
+	wg.Add(2)
+	go concurrentAllocWorker(w, &concurrentSinkA1, &concurrentSinkA2, 1024, &startBarrier, &allocBarrier, &wg)
+	go concurrentAllocWorker(w, &concurrentSinkB1, &concurrentSinkB2, 512, &startBarrier, &allocBarrier, &wg)
 
 	wg.Wait()
 
@@ -510,10 +507,10 @@ func (w *WorkerActor) patternConcurrent() {
 	concurrentSinkA1 = nil
 	concurrentSinkB1 = nil
 
-	atomic.AddInt64(&w.stats.TotalAllocs, 7)
-	atomic.AddInt64(&w.stats.TotalBytes, 3*256+1024+2*256+512)
-	atomic.AddInt64(&w.stats.DeadAllocs, 5)
-	atomic.AddInt64(&w.stats.DeadBytes, 3*256+2*256)
+	atomic.AddInt64(&w.stats.TotalAllocs, 4)
+	atomic.AddInt64(&w.stats.TotalBytes, 256+1024+256+512)
+	atomic.AddInt64(&w.stats.DeadAllocs, 2)
+	atomic.AddInt64(&w.stats.DeadBytes, 256+256)
 
 	// Trigger GC to see per-session breakdown output.
 	runtime.GC()

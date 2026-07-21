@@ -13,6 +13,13 @@ v6: 移除 bucket 级启发式计数，完全依赖 per-session special 和会�
 v7: sessionID 改为参数传入，不再自动分配（由业务控制）。新增多 goroutine
     加入同一 session 支持（startSites + joinCount + ended 标志）。
     拆分为两个 GODEBUG 开关：gcdeadsession（会话机制）和 gcdeadtrace（分配追踪）。
+    GODEBUG=gcdeadtrace=2 额外输出 session 开始/结束事件日志。
+v8: 修复 joinCount/gcDeadSessionCount 计数（per-session 级别而非 per-goroutine）。
+    End 时 allgs 遍历清理所有 goroutine 的 session 状态，支持 start-after-end。
+    Start 中防御性检查 stale session，自动清理。
+v9: 扩展 gcDeadPerSessionSites 至 1024，gcDeadMaxStartSites 至 32。
+    gcDeadSessionTable 改为惰性分配指针（persistentalloc），
+    不启用 gcdeadtrace 时零内存开销（原 560MB 固定 BSS 数组）。
 
 
 0. 两个 GODEBUG 开关
@@ -21,7 +28,8 @@ v7: sessionID 改为参数传入，不再自动分配（由业务控制）。新
 | 开关 | 默认值 | 作用 |
 |------|--------|------|
 | `gcdeadsession` | `0` | **会话机制**：开启 Start/End API，创建 session 表项，记录边界位置 |
-| `gcdeadtrace` | `0` | **分配追踪**：采集每次分配的详情、挂 special、End 时强制 GC |
+| `gcdeadtrace` | `0` | **分配追踪**：采集每次分配的详情、挂 special、End 时强制 GC。
+                         Level 2 额外输出 session 开始/结束事件日志 |
 
 四种组合：
 
@@ -29,6 +37,7 @@ v7: sessionID 改为参数传入，不再自动分配（由业务控制）。新
 GODEBUG=gcdeadsession=1                           → 轻量模式：会话机制开启，无输出
 GODEBUG=gcdeadtrace=1                             → 完整模式（向后兼容，等价于两者都开）
 GODEBUG=gcdeadsession=1,gcdeadtrace=1             → 完整模式
+GODEBUG=gcdeadsession=1,gcdeadtrace=2             → 完整模式 + 输出 session 开始/结束事件日志
 GODEBUG=                                           → 关闭（默认）
 ```
 
@@ -151,10 +160,11 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   │   // 每会话每桶分配计数，用于 alive 站点级 session 归属 (v5)    │
   │   allocBucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef  │
   │                                                                 │
-  │   var gcDeadSessionTable [gcDeadMaxSessions]gcDeadSessionInfo    │
+  │   var gcDeadSessionTable *[gcDeadMaxSessions]gcDeadSessionInfo   │
+  │   // (v9: 惰性分配指针，persistentalloc，零内存开销)              │
   │   const gcDeadMaxSessions     = 4096                             │
-  │   const gcDeadPerSessionSites = 256                              │
-  │   const gcDeadMaxStartSites   = 8                                │
+  │   const gcDeadPerSessionSites = 1024                             │
+  │   const gcDeadMaxStartSites   = 32                               │
   └─────────────────────────────────────────────────────────────────┘
 
   ┌─────────────────────────────────────────────────────────────────┐
@@ -172,7 +182,7 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   │   cumFreeBytes uintptr        // (v6) 累计释放字节数              │
   │   typeName     string         // 类型名称 (v5)                    │
   │                                                                 │
-  │   gcDeadRecordFree 中通过 bucket 指针匹配，O(256) 线性探测       │
+  │   gcDeadRecordFree 中通过 bucket 指针匹配，O(1024) 线性探测      │
   │   allocBucketRefs 也使用同结构，cumFrees 由 gcDeadRecordFree      │
   │   在释放时通过 bucket 指针匹配后累加 (v6)。                       │
   │   每 GC 周期结束后清零 per-cycle 计数，保留 cumFrees 和指针。     │
@@ -223,23 +233,31 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   GcDeadSessionStart(id):
     1. debug.gcdeadsession==0 && debug.gcdeadtrace==0 → 直接返回
-    2. 获取 getg().m.curg
-    3. 若 gp==nil 或 gp.gcDeadSessionActive → 返回（幂等）
-    4. idx = id % gcDeadMaxSessions, e = &gcDeadSessionTable[idx]
-    5. 若 e.ended → 返回（已结束的 session 不加入）
-    6. 若 e.id != id → 首次创建，初始化条目：
+    2. 惰性分配会话表（v9）：若 gcDeadSessionTable==nil，加锁后通过
+       persistentalloc 分配 [4096]gcDeadSessionInfo。零 BSS 开销。
+    3. 获取 getg().m.curg
+    4. 若 gp==nil → 返回
+    5. 若 gp.gcDeadSessionActive:
+       - 检查对应 session 是否已结束（ended 标志）
+       - 若已结束 → 自动清理：gp.gcDeadSessionActive = false, id = 0，继续
+       - 若未结束 → 返回（幂等）
+    6. idx = id % gcDeadMaxSessions, e = &gcDeadSessionTable[idx]
+    7. 若 e.ended → 返回（已结束的 session 不加入）
+    8. 若 e.id != id → 首次创建，初始化条目：
        - e.id = id, e.endPC = 0, e.ended = false
+       - e.joinCount = 1 (v8 修复: 设 1 而不是从 0 累加)
        - e.numStartSites = 1, e.startSites[0] = {goid, pc}
        - 清零所有计数器和 bucketRefs
-    7. 否则 → 后续加入的 goroutine，CAS 添加 startSites[n]
-    8. 设置 gp.gcDeadSessionID = id, gp.gcDeadSessionActive = true
+    9. 否则 → 后续加入的 goroutine，CAS 添加 startSites[n]
+    10. 设置 gp.gcDeadSessionID = id, gp.gcDeadSessionActive = true
 
     以上为会话机制逻辑（gcdeadsession=1 或 gcdeadtrace=1 时都执行）。
 
-    9. 若 debug.gcdeadtrace > 0:
-       - e.joinCount++（原子）
-       - gcDeadSessionCount.Add(1)
-       - 若首个活跃 session → 保存 MemProfileRate 并设为 1
+    11. 若 debug.gcdeadtrace > 0:
+        - 仅首次初始化时（e.id != id 分支）:
+          gcDeadSessionCount.Add(1)
+          若首个活跃 session → 保存 MemProfileRate 并设为 1
+        - 后续加入的 goroutine 不重复递增这些计数器
 
   GcDeadSessionEnd(id):
     1. debug.gcdeadsession==0 && debug.gcdeadtrace==0 → 直接返回
@@ -249,13 +267,16 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
     5. 若 e.id != id 或 e.ended → 返回（幂等保证）
     6. e.endPC = callerPC(), e.ended = true
     7. gp.gcDeadSessionActive = false, gp.gcDeadSessionID = 0
+    8. 遍历 allgs，清理所有 gcDeadSessionID == id 的 goroutine 状态
+       (v8 修复: 确保其他 goroutine 也能重新 Start 新 session)
 
     以上为会话机制逻辑（gcdeadsession=1 或 gcdeadtrace=1 时都执行）。
 
-    8. 若 debug.gcdeadtrace > 0:
-       - jc = e.joinCount, joinCount 清零（原子）
-       - gcDeadSessionCount.Add(-jc)
-       - 若无活跃 session 了 → 恢复 MemProfileRate
+    9. 若 debug.gcdeadtrace > 0:
+       - atomic.Xaddint32(&e.joinCount, -1)  (v8: 改为 Add(-1) 而非 Xchg 清零)
+       - gcDeadSessionCount.Add(-1)
+       - 若无活跃 session → 恢复 MemProfileRate
+       - 打印 session 结束位置: "runtime: gcdeadsession: session N ended at file:line"
        - GC() 强制触发 GC，立即输出采集结果
 
   关键变更（v7）：
@@ -287,8 +308,8 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   GcDeadSessionStart() 中（gcdeadtrace>0 时执行）:
     ┌──────────────────────────────────────────────────────────────┐
-    │ joinCount++                                                 │
-    │ if gcDeadSessionCount.Add(1) == 1 {   // 首个 goroutine 加入│
+    │ // joinCount = 1（首次初始化时设 1，后续 goroutine 不递增）  │
+    │ if gcDeadSessionCount.Add(1) == 1 {   // 首个 session 创建   │
     │     gcDeadSavedRate = MemProfileRate    // 保存原始值        │
     │     MemProfileRate = 1                  // 设置为全采集      │
     │ }                                                           │
@@ -296,19 +317,21 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   GcDeadSessionEnd() 中（gcdeadtrace>0 时执行）:
     ┌──────────────────────────────────────────────────────────────┐
-    │ jc = xchg joinCount, 0     // 一次性减去所有 goroutine      │
-    │ if gcDeadSessionCount.Add(-jc) <= 0 {  // 所有 goroutine 结束 │
+    │ atomic.Xaddint32(&e.joinCount, -1)  // 减 1 而非 Xchg 清零  │
+    │ if gcDeadSessionCount.Add(-1) <= 0 {  // 最后一个 session 结束│
     │     MemProfileRate = gcDeadSavedRate   // 恢复原始值         │
     │ }                                                           │
     │ GC()  // 强制触发 GC 立即输出                                │
     └──────────────────────────────────────────────────────────────┘
 
-  设计要点（v7）：
-    - joinCount 替代 gcDeadSessionCount 的 per-goroutine 递增（v2-v6）
-    - joinCount 跟踪的是"加入该 session 的 goroutine 数"
-    - gcDeadSessionCount 是所有 session 的 joinCount 之和
-    - End 时一次性扣除 joinCount，确保计数正确
-    - 首个 goroutine 加入时设置 MemProfileRate=1，最后一个结束才恢复
+  设计要点（v7，v8 修复）：
+    - v7 原来的设计：joinCount 是每个 goroutine 加入时 +1，End 时 Xchg 清零一次性减去所有
+    - v8 修复：joinCount 只在首次初始化时设 1（per-session 级别），End 时 Add(-1)
+    - 修复理由：joinCount 只应反映 session 级别（始终为 1），不是每个 goroutine 都 +1
+    - gcDeadSessionCount 也同理：只和 session 数 1:1，不和 goroutine 数绑定
+    - End 后 allgs 遍历清理所有 goroutine 的 session 状态（v8 新增）
+    - Start 防御性检查：若当前 goroutine 的 session 已结束，自动清理并允许重新 Start
+    - MemProfileRate 正确恢复条件：gcDeadSessionCount 到达 0（最后一个 session 结束时）
     - 强制 GC() 确保 End 后立即输出，避免等待下次自然 GC
 
   性能考量：
@@ -601,7 +624,7 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   限制:
     - sessionRefs/aliveSessionRefs 数组大小为 16 (gcDeadSessionRefSlots)
-    - bucketRefs/allocBucketRefs 数组大小为 256 (gcDeadPerSessionSites)，超过时 LRU 替换
+    - bucketRefs/allocBucketRefs 数组大小为 1024 (gcDeadPerSessionSites)，超过时 LRU 替换
     - GC 间清理机制确保不产生跨周期陈旧归属
 
 
@@ -712,14 +735,22 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   v7 关键区别：
     - 不再有 goid 字段（多 goroutine 共享 session，goid 存在于 startSites 中）
     - 新增 ended 标志，保证 End 仅一次
-    - 新增 joinCount 管理 MemProfileRate
+    - 新增 joinCount 管理 MemProfileRate（v8 修复 per-session 级别计数）
     - startSites 记录所有 goroutine 的 Start 位置
+    - End 时 allgs 遍历清理所有 goroutine 的 session 状态（v8 新增）
+
+  v8 修复：
+    - joinCount = 1（per-session 级别），不是 per-goroutine 累加
+    - End 时 Add(-1) 而非 Xchg 清零
+    - gcDeadSessionCount 只和 session 数 1:1
+    - Start 防御性检查 stale session（允许 start-after-end）
 
   常量:
     最大并发 sessions:    4096 (gcDeadMaxSessions)
-    Per-session 站点上限: 256  (gcDeadPerSessionSites)，超过时 LRU 替换
-    最大 start 位置数:    8    (gcDeadMaxStartSites)
+    Per-session 站点上限: 1024 (gcDeadPerSessionSites)，超过时 LRU 替换
+    最大 start 位置数:    32   (gcDeadMaxStartSites)
     Session 归属 slot 数: 16   (gcDeadSessionRefSlots)
+    会话表存储:           惰性分配指针（persistentalloc），零关闭开销（v9）
 
 
 12. 关键文件
@@ -825,7 +856,10 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 =============
 
 14.1 会话表容量限制 (gcDeadMaxSessions = 4096)
-  会话表使用固定大小数组 gcDeadSessionTable[4096]，按 sessionID % 4096 索引。
+  会话表使用惰性分配指针 gcDeadSessionTable，首次调用 GcDeadSessionStart
+  时通过 persistentalloc 分配 4096 个条目。按 sessionID % 4096 索引。
+  不启用 gcdeadtrace/gcdeadsession 时零内存开销（v9 变更：原固定 BSS 数组
+  约 560MB → 惰性分配指针，仅在使用时分配）。
   当并发 session 数超过 4096 时，新 session 会覆盖旧 session 的表条目，
   旧 session 后续的释放数据丢失（gcDeadRecordFree 中 e.id != sessionID
   检查失败，提前 return）。
@@ -841,10 +875,10 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   已从 64 增大至 4096（v6），大幅降低冲突概率。如果仍有冲突，可考虑
   改用可扩容哈希表结构。
 
-14.2 Per-Session 分配站点跟踪限制 (gcDeadPerSessionSites = 256)
-  每个 session 表条目仅有 256 个 bucketRefs + 256 个 allocBucketRefs 槽位。
-  v6 从 8 增大至 256，覆盖绝大多数 session 分配场景。超过 256 个不同站点时，
-  多余站点仍会覆盖 slot 0（LRU 近似策略），但概率极低。
+14.2 Per-Session 分配站点跟踪限制 (gcDeadPerSessionSites = 1024)
+  每个 session 表条目仅有 1024 个 bucketRefs + 1024 个 allocBucketRefs 槽位。
+  v6 从 8 增大至 256，v9 从 256 增大至 1024，覆盖绝大多数 session 分配场景。
+  超过 1024 个不同站点时，多余站点仍会覆盖 slot 0（LRU 近似策略），但概率极低。
 
 14.3 全局站点行归属限制 (gcDeadSessionRefSlots = 16)
   gcdeadsession:freed 和 alived 的站点行中，per-session 归属标注最多支持 16 个
@@ -884,11 +918,16 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   不支持非 ASCII 字符（中文等）。建议使用英文路径。
   仅在 Windows 平台有此限制。
 
-14.10 多 goroutine startSites 上限 (gcDeadMaxStartSites = 8)
-  每个 session 最多记录 8 个 goroutine 的 Start 位置。理论上同一 session
-  可以由超过 8 个 goroutine 同时使用，但超过限制的 goroutine 的 startSites
+14.10 多 goroutine startSites 上限 (gcDeadMaxStartSites = 32)
+  每个 session 最多记录 32 个 goroutine 的 Start 位置。理论上同一 session
+  可以由超过 32 个 goroutine 同时使用，但超过限制的 goroutine 的 startSites
   不会被记录（输出中不显示），仅 joinCount 保持准确。
-  若需要更多，可增大 gcDeadMaxStartSites 常量。
+  v9 从 8 增大至 32。
+
+14.11 End 后 allgs 遍历的锁竞争
+  GcDeadSessionEnd 中遍历 allgs 时需要持有 allglock。在极高频 End 调用
+  （每秒数十万次）的场景下，allglock 可能产生短暂竞争。影响较小，因为
+  allglock 锁粒度轻（仅保护 allgs 增删），遍历时间在百微秒级。
 
 
 附录: GODEBUG 使用说明
@@ -898,6 +937,12 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
    // 完整模式：启用 gcdeadtrace，输出到 stderr
    GODEBUG=gcdeadtrace=1 go run main.go
+
+   // 完整模式 + session 开始/结束日志 (gcdeadtrace=2)
+   GODEBUG=gcdeadtrace=2 go run main.go
+   // 输出新增:
+   //   runtime: gcdeadsession: session 1001 started at main.go:100
+   //   runtime: gcdeadsession: session 1001 ended at main.go:200
 
    // 轻量模式：开启会话机制，无输出（仅 gcdeadsession=1）
    GODEBUG=gcdeadsession=1 go run main.go
@@ -983,7 +1028,8 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
      // goroutine B（同一 session）
      runtime.GcDeadSessionStart(42)
      // ... 分配 ...
-     // B 不调 End，由 A 调 End 即可
+     // B 不调 End，由 A 调 End 即可。End 后所有 goroutine 被清理，
+     // B 可随后启动新 session: runtime.GcDeadSessionStart(43)
 
 4. 文件输出说明
 
