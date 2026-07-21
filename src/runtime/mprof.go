@@ -1692,7 +1692,10 @@ func GcDeadSessionStart(id uint64) {
 
 	// If this is the first time this sessionId is being used, initialize entry.
 	if e.id != id {
-		e.id = id
+		// WARNING: all per-session data structures must be initialized BEFORE
+		// setting e.id, otherwise a concurrently joining goroutine (which sees
+		// e.id == id) may write to goroutineStats/bucketRefs/startSites only
+		// to have them erased by the ongoing initialization.
 		e.endPC = 0
 		e.ended = false
 		e.printed = 0
@@ -1723,6 +1726,9 @@ func GcDeadSessionStart(id uint64) {
 			e.goroutineStats[j] = gcDeadGoroutineStat{}
 		}
 		e.goroutineStats[0].goid = gp.goid
+		// Publish the initialized entry last so that a concurrently joining
+		// goroutine sees a consistent snapshot.
+		e.id = id
 
 		if debug.gcdeadtrace > 0 {
 			// Ensure all allocations are profiled for accurate session tracking.
