@@ -1015,7 +1015,7 @@ func gcDeadTracePrint() {
 				continue
 			}
 			for _, br := range se.allocBucketRefs {
-				if br.bucket == nil || br.frees == 0 {
+				if br.bucket == nil {
 					continue
 				}
 				bp := (*bucket)(br.bucket)
@@ -1129,12 +1129,6 @@ func gcDeadTracePrint() {
 					atomic.Storeuintptr(&se.bucketRefs[j].frees, 0)
 					atomic.Storeuintptr(&se.bucketRefs[j].bytes, 0)
 				}
-			}
-		}
-		for j := range se.allocBucketRefs {
-			if se.allocBucketRefs[j].bucket != nil {
-				atomic.Storeuintptr(&se.allocBucketRefs[j].frees, 0)
-				atomic.Storeuintptr(&se.allocBucketRefs[j].bytes, 0)
 			}
 		}
 		}
