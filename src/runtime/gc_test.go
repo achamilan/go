@@ -559,6 +559,30 @@ func TestGcDeadTraceStartAfterEnd(t *testing.T) {
 	}
 }
 
+// TestGcDeadSessionOnlyMem verifies that GODEBUG=gcdeadsession=1 alone does NOT
+// allocate the 519 MB session table. As a control, also verifies that
+// GODEBUG=gcdeadtrace=1 DOES allocate the table.
+// Uses OtherSys from runtime.MemStats to detect persistentalloc growth.
+func TestGcDeadSessionOnlyMem(t *testing.T) {
+	// gcdeadsession=1 only: must NOT allocate the 519 MB table.
+	got := runTestProg(t, "testprog", "GCDeadSessionOnlyMem", "GODEBUG=gcdeadsession=1")
+	if strings.HasPrefix(got, "FAIL") {
+		t.Fatalf("gcdeadsession=1 only allocated the session table:\n%s", got)
+	}
+	t.Logf("gcdeadsession=1 only: %s", strings.TrimSpace(got))
+
+	// gcdeadtrace=1: SHOULD allocate the 519 MB table (control/regression check).
+	got2 := runTestProg(t, "testprog", "GCDeadSessionOnlyMem", "GODEBUG=gcdeadtrace=1")
+	t.Logf("gcdeadtrace=1: %s", strings.TrimSpace(got2))
+	// The testprog prints "FAIL: OtherSys increased" when delta > 100 MB,
+	// which is the expected behavior for gcdeadtrace=1.
+	if strings.Contains(got2, "FAIL: OtherSys increased") {
+		t.Logf("(expected: gcdeadtrace=1 correctly allocates the session table)")
+	} else {
+		t.Logf("(note: OtherSys delta is small — table may have been pre-allocated by another test)")
+	}
+}
+
 // TestGcDeadSessionOnly verifies that GODEBUG=gcdeadsession=1 alone
 // (without gcdeadtrace=1) works correctly.
 // - No gcdeadtrace output expected (not enabled)

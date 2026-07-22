@@ -35,6 +35,7 @@ func init() {
 	register("GCDeadTraceBucketOvercountConcurrent", GCDeadTraceBucketOvercountConcurrent)
 	register("GCDeadTraceStartAfterEnd", GCDeadTraceStartAfterEnd)
 	register("GCDeadSessionOnly", GCDeadSessionOnly)
+	register("GCDeadSessionOnlyMem", GCDeadSessionOnlyMem)
 }
 
 func GCSys() {
@@ -828,6 +829,41 @@ func GCDeadSessionOnly() {
 	_ = live
 
 	fmt.Println("OK")
+}
+
+// GCDeadSessionOnlyMem checks whether the 519 MB session table is allocated
+// during GcDeadSessionStart/End by measuring runtime.MemStats.OtherSys delta.
+// Expected behavior:
+//   - With GODEBUG=gcdeadsession=1 alone: delta ≪ 100 MB (no table allocation)
+//   - With GODEBUG=gcdeadtrace=1: delta ≈ 519 MB (table allocated for tracing)
+func GCDeadSessionOnlyMem() {
+	runtime.MemProfileRate = 1
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	// Session operations — same pattern as GCDeadSessionOnly.
+	runtime.GcDeadSessionStart(801)
+	for i := 0; i < 100; i++ {
+		deadSink = make([]byte, 256)
+	}
+	deadSink = nil
+	runtime.GcDeadSessionEnd(801)
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+
+	// Handle potential noise: OtherSys may slightly decrease between reads.
+	delta := uint64(0)
+	if after.OtherSys > before.OtherSys {
+		delta = after.OtherSys - before.OtherSys
+	}
+	const threshold = 100 * 1024 * 1024 // 100 MB
+	if delta > threshold {
+		fmt.Printf("FAIL: OtherSys increased by %d bytes (>= %d), table was allocated\n", delta, threshold)
+		return
+	}
+	fmt.Printf("OK: OtherSys delta = %d bytes (< %d), no table allocation\n", delta, threshold)
 }
 
 // Test SetMemoryLimit functionality.
