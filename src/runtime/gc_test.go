@@ -559,6 +559,25 @@ func TestGcDeadTraceStartAfterEnd(t *testing.T) {
 	}
 }
 
+// TestGcDeadSessionOnly verifies that GODEBUG=gcdeadsession=1 alone
+// (without gcdeadtrace=1) works correctly.
+// - No gcdeadtrace output expected (not enabled)
+// - No crash, no hang
+// - Session table allocates and GcDeadSessionStart/End operate correctly
+func TestGcDeadSessionOnly(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadSessionOnly", "GODEBUG=gcdeadsession=1")
+
+	// Must not contain gcdeadtrace output (gcdeadtrace is not enabled).
+	if strings.Contains(got, "gcdeadsession") {
+		t.Errorf("unexpected gcdeadsession output with only gcdeadsession=1:\n%s", got)
+	}
+
+	// Must print OK and nothing else.
+	if want := "OK\n"; got != want {
+		t.Fatalf("expected %q, but got %q", want, got)
+	}
+}
+
 func TestGCTestMoveStackOnNextCall(t *testing.T) {
 	if asan.Enabled {
 		t.Skip("extra allocations with -asan causes this to fail; see #70079")

@@ -34,6 +34,7 @@ func init() {
 	register("GCDeadTraceBucketOvercount", GCDeadTraceBucketOvercount)
 	register("GCDeadTraceBucketOvercountConcurrent", GCDeadTraceBucketOvercountConcurrent)
 	register("GCDeadTraceStartAfterEnd", GCDeadTraceStartAfterEnd)
+	register("GCDeadSessionOnly", GCDeadSessionOnly)
 }
 
 func GCSys() {
@@ -797,6 +798,35 @@ func GCDeadTraceStartAfterEnd() {
 	gcDeadAfterEndS1Die = nil
 
 	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadSessionOnly tests that GODEBUG=gcdeadsession=1 alone works without
+// gcdeadtrace=1. There should be no gcdeadtrace output, no crash, and no hang.
+// This validates that the session table allocation and GcDeadSessionStart/End
+// operate correctly without any gcdeadtrace dependencies.
+func GCDeadSessionOnly() {
+	runtime.MemProfileRate = 1 // profile every allocation
+
+	// Allocate and free within a session.
+	runtime.GcDeadSessionStart(601)
+	for i := 0; i < 100; i++ {
+		deadSink = make([]byte, 256)
+	}
+	deadSink = nil
+	runtime.GcDeadSessionEnd(601)
+
+	// Second session to ensure multi-session stability.
+	runtime.GcDeadSessionStart(602)
+	live := make([]byte, 1024)
+	deadSink = make([]byte, 128)
+	deadSink = nil
+	runtime.GcDeadSessionEnd(602)
+
+	// Force GC to exercise sweep path (gcDeadRecordFree called without specials).
+	runtime.GC()
+	_ = live
+
 	fmt.Println("OK")
 }
 
