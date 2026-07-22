@@ -1659,8 +1659,21 @@ func GcDeadSessionStart(id uint64) {
 	if debug.gcdeadsession == 0 && debug.gcdeadtrace == 0 {
 		return
 	}
-	// Lazily allocate the session table. Only allocated when gcdeadtrace/gcdeadsession
-	// is actually used so there is zero overhead when the feature is disabled.
+
+	gp := getg().m.curg
+	if gp == nil {
+		return
+	}
+
+	if debug.gcdeadtrace == 0 {
+		// gcdeadsession=1 only: lightweight path, no session table needed.
+		gp.gcDeadSessionActive = true
+		gp.gcDeadSessionID = id
+		return
+	}
+
+	// Lazily allocate the session table. Only allocated when gcdeadtrace>0
+	// so that gcdeadsession=1 alone doesn't pay the 519 MB table cost.
 	if gcDeadSessionTable == nil {
 		lock(&gcDeadSessionTableLock)
 		if gcDeadSessionTable == nil {
@@ -1669,10 +1682,6 @@ func GcDeadSessionStart(id uint64) {
 			gcDeadSessionTable = (*[gcDeadMaxSessions]gcDeadSessionInfo)(p)
 		}
 		unlock(&gcDeadSessionTableLock)
-	}
-	gp := getg().m.curg
-	if gp == nil {
-		return
 	}
 	if gp.gcDeadSessionActive {
 		// Check if the goroutine's current session has already ended
@@ -1807,16 +1816,6 @@ func GcDeadSessionEnd(id uint64) {
 		return
 	}
 
-	idx := id % gcDeadMaxSessions
-	e := &gcDeadSessionTable[idx]
-	if e.id != id || e.ended {
-		return
-	}
-
-	// Record the caller's PC for end location output.
-	e.endPC = sys.GetCallerPC()
-	e.ended = true
-
 	// Clear the calling goroutine's session state.
 	gp.gcDeadSessionActive = false
 	gp.gcDeadSessionID = 0
@@ -1832,24 +1831,37 @@ func GcDeadSessionEnd(id uint64) {
 	}
 	unlock(&allglock)
 
-	if debug.gcdeadtrace > 0 {
-		atomic.Xaddint32(&e.joinCount, -1)
-		if gcDeadSessionCount.Add(-1) <= 0 {
-			MemProfileRate = gcDeadSavedRate
-		}
-
-		// Print session end location.
-		pc := sys.GetCallerPC()
-		f := findfunc(pc)
-		if f.valid() {
-			file, line := funcline(f, pc)
-			print("runtime: gcdeadsession: session ", id, " ended at ", file, ":", line, "\n")
-		}
-
-		// Force a full GC to immediately collect and report
-		// session allocation data.
-		GC()
+	if debug.gcdeadtrace == 0 {
+		// gcdeadsession=1 only: lightweight path, no session table needed.
+		return
 	}
+
+	idx := id % gcDeadMaxSessions
+	e := &gcDeadSessionTable[idx]
+	if e.id != id || e.ended {
+		return
+	}
+
+	// Record the caller's PC for end location output.
+	e.endPC = sys.GetCallerPC()
+	e.ended = true
+
+	atomic.Xaddint32(&e.joinCount, -1)
+	if gcDeadSessionCount.Add(-1) <= 0 {
+		MemProfileRate = gcDeadSavedRate
+	}
+
+	// Print session end location.
+	pc := sys.GetCallerPC()
+	f := findfunc(pc)
+	if f.valid() {
+		file, line := funcline(f, pc)
+		print("runtime: gcdeadsession: session ", id, " ended at ", file, ":", line, "\n")
+	}
+
+	// Force a full GC to immediately collect and report
+	// session allocation data.
+	GC()
 }
 
 // gcDeadSessionCount tracks the number of active gcdeadtrace sessions.
