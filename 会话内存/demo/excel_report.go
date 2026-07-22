@@ -169,7 +169,7 @@ type xlsxSheet struct {
 	colWidths []float64
 }
 
-const maxColWidth = 200.0
+const maxColWidth = 70.0
 
 func (s *xlsxSheet) addRow(cells ...string) {
 	s.rows = append(s.rows, cells)
