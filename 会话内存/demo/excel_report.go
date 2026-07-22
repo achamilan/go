@@ -169,7 +169,7 @@ type xlsxSheet struct {
 	colWidths []float64
 }
 
-const maxColWidth = 70.0
+const maxColWidth = 200.0
 
 func (s *xlsxSheet) addRow(cells ...string) {
 	s.rows = append(s.rows, cells)
@@ -480,7 +480,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			for r := range si.Refs { refs = append(refs, r) }
 			sort.Strings(refs)
 			refStr := strings.Join(refs, "; ")
-			if len(refStr) > 1000 { refStr = refStr[:997] + "..." }
+			if len(refStr) > 10000 { refStr = refStr[:9997] + "..." }
 			// Extract the first (file:line) from the call stack = actual alloc point.
 			// For simple stacks (no call chain), fall back to si.Loc.
 			loc := firstFileLine(si.Func, si.Loc)
@@ -562,7 +562,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		for f := range aa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
+		if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
 		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
 			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
 			fmt.Sprint(len(funcs)), fnStr)
@@ -605,7 +605,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		for f := range fa.Funcs { funcs = append(funcs, f) }
 		sort.Strings(funcs)
 		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 1000 { fnStr = fnStr[:997] + "..." }
+		if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
 		s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
 			fmt.Sprint(len(funcs)), fnStr)
 	}
