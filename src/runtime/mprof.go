@@ -520,7 +520,7 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				// only session-level cumulative counts remain accurate.
 				if gcDeadSessionTable != nil {
 					printlock()
-					print("gcdeadtrace: session #", e.id, " allocBucketRefs overflow (>", gcDeadPerSessionSites, " sites), evicting slot 0\n")
+					print("runtime: gcdeadtrace: session #", e.id, " allocBucketRefs overflow (>", gcDeadPerSessionSites, " sites), evicting slot 0\n")
 					printunlock()
 				}
 				e.allocBucketRefs[0].bucket = bp
