@@ -497,16 +497,23 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 				// Record alloc bucket ref for alive session attribution.
 				bp := unsafe.Pointer(b)
 			allocBucketSearch:
-				if e.allocBucketRefs == nil {
+				refsPtr := e.allocBucketRefs
+				if refsPtr == nil {
 					// Lazily allocate the initial bucket ref array.
 					initLen := uint32(gcDeadPerSessionSites)
 					e.allocBucketRefs = (*gcDeadSessionBucketRef)(persistentalloc(
 						uintptr(initLen)*unsafe.Sizeof(gcDeadSessionBucketRef{}),
 						0, &memstats.other_sys))
 					e.allocBucketRefsLen = initLen
+					goto allocBucketSearch
 				}
-				refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(e.allocBucketRefs))
+				// Capture refs and len: if GcDeadSessionStart concurrently clears the slot,
+				// len may be 0 even though refsPtr is non-nil. Check and retry.
+				refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(refsPtr))
 				len := e.allocBucketRefsLen
+				if len == 0 {
+					goto allocBucketSearch
+				}
 				for j := uint32(0); j < len; j++ {
 					// Fast path: matching bucket AND same goroutine.
 					if refs[j].bucket == bp && refs[j].goid == gp.goid {
@@ -930,6 +937,9 @@ func gcDeadTracePrint() {
 	for si := range table {
 		se := &table[si]
 			if se.id == 0 {
+				continue
+			}
+			if se.allocBucketRefs == nil {
 				continue
 			}
 			refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(se.allocBucketRefs))
@@ -1591,6 +1601,9 @@ func gcDeadTracePrint() {
 		for si := range table {
 			se := &table[si]
 			if se.id == 0 {
+				continue
+			}
+			if se.allocBucketRefs == nil {
 				continue
 			}
 			refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(se.allocBucketRefs))
