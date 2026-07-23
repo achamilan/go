@@ -384,10 +384,17 @@ func buildOverviewSheet(allData []*ParsedData) *xlsxSheet {
 	s := &xlsxSheet{name: "Overview", colWidths: make([]float64, 20)}
 	s.addHeaderRow("Mode", "GC Cycles", "Sessions", "Freed Objs", "Alive Objs", "Avg Freed/GC", "Avg Alive/GC")
 	for _, d := range allData {
-		tf, ta := 0, 0
+		tf := 0
 		for _, gc := range d.GCCycles {
 			if gc.Freed != nil { tf += gc.Freed.Objs }
-			if gc.Alive != nil { ta += gc.Alive.Objs }
+		}
+		// Total Alive: last GC cycle with alive data (current snapshot), not sum.
+		ta := 0
+		for i := len(d.GCCycles) - 1; i >= 0; i-- {
+			if d.GCCycles[i].Alive != nil {
+				ta = d.GCCycles[i].Alive.Objs
+				break
+			}
 		}
 		sessSet := make(map[int]bool)
 		for _, gc := range d.GCCycles {
@@ -406,10 +413,17 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	s := &xlsxSheet{name: data.Mode, colWidths: make([]float64, 20)}
 	gcs := data.GCCycles
 
-	tf, ta := 0, 0
+	tf := 0
 	for _, gc := range gcs {
 		if gc.Freed != nil { tf += gc.Freed.Objs }
-		if gc.Alive != nil { ta += gc.Alive.Objs }
+	}
+	// Total Alive: last GC cycle with alive data (current snapshot), not sum.
+	ta := 0
+	for i := len(gcs) - 1; i >= 0; i-- {
+		if gcs[i].Alive != nil {
+			ta = gcs[i].Alive.Objs
+			break
+		}
 	}
 	sessSet := make(map[int]bool)
 	for _, gc := range gcs {
