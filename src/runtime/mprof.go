@@ -496,38 +496,60 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 
 				// Record alloc bucket ref for alive session attribution.
 				bp := unsafe.Pointer(b)
-				for j := range e.allocBucketRefs {
+			allocBucketSearch:
+				if e.allocBucketRefs == nil {
+					// Lazily allocate the initial bucket ref array.
+					initLen := uint32(gcDeadPerSessionSites)
+					e.allocBucketRefs = (*gcDeadSessionBucketRef)(persistentalloc(
+						uintptr(initLen)*unsafe.Sizeof(gcDeadSessionBucketRef{}),
+						0, &memstats.other_sys))
+					e.allocBucketRefsLen = initLen
+				}
+				refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(e.allocBucketRefs))
+				len := e.allocBucketRefsLen
+				for j := uint32(0); j < len; j++ {
 					// Fast path: matching bucket AND same goroutine.
-					if e.allocBucketRefs[j].bucket == bp && e.allocBucketRefs[j].goid == gp.goid {
-						atomic.Xadduintptr(&e.allocBucketRefs[j].frees, 1)
-						atomic.Xadduintptr(&e.allocBucketRefs[j].bytes, size)
-						e.allocBucketRefs[j].goid = gp.goid
+					if refs[j].bucket == bp && refs[j].goid == gp.goid {
+						atomic.Xadduintptr(&refs[j].frees, 1)
+						atomic.Xadduintptr(&refs[j].bytes, size)
+						refs[j].goid = gp.goid
 						goto done2
 					}
 				}
-				for j := range e.allocBucketRefs {
-					if e.allocBucketRefs[j].bucket == nil {
-						e.allocBucketRefs[j].bucket = bp
-						e.allocBucketRefs[j].goid = gp.goid
-						e.allocBucketRefs[j].frees = 1
-						e.allocBucketRefs[j].bytes = size
-						e.allocBucketRefs[j].typeName = tn
+				for j := uint32(0); j < len; j++ {
+					if refs[j].bucket == nil {
+						refs[j].bucket = bp
+						refs[j].goid = gp.goid
+						refs[j].frees = 1
+						refs[j].bytes = size
+						refs[j].typeName = tn
 						goto done2
 					}
 				}
-				// All slots full: overwrite first (LRU-approximate).
-				// Per-site attribution for the evicted entry will be lost —
-				// only session-level cumulative counts remain accurate.
-				if gcDeadSessionTable != nil {
-					printlock()
-					print("runtime: gcdeadtrace: session #", e.id, " allocBucketRefs overflow (>", gcDeadPerSessionSites, " sites), evicting slot 0\n")
-					printunlock()
+				// All slots full: grow the array (double capacity).
+				lock(&e.allocBucketRefsLock)
+				// Re-check after acquiring lock: another goroutine may have grown.
+				if e.allocBucketRefsLen == len {
+					newLen := len * 2
+					newRefs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(persistentalloc(
+						uintptr(newLen)*unsafe.Sizeof(gcDeadSessionBucketRef{}),
+						0, &memstats.other_sys)))
+					for j := uint32(0); j < len; j++ {
+						newRefs[j] = refs[j]
+					}
+					newRefs[len].bucket = bp
+					newRefs[len].goid = gp.goid
+					newRefs[len].frees = 1
+					newRefs[len].bytes = size
+					newRefs[len].typeName = tn
+					e.allocBucketRefs = (*gcDeadSessionBucketRef)(unsafe.Pointer(newRefs))
+					e.allocBucketRefsLen = newLen
+				} else {
+					// Already grown by another goroutine: retry.
+					unlock(&e.allocBucketRefsLock)
+					goto allocBucketSearch
 				}
-				e.allocBucketRefs[0].bucket = bp
-				e.allocBucketRefs[0].goid = gp.goid
-				e.allocBucketRefs[0].frees = 1
-				e.allocBucketRefs[0].bytes = size
-				e.allocBucketRefs[0].typeName = tn
+				unlock(&e.allocBucketRefsLock)
 			done2:
 			}
 		}
@@ -719,11 +741,11 @@ type gcDeadSessionInfo struct {
 	goroutineStats [gcDeadMaxStartSites]gcDeadGoroutineStat
 
 	// Per-bucket alloc/free tracking, populated by mProf_Malloc and gcDeadRecordFree.
-	// Used in gcDeadTracePrint for both freed and alive site attribution via
-	// cumulative frees delta (cumFrees - prevCumFrees) and alive = frees - cumFrees.
-	// Entries persist across GC cycles to avoid lost attribution when all objects
-	// from a site are freed. See gcDeadPerSessionSites for capacity.
-	allocBucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef
+	// Dynamically allocated via persistentalloc and grows by doubling when full.
+	// See gcDeadPerSessionSites for initial capacity.
+	allocBucketRefs     *gcDeadSessionBucketRef
+	allocBucketRefsLen  uint32
+	allocBucketRefsLock mutex
 }
 
 // Session tracking table. Entries are indexed by session ID % gcDeadMaxSessions.
@@ -763,12 +785,13 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 	// allocBucketRefs entries persist across GC cycles (created at allocation time),
 	// avoiding the loss of site attribution when per-cycle entries
 	// would be evicted.
-	if b != nil {
+	if b != nil && e.allocBucketRefs != nil {
 		bp := unsafe.Pointer(b)
-		for j := range e.allocBucketRefs {
-			if e.allocBucketRefs[j].bucket == bp && e.allocBucketRefs[j].goid == goid {
-				atomic.Xadduintptr(&e.allocBucketRefs[j].cumFrees, 1)
-				atomic.Xadduintptr(&e.allocBucketRefs[j].cumFreeBytes, size)
+		refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(e.allocBucketRefs))
+		for j := uint32(0); j < e.allocBucketRefsLen; j++ {
+			if refs[j].bucket == bp && refs[j].goid == goid {
+				atomic.Xadduintptr(&refs[j].cumFrees, 1)
+				atomic.Xadduintptr(&refs[j].cumFreeBytes, size)
 				break
 			}
 		}
@@ -909,7 +932,9 @@ func gcDeadTracePrint() {
 			if se.id == 0 {
 				continue
 			}
-			for _, br := range se.allocBucketRefs {
+			refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(se.allocBucketRefs))
+			for j := uint32(0); j < se.allocBucketRefsLen; j++ {
+				br := &refs[j]
 				if br.bucket == nil {
 					continue
 				}
@@ -1568,8 +1593,9 @@ func gcDeadTracePrint() {
 			if se.id == 0 {
 				continue
 			}
-			for j := range se.allocBucketRefs {
-				br := &se.allocBucketRefs[j]
+			refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(se.allocBucketRefs))
+			for j := uint32(0); j < se.allocBucketRefsLen; j++ {
+				br := &refs[j]
 				if br.bucket == nil {
 					continue
 				}
@@ -1609,6 +1635,9 @@ func GcDeadSessionStart(id uint64) {
 
 	gp := getg().m.curg
 	if gp == nil {
+		if debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: not in goroutine context\n")
+		}
 		return
 	}
 
@@ -1640,6 +1669,9 @@ func GcDeadSessionStart(id uint64) {
 			gp.gcDeadSessionActive = false
 			gp.gcDeadSessionID = 0
 		} else {
+			if debug.gcdeadtrace > 0 {
+				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: already in session ", gp.gcDeadSessionID, "\n")
+			}
 			return
 		}
 	}
@@ -1649,6 +1681,9 @@ func GcDeadSessionStart(id uint64) {
 
 	// If session has already ended, don't join.
 	if e.ended {
+		if debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: session already ended\n")
+		}
 		return
 	}
 
@@ -1677,9 +1712,8 @@ func GcDeadSessionStart(id uint64) {
 		e.cumFrees = 0
 		e.cumFreeBytes = 0
 		// Clear alloc bucket refs from any previous session.
-		for j := range e.allocBucketRefs {
-			e.allocBucketRefs[j] = gcDeadSessionBucketRef{}
-		}
+		e.allocBucketRefs = nil
+		e.allocBucketRefsLen = 0
 		// Clear goroutine stats from any previous session.
 		for j := range e.goroutineStats {
 			e.goroutineStats[j] = gcDeadGoroutineStat{}
@@ -1757,6 +1791,15 @@ func GcDeadSessionEnd(id uint64) {
 	}
 	gp := getg().m.curg
 	if gp == nil || !gp.gcDeadSessionActive || gp.gcDeadSessionID != id {
+		if debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (active=", gp != nil && gp.gcDeadSessionActive, ", id=")
+			if gp != nil {
+				print(gp.gcDeadSessionID)
+			} else {
+				print("nil")
+			}
+			print(")\n")
+		}
 		return
 	}
 
@@ -1783,6 +1826,13 @@ func GcDeadSessionEnd(id uint64) {
 	idx := id % gcDeadMaxSessions
 	e := &gcDeadSessionTable[idx]
 	if e.id != id || e.ended {
+		if debug.gcdeadtrace > 0 {
+			if e.ended {
+				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session already ended\n")
+			} else {
+				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: hash slot occupied by session ", e.id, "\n")
+			}
+		}
 		return
 	}
 

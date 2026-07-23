@@ -28,7 +28,10 @@ v10: 移除已废弃的 bucketRefs（死代码），allocBucketRefs 从 1024 扩
      移除 per-cycle allocBucketRefs 清零操作，实现跨周期 freed/alive 正确归属。
      新增 prevCumFrees/prevCumFreeBytes 字段用于 freed delta 快照。
      gcDeadRecordFree 简化：移除 bucketRefs 和类型名解析，仅更新 cumFrees。
-     溢出时输出 runtime: gcdeadtrace: All slots full 警告。
+v11: allocBucketRefs 改为动态扩展（指针 + 长度 + mutex），移除 2048 上限。
+     初始大小为 gcDeadPerSessionSites，满时翻倍扩容（persistentalloc），
+     无溢出警告。mProf_Malloc 路径无锁探测，仅在扩容时加锁 re-check。
+     所有遍历代码改为 for j := uint32(0); j < len; j++ + 数组指针转换。
 
 
 2. GODEBUG 开关
@@ -143,7 +146,9 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   │   cumFreeBytes uintptr // 累计释放字节                          │
   │                                                                 │
   │   // 每会话每桶分配+释放计数，用于 freed/alive 站点级 session 归属
-  │   allocBucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef
+  │   allocBucketRefs     *gcDeadSessionBucketRef // v11: 动态扩展指针
+  │   allocBucketRefsLen  uint32                   // 当前数组长度
+  │   allocBucketRefsLock mutex                    // 扩容保护锁
   │                                                                 │
   │   var gcDeadSessionTable *[gcDeadMaxSessions]gcDeadSessionInfo   │
   │   // (v9: 惰性分配指针，persistentalloc，零内存开销)              │
@@ -177,7 +182,7 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   │                                                                 │
   │   freed 站点计数 = cumFrees - prevCumFrees (本轮释放数, v10)    │
   │   alive 站点计数 = frees - cumFrees (当前存活数)               │
-  │   线性探测 O(2048) 查找 bucket 指针。                           │
+  │   线性探测 O(N) 查找 bucket 指针。                           │
   └─────────────────────────────────────────────────────────────────┘
 
 3.6 gcDeadSessionRef — 输出中 session 归属结构
@@ -351,20 +356,38 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
     B2 — 更新 allocBucketRefs（站点级分配记录）:
 
-      allocBucketRefs 是 [2048]gcDeadSessionBucketRef 数组，按 bucket 指针匹配：
+      allocBucketRefs 是动态扩展的 *gcDeadSessionBucketRef 数组
+      （v11: 初始 gcDeadPerSessionSites 个，满时翻倍扩容）：
 
         bp = unsafe.Pointer(b)
-        for j := range e.allocBucketRefs {
-            if e.allocBucketRefs[j].bucket == bp {
-                // 匹配已有站点 → 累加
-                atomic.Xadduintptr(&e.allocBucketRefs[j].frees, 1)
-                atomic.Xadduintptr(&e.allocBucketRefs[j].bytes, size)
+        // 基于指针 + len 的线性探测，无锁
+        refs = (*[1<<20]T)(unsafe.Pointer(e.allocBucketRefs))
+        for j := uint32(0); j < e.allocBucketRefsLen; j++ {
+            if refs[j].bucket == bp && refs[j].goid == gp.goid {
+                // 完全命中（同 bucket + 同 goroutine）
+                atomic.Xadduintptr(&refs[j].frees, 1)
+                atomic.Xadduintptr(&refs[j].bytes, size)
                 goto mountSpecial
             }
         }
-        // 查找或插入空槽
-        e.allocBucketRefs[slot] = {bucket, frees:1, bytes:size, typeName:tn}
-        // 2048 满 → LRU 替换 slot 0 + 溢出警告
+        // 查找空槽插入
+        for j := uint32(0); j < e.allocBucketRefsLen; j++ {
+            if refs[j].bucket == nil {
+                refs[j] = {bucket, goid, frees:1, bytes:size, typeName:tn}
+                goto mountSpecial
+            }
+        }
+        // 全满 → 持锁翻倍扩容，re-check 后插入
+        lock(&e.allocBucketRefsLock)
+        if e.allocBucketRefsLen == oldLen { // double-check
+            newLen = oldLen * 2
+            newRefs = persistentalloc(newLen * sizeof, ...)
+            copy(newRefs[:oldLen], refs[:oldLen])
+            newRefs[oldLen] = {bucket, goid, frees:1, ...}
+            e.allocBucketRefs = (*T)(unsafe.Pointer(newRefs))
+            e.allocBucketRefsLen = newLen
+        } // else: 其他协程已扩容 → unlock + retry
+        unlock(&e.allocBucketRefsLock)
 
       frees/bytes 是累计分配计数（v10 后不再清零），
       typeName 来自 toRType(typ).string()。
@@ -644,7 +667,7 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   常量:
     最大并发 sessions:    4096 (gcDeadMaxSessions)
-    Per-session 站点上限: 2048 (gcDeadPerSessionSites)，超过时 LRU 替换
+    Per-session 站点上限: 动态扩展（初始 2048，满时翻倍）
     最大 start 位置数:    32   (gcDeadMaxStartSites)
     Session 归属 slot 数: 16   (gcDeadSessionRefSlots)
 
@@ -728,11 +751,9 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 
   安全性：e.id != sessionID 严格检查保证不误计到其他 session。
 
-7.2 Per-Session 分配站点跟踪限制 (gcDeadPerSessionSites = 2048)
-  v10 从 1024 扩展（同时移除了独立的 bucketRefs）。
-  超过 2048 个不同站点时，多余站点覆盖 slot 0（LRU 近似策略），
-  此时输出警告：runtime: gcdeadtrace: All slots full for session N
-  溢出影响 per-site 统计，per-session 汇总仍然准确。
+7.2 Per-Session 分配站点跟踪 (gcDeadPerSessionSites = 2048)
+  v10 从 1024 扩展。v11 改为动态扩展：初始 2048，满时翻倍，
+  移除 LRU 替换和溢出警告。参见 7.12。
 
 7.3 全局站点行归属限制 (gcDeadSessionRefSlots = 16)
   站点行 per-session 归属标注最多支持 16 个 session。v6 从 4 增大至 16。
@@ -764,9 +785,12 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 7.11 End 后 allgs 遍历的锁竞争
   GcDeadSessionEnd 中遍历 allgs 需持有 allglock，高频 End 可产生竞争。
 
-7.12 allocBucketRefs 溢出警告
-  mProf_Malloc 路径中，带 printlock 保护输出到 stderr：
-    runtime: gcdeadtrace: All slots full for session N
+7.12 allocBucketRefs 动态扩展
+  v11 移除了固定大小（2048）限制，改用翻倍扩容策略：
+  - 初始 gcDeadPerSessionSites（2048）个槽位
+  - 满时翻倍（4096, 8192, ...），persistentalloc 零拷贝成本
+  - mProf_Malloc 路径无锁线性探测，仅在扩容瞬态加锁
+  - 无须溢出警告
 
 
 8. 关键文件
