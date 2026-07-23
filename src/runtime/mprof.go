@@ -654,6 +654,8 @@ type gcDeadSessionBucketRef struct {
 	bytes        uintptr        // per-cycle bytes
 	cumFrees     uintptr        // cumulative frees at this bucket from this session
 	cumFreeBytes uintptr
+	prevCumFrees     uintptr    // snapshot of cumFrees from previous GC cycle (for freed delta)
+	prevCumFreeBytes uintptr    // snapshot of cumFreeBytes from previous GC cycle
 	typeName     string         // type name (e.g. "[]byte"), set at allocation time
 }
 
@@ -919,96 +921,19 @@ func gcDeadTracePrint() {
 	}
 	unlock(&profMemActiveLock)
 
-	// Cross-reference session table bucketRefs with raw entries.
-	// This populates raw[].sessionRefs for per-session attribution in site lines.
-	// If a bucket referenced by the session table has no raw entry, create one.
-	if table := gcDeadSessionTable; table != nil {
-		for si := range table {
-			se := &table[si]
-		if se.id == 0 {
-			continue
-		}
-		for _, br := range se.bucketRefs {
-			if br.bucket == nil || br.frees == 0 {
-				continue
-			}
-			bp := (*bucket)(br.bucket)
-			// Extract non-runtime PCs from this bucket's stack.
-			stk := bp.stk()
-			var bpcs [gcDeadTraceMaxFrames]uintptr
-			bNframes := 0
-			for _, p := range stk {
-				callPC := p
-				if callPC > 1 {
-					callPC--
-				}
-				fi := findfunc(callPC)
-				if fi.valid() {
-					name := funcname(fi)
-					if len(name) >= 8 && name[:8] == "runtime." {
-						continue
-					}
-					bpcs[bNframes] = callPC
-					bNframes++
-					if bNframes >= gcDeadTraceMaxFrames {
-						break
-					}
-				}
-			}
-			if bNframes == 0 && len(stk) > 0 {
-				bpcs[0] = stk[len(stk)-1]
-				bNframes = 1
-			}
-			// Find matching raw entry by PC tuple. Create one if no match.
-			found := false
-			for ri := 0; ri < rawCount; ri++ {
-				if raw[ri].nframes != bNframes {
-					continue
-				}
-				match := true
-				for j := 0; j < bNframes; j++ {
-					if raw[ri].pcs[j] != bpcs[j] {
-						match = false
-						break
-					}
-				}
-				if !match {
-					continue
-				}
-				// Found matching site. Add session attribution.
-				r := &raw[ri]
-				if r.numSessionRefs < len(r.sessionRefs) {
-					ns := r.numSessionRefs
-					r.sessionRefs[ns].sessionID = se.id
-					r.sessionRefs[ns].goid = br.goid
-					r.sessionRefs[ns].objs = br.frees
-					r.sessionRefs[ns].bytes = br.bytes
-					r.sessionRefs[ns].typeName = br.typeName
-					r.numSessionRefs++
-				}
-				found = true
-				break
-			}
-			if !found && rawCount < gcDeadTraceMaxSites {
-				// Create a new raw entry for this previously unseen bucket.
-				raw[rawCount] = gcDeadRawEntry{
-					pcs: bpcs, nframes: bNframes,
-				}
-				r := &raw[rawCount]
-				r.sessionRefs[0].sessionID = se.id
-				r.sessionRefs[0].goid = br.goid
-				r.sessionRefs[0].objs = br.frees
-				r.sessionRefs[0].bytes = br.bytes
-				r.sessionRefs[0].typeName = br.typeName
-				r.numSessionRefs = 1
-				rawCount++
-			}
-		}
-	}
-
 	// Cross-reference session table allocBucketRefs with raw entries.
-	// This populates raw[].aliveSessionRefs for alive session attribution.
+	// This populates raw[].sessionRefs and raw[].aliveSessionRefs for
+	// per-session freed and alive attribution in site lines.
+	//
+	// Free attribution uses the cumFrees delta since the last GC cycle:
+	//   freedThisCycle = cumFrees - prevCumFrees
+	// This is more reliable than bucketRefs because allocBucketRefs entries
+	// are created at allocation time and persist across cycles, avoiding the
+	// loss of site attribution when all objects from a site are freed.
+	//
 	// Alive count = allocs (br.frees) - cumulative frees (br.cumFrees).
+	// This populates raw[].aliveSessionRefs for alive session attribution.
+	if table := gcDeadSessionTable; table != nil {
 	for si := range table {
 		se := &table[si]
 			if se.id == 0 {
@@ -1059,8 +984,15 @@ func gcDeadTracePrint() {
 					if !match {
 						continue
 					}
-					// Found matching site. Add alive session attribution.
-				// Alive = allocs (br.frees) - cumulative frees (br.cumFrees).
+					// Freed = cumFrees delta since last cycle.
+					freedThisCycle := uintptr(0)
+					freedThisCycleBytes := uintptr(0)
+					if br.cumFrees > br.prevCumFrees {
+						freedThisCycle = br.cumFrees - br.prevCumFrees
+						freedThisCycleBytes = br.cumFreeBytes - br.prevCumFreeBytes
+					}
+
+					// Alive = allocs (br.frees) - cumulative frees (br.cumFrees).
 					aliveObjs := br.frees
 					aliveBytes := br.bytes
 					if br.cumFrees > 0 {
@@ -1072,8 +1004,24 @@ func gcDeadTracePrint() {
 							aliveBytes = 0
 						}
 					}
+
+					r := &raw[ri]
+
+					// Add freed session attribution.
+					if freedThisCycle > 0 {
+						if r.numSessionRefs < len(r.sessionRefs) {
+							ns := r.numSessionRefs
+							r.sessionRefs[ns].sessionID = se.id
+							r.sessionRefs[ns].goid = br.goid
+							r.sessionRefs[ns].objs = freedThisCycle
+							r.sessionRefs[ns].bytes = freedThisCycleBytes
+							r.sessionRefs[ns].typeName = br.typeName
+							r.numSessionRefs++
+						}
+					}
+
+					// Add alive session attribution.
 					if aliveObjs > 0 {
-						r := &raw[ri]
 						if r.numAliveSessionRefs < len(r.aliveSessionRefs) {
 							ns := r.numAliveSessionRefs
 							r.aliveSessionRefs[ns].sessionID = se.id
@@ -1088,6 +1036,14 @@ func gcDeadTracePrint() {
 					break
 				}
 				if !found && rawCount < gcDeadTraceMaxSites {
+					// Freed = cumFrees delta since last cycle.
+					freedThisCycle := uintptr(0)
+					freedThisCycleBytes := uintptr(0)
+					if br.cumFrees > br.prevCumFrees {
+						freedThisCycle = br.cumFrees - br.prevCumFrees
+						freedThisCycleBytes = br.cumFreeBytes - br.prevCumFreeBytes
+					}
+
 					aliveObjs := br.frees
 					aliveBytes := br.bytes
 					if br.cumFrees > 0 {
@@ -1099,18 +1055,34 @@ func gcDeadTracePrint() {
 							aliveBytes = 0
 						}
 					}
-					if aliveObjs > 0 {
+
+					if freedThisCycle > 0 || aliveObjs > 0 {
 						// Create a new raw entry for this previously unseen bucket.
 						raw[rawCount] = gcDeadRawEntry{
 							pcs: bpcs, nframes: bNframes,
 						}
 						r := &raw[rawCount]
-						r.aliveSessionRefs[0].sessionID = se.id
-						r.aliveSessionRefs[0].goid = br.goid
-						r.aliveSessionRefs[0].objs = aliveObjs
-						r.aliveSessionRefs[0].bytes = aliveBytes
-						r.aliveSessionRefs[0].typeName = br.typeName
-						r.numAliveSessionRefs = 1
+
+						// Add freed session attribution.
+						if freedThisCycle > 0 {
+							r.sessionRefs[0].sessionID = se.id
+							r.sessionRefs[0].goid = br.goid
+							r.sessionRefs[0].objs = freedThisCycle
+							r.sessionRefs[0].bytes = freedThisCycleBytes
+							r.sessionRefs[0].typeName = br.typeName
+							r.numSessionRefs = 1
+						}
+
+						// Add alive session attribution.
+						if aliveObjs > 0 {
+							ns := r.numAliveSessionRefs
+							r.aliveSessionRefs[ns].sessionID = se.id
+							r.aliveSessionRefs[ns].goid = br.goid
+							r.aliveSessionRefs[ns].objs = aliveObjs
+							r.aliveSessionRefs[ns].bytes = aliveBytes
+							r.aliveSessionRefs[ns].typeName = br.typeName
+							r.numAliveSessionRefs++
+						}
 						rawCount++
 					}
 				}
@@ -1632,6 +1604,26 @@ func gcDeadTracePrint() {
 
 	if debug.gcdeadtracefile != "" {
 		writeDeadTraceToFile(debug.gcdeadtracefile, buf[:n])
+	}
+
+	// Update prevCumFrees for next cycle's freed delta computation.
+	if table := gcDeadSessionTable; table != nil {
+		for si := range table {
+			se := &table[si]
+			if se.id == 0 {
+				continue
+			}
+			for j := range se.allocBucketRefs {
+				br := &se.allocBucketRefs[j]
+				if br.bucket == nil {
+					continue
+				}
+				if br.cumFrees > br.prevCumFrees || br.cumFreeBytes > br.prevCumFreeBytes {
+					br.prevCumFrees = br.cumFrees
+					br.prevCumFreeBytes = br.cumFreeBytes
+				}
+			}
+		}
 	}
 }
 
