@@ -1689,7 +1689,9 @@ func GcDeadSessionStart(id uint64) {
 
 	// If this is the first time this sessionId is being used, initialize entry.
 	if e.id != id {
-		// WARNING: all per-session data structures must be initialized BEFORE
+		if e.id != 0 && debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") overwriting slot occupied by session ", e.id, "\n")
+		}
 		// setting e.id, otherwise a concurrently joining goroutine (which sees
 		// e.id == id) may write to goroutineStats/startSites only
 		// to have them erased by the ongoing initialization.
@@ -1737,6 +1739,9 @@ func GcDeadSessionStart(id uint64) {
 		for {
 			n := atomic.Loadint32(&e.numStartSites)
 			if n >= gcDeadMaxStartSites {
+				if debug.gcdeadtrace > 0 {
+					print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") joining goroutine ", gp.goid, " start site not recorded (max ", gcDeadMaxStartSites, " reached)\n")
+				}
 				break
 			}
 			if atomic.Casint32(&e.numStartSites, n, n+1) {
@@ -1759,6 +1764,9 @@ func GcDeadSessionStart(id uint64) {
 		}
 		if !found {
 			// All slots full: overwrite first (LRU-approximate).
+			if debug.gcdeadtrace > 0 {
+				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") goroutine ", gp.goid, " stats not recorded (all ", gcDeadMaxStartSites, " slots full, LRU overwriting)\n")
+			}
 			e.goroutineStats[0].goid = gp.goid
 			e.goroutineStats[0].allocs = 0
 			e.goroutineStats[0].allocBytes = 0
