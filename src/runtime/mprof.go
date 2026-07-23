@@ -1635,7 +1635,7 @@ func GcDeadSessionStart(id uint64) {
 
 	gp := getg().m.curg
 	if gp == nil {
-		if debug.gcdeadtrace > 0 {
+		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: not in goroutine context\n")
 		}
 		return
@@ -1669,7 +1669,7 @@ func GcDeadSessionStart(id uint64) {
 			gp.gcDeadSessionActive = false
 			gp.gcDeadSessionID = 0
 		} else {
-			if debug.gcdeadtrace > 0 {
+			if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: already in session ", gp.gcDeadSessionID, "\n")
 			}
 			return
@@ -1681,7 +1681,7 @@ func GcDeadSessionStart(id uint64) {
 
 	// If session has already ended, don't join.
 	if e.ended {
-		if debug.gcdeadtrace > 0 {
+		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: session already ended\n")
 		}
 		return
@@ -1689,7 +1689,7 @@ func GcDeadSessionStart(id uint64) {
 
 	// If this is the first time this sessionId is being used, initialize entry.
 	if e.id != id {
-		if e.id != 0 && debug.gcdeadtrace > 0 {
+		if e.id != 0 && (debug.gcdeadsession > 0 || debug.gcdeadtrace > 0) {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") overwriting slot occupied by session ", e.id, "\n")
 		}
 		// setting e.id, otherwise a concurrently joining goroutine (which sees
@@ -1739,7 +1739,7 @@ func GcDeadSessionStart(id uint64) {
 		for {
 			n := atomic.Loadint32(&e.numStartSites)
 			if n >= gcDeadMaxStartSites {
-				if debug.gcdeadtrace > 0 {
+				if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 					print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") joining goroutine ", gp.goid, " start site not recorded (max ", gcDeadMaxStartSites, " reached)\n")
 				}
 				break
@@ -1764,7 +1764,7 @@ func GcDeadSessionStart(id uint64) {
 		}
 		if !found {
 			// All slots full: overwrite first (LRU-approximate).
-			if debug.gcdeadtrace > 0 {
+			if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") goroutine ", gp.goid, " stats not recorded (all ", gcDeadMaxStartSites, " slots full, LRU overwriting)\n")
 			}
 			e.goroutineStats[0].goid = gp.goid
