@@ -516,6 +516,13 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 					}
 				}
 				// All slots full: overwrite first (LRU-approximate).
+				// Per-site attribution for the evicted entry will be lost —
+				// only session-level cumulative counts remain accurate.
+				if gcDeadSessionTable != nil {
+					printlock()
+					print("gcdeadtrace: session #", e.id, " allocBucketRefs overflow (>", gcDeadPerSessionSites, " sites), evicting slot 0\n")
+					printunlock()
+				}
 				e.allocBucketRefs[0].bucket = bp
 				e.allocBucketRefs[0].goid = gp.goid
 				e.allocBucketRefs[0].frees = 1
@@ -642,8 +649,8 @@ var (
 const gcDeadMaxSessions = 4096
 
 // Number of distinct allocation sites tracked per session for per-site
-// session attribution in gcdeadsession:freed output.
-const gcDeadPerSessionSites = 1024
+// session attribution in gcdeadsession:freed and alive output.
+const gcDeadPerSessionSites = 2048
 
 // gcDeadSessionBucketRef tracks freed counts per (session, bucket) pair,
 // enabling per-site output lines to show which session freed the objects.
@@ -711,12 +718,11 @@ type gcDeadSessionInfo struct {
 	// Indexed by matching goid from startSites.
 	goroutineStats [gcDeadMaxStartSites]gcDeadGoroutineStat
 
-	// Per-bucket freed tracking, populated by gcDeadRecordFree.
-	// Used in gcDeadTracePrint to append session info to site lines.
-	bucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef
-
-	// Per-bucket alloc tracking, populated by mProf_Malloc.
-	// Used in gcDeadTracePrint to append session info to alive site lines.
+	// Per-bucket alloc/free tracking, populated by mProf_Malloc and gcDeadRecordFree.
+	// Used in gcDeadTracePrint for both freed and alive site attribution via
+	// cumulative frees delta (cumFrees - prevCumFrees) and alive = frees - cumFrees.
+	// Entries persist across GC cycles to avoid lost attribution when all objects
+	// from a site are freed. See gcDeadPerSessionSites for capacity.
 	allocBucketRefs [gcDeadPerSessionSites]gcDeadSessionBucketRef
 }
 
@@ -753,48 +759,12 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 		}
 	}
 
-	// Resolve type name for freed output.
-	tn := ""
-	if typ != nil {
-		tn = toRType(typ).string()
-	}
-
-	// Track per-(session, bucket, goid) freed counts for site attribution.
+	// Update allocBucketRefs.cumFrees for per-site freed/alive attribution.
+	// allocBucketRefs entries persist across GC cycles (created at allocation time),
+	// avoiding the loss of site attribution when per-cycle entries
+	// would be evicted.
 	if b != nil {
 		bp := unsafe.Pointer(b)
-		for j := range e.bucketRefs {
-			// Fast path: matching bucket pointer AND same goroutine.
-			if e.bucketRefs[j].bucket == bp && e.bucketRefs[j].goid == goid {
-				atomic.Xadduintptr(&e.bucketRefs[j].frees, 1)
-				atomic.Xadduintptr(&e.bucketRefs[j].bytes, size)
-				e.bucketRefs[j].goid = goid
-				goto updateAllocCumFrees
-			}
-		}
-		// Slow path: find an empty slot or the first slot (LRU-evict).
-		for j := range e.bucketRefs {
-			if e.bucketRefs[j].bucket == nil {
-				// Store the bucket pointer with release store; subsequent
-				// loads in gcDeadTracePrint will observe it.
-				e.bucketRefs[j].bucket = bp
-				e.bucketRefs[j].goid = goid
-				e.bucketRefs[j].frees = 1
-				e.bucketRefs[j].bytes = size
-				e.bucketRefs[j].typeName = tn
-				goto updateAllocCumFrees
-			}
-		}
-		// All slots full: write into first slot (approximate fallback).
-		e.bucketRefs[0].bucket = bp
-		e.bucketRefs[0].goid = goid
-		e.bucketRefs[0].frees = 1
-		e.bucketRefs[0].bytes = size
-		e.bucketRefs[0].typeName = tn
-
-	updateAllocCumFrees:
-		// Also update allocBucketRefs.cumFrees for accurate per-site alive tracking.
-		// Must also match goid so that a free from one goroutine decrements the
-		// correct allocBucketRef entry when multiple goroutines share the same bucket.
 		for j := range e.allocBucketRefs {
 			if e.allocBucketRefs[j].bucket == bp && e.allocBucketRefs[j].goid == goid {
 				atomic.Xadduintptr(&e.allocBucketRefs[j].cumFrees, 1)
@@ -927,7 +897,7 @@ func gcDeadTracePrint() {
 	//
 	// Free attribution uses the cumFrees delta since the last GC cycle:
 	//   freedThisCycle = cumFrees - prevCumFrees
-	// This is more reliable than bucketRefs because allocBucketRefs entries
+	// This is more reliable than per-cycle freed tracking because allocBucketRefs entries
 	// are created at allocation time and persist across cycles, avoiding the
 	// loss of site attribution when all objects from a site are freed.
 	//
@@ -1089,21 +1059,6 @@ func gcDeadTracePrint() {
 			}
 		}
 
-		// Clear per-cycle bucketRefs and allocBucketRefs between GC cycles.
-		for si := range table {
-			se := &table[si]
-		if se.id == 0 {
-			continue
-		}
-		for j := range se.bucketRefs {
-			if se.bucketRefs[j].bucket != nil {
-				if atomic.Loaduintptr(&se.bucketRefs[j].frees) > 0 {
-					atomic.Storeuintptr(&se.bucketRefs[j].frees, 0)
-					atomic.Storeuintptr(&se.bucketRefs[j].bytes, 0)
-				}
-			}
-		}
-		}
 	}
 
 	// Phase 2: resolve PCs and merge by the full site key.
@@ -1701,7 +1656,7 @@ func GcDeadSessionStart(id uint64) {
 	if e.id != id {
 		// WARNING: all per-session data structures must be initialized BEFORE
 		// setting e.id, otherwise a concurrently joining goroutine (which sees
-		// e.id == id) may write to goroutineStats/bucketRefs/startSites only
+		// e.id == id) may write to goroutineStats/startSites only
 		// to have them erased by the ongoing initialization.
 		e.endPC = 0
 		e.ended = false
@@ -1721,10 +1676,7 @@ func GcDeadSessionStart(id uint64) {
 		e.cumAllocBytes = 0
 		e.cumFrees = 0
 		e.cumFreeBytes = 0
-		// Clear bucket refs from any previous session.
-		for j := range e.bucketRefs {
-			e.bucketRefs[j] = gcDeadSessionBucketRef{}
-		}
+		// Clear alloc bucket refs from any previous session.
 		for j := range e.allocBucketRefs {
 			e.allocBucketRefs[j] = gcDeadSessionBucketRef{}
 		}
