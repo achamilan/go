@@ -628,8 +628,12 @@ const gcDeadTraceMaxSites = 4096
 // allocated by the same function called from different places.
 const gcDeadTraceMaxFrames = 3
 
-// gcDeadTraceBufSize is the output buffer size (1 MB).
-const gcDeadTraceBufSize = 1 << 20
+// gcDeadTraceBufSize is the output buffer size (4 MB).
+// In high-throughput scenarios with many sessions (up to 4096) and allocation
+// sites, output can easily exceed 1 MB. The per-session breakdown alone can
+// reach ~800 KB, and per-site freed/alive details add more. The alive section
+// is written last, so a too-small buffer causes alive data to be silently lost.
+const gcDeadTraceBufSize = 4 << 20
 
 // gcDeadTrace storage types, defined at package level so persistentalloc
 // can compute their size.
@@ -1215,6 +1219,9 @@ func gcDeadTracePrint() {
 	}
 
 	appendUintptr := func(v uintptr) {
+		if n >= gcDeadTraceBufSize {
+			return
+		}
 		if v == 0 {
 			buf[n] = '0'
 			n++
@@ -1227,14 +1234,19 @@ func gcDeadTracePrint() {
 	}
 
 	appendPCLoc := func(pc uintptr) {
+		if n >= gcDeadTraceBufSize {
+			return
+		}
 		fi := findfunc(pc)
 		if fi.valid() {
 			file, line := funcline(fi, pc)
 			var tmp [20]byte
 			b := itoa(tmp[:], uint64(line))
 			n += copy(buf[n:], file)
-			buf[n] = ':'
-			n++
+			if n < gcDeadTraceBufSize {
+				buf[n] = ':'
+				n++
+			}
 			n += copy(buf[n:], b)
 		} else {
 			n += copy(buf[n:], "?:?")
@@ -1588,6 +1600,15 @@ func gcDeadTracePrint() {
 	}
 
 	// Phase 5: write output.
+	if n >= gcDeadTraceBufSize {
+		// Buffer full — append truncation marker so the user knows data
+		// was lost. Overwrite the last bytes of the buffer.
+		marker := "..TRUNCATED"
+		if n >= len(marker) {
+			copy(buf[n-len(marker):], marker)
+		}
+		n = gcDeadTraceBufSize
+	}
 	printlock()
 	write(2, unsafe.Pointer(&buf[0]), int32(n))
 	printunlock()
