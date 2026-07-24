@@ -703,8 +703,10 @@ const gcDeadSessionRefSlots = 16
 
 // Session attribution for a single site line in gcDeadTracePrint output.
 type gcDeadSessionRef struct {
-	sessionID uint64
-	goid      uint64 // goroutine that allocated/freed these objects
+	sessionID  uint64 // internal ID (for dedup in Phase 2)
+	originalID uint64 // user-provided ID (for display)
+	generation uint32 // generation counter for reuse (for display)
+	goid       uint64 // goroutine that allocated/freed these objects
 	objs      uintptr // count of objects (freed or alive depending on context)
 	bytes     uintptr
 	typeName  string
@@ -731,7 +733,9 @@ type gcDeadGoroutineStat struct {
 // Entries persist after the session ends so that freed objects can still
 // be attributed to the correct session.
 type gcDeadSessionInfo struct {
-	id         uint64
+	id         uint64   // internal ID: originalID for gen 0, originalID*gcDeadMaxSessions+generation for gen>0
+	originalID uint64   // user-provided ID (for display)
+	generation uint32   // generation counter (0-based, for display)
 	endPC      uintptr  // PC of the GcDeadSessionEnd caller (0 if session hasn't ended)
 	printed    uint32   // 0=unprinted, 1=printed without end (re-print when end arrives), 2=printed with end
 	ended      bool     // End has been called — no more allocs accepted
@@ -1021,6 +1025,8 @@ func gcDeadTracePrint() {
 						if r.numSessionRefs < len(r.sessionRefs) {
 							ns := r.numSessionRefs
 							r.sessionRefs[ns].sessionID = se.id
+							r.sessionRefs[ns].originalID = se.originalID
+							r.sessionRefs[ns].generation = se.generation
 							r.sessionRefs[ns].goid = br.goid
 							r.sessionRefs[ns].objs = freedThisCycle
 							r.sessionRefs[ns].bytes = freedThisCycleBytes
@@ -1034,6 +1040,8 @@ func gcDeadTracePrint() {
 						if r.numAliveSessionRefs < len(r.aliveSessionRefs) {
 							ns := r.numAliveSessionRefs
 							r.aliveSessionRefs[ns].sessionID = se.id
+							r.aliveSessionRefs[ns].originalID = se.originalID
+							r.aliveSessionRefs[ns].generation = se.generation
 							r.aliveSessionRefs[ns].goid = br.goid
 							r.aliveSessionRefs[ns].objs = aliveObjs
 							r.aliveSessionRefs[ns].bytes = aliveBytes
@@ -1075,6 +1083,8 @@ func gcDeadTracePrint() {
 						// Add freed session attribution.
 						if freedThisCycle > 0 {
 							r.sessionRefs[0].sessionID = se.id
+							r.sessionRefs[0].originalID = se.originalID
+							r.sessionRefs[0].generation = se.generation
 							r.sessionRefs[0].goid = br.goid
 							r.sessionRefs[0].objs = freedThisCycle
 							r.sessionRefs[0].bytes = freedThisCycleBytes
@@ -1086,6 +1096,8 @@ func gcDeadTracePrint() {
 						if aliveObjs > 0 {
 							ns := r.numAliveSessionRefs
 							r.aliveSessionRefs[ns].sessionID = se.id
+							r.aliveSessionRefs[ns].originalID = se.originalID
+							r.aliveSessionRefs[ns].generation = se.generation
 							r.aliveSessionRefs[ns].goid = br.goid
 							r.aliveSessionRefs[ns].objs = aliveObjs
 							r.aliveSessionRefs[ns].bytes = aliveBytes
@@ -1339,9 +1351,15 @@ func gcDeadTracePrint() {
 			}
 			appendStr("  session #")
 			var tmp [20]byte
-			b := itoa(tmp[:], e.id)
+			b := itoa(tmp[:], e.originalID)
 			m := copy(buf[n:], b)
 			n += m
+			if e.generation > 0 {
+				appendStr("#")
+				b2 := itoa(tmp[:], uint64(e.generation))
+				m = copy(buf[n:], b2)
+				n += m
+			}
 			appendStr(": ")
 			appendUintptr(allocs)
 			appendStr(" allocs (")
@@ -1492,9 +1510,15 @@ func gcDeadTracePrint() {
 				r := &s.sessionRefs[ri]
 				appendStr(" [session #")
 				var tmp2 [20]byte
-				b := itoa(tmp2[:], r.sessionID)
+				b := itoa(tmp2[:], r.originalID)
 				m := copy(buf[n:], b)
 				n += m
+				if r.generation > 0 {
+					appendStr("#")
+					b2 := itoa(tmp2[:], uint64(r.generation))
+					m = copy(buf[n:], b2)
+					n += m
+				}
 				appendStr(": ")
 				appendUintptr(r.objs)
 				appendStr(" objs, ")
@@ -1573,9 +1597,15 @@ func gcDeadTracePrint() {
 				r := &s.aliveSessionRefs[ri]
 				appendStr(" [session #")
 				var tmp2 [20]byte
-				b := itoa(tmp2[:], r.sessionID)
+				b := itoa(tmp2[:], r.originalID)
 				m := copy(buf[n:], b)
 				n += m
+				if r.generation > 0 {
+					appendStr("#")
+					b2 := itoa(tmp2[:], uint64(r.generation))
+					m = copy(buf[n:], b2)
+					n += m
+				}
 				appendStr(": ")
 				appendUintptr(r.objs)
 				appendStr(" objs, ")
@@ -1713,6 +1743,81 @@ func GcDeadSessionStart(id uint64) {
 	idx := id % gcDeadMaxSessions
 	e := &gcDeadSessionTable[idx]
 
+	// Check for session ID reuse: same originalID, session has ended.
+	// Create a new generation with its own hash slot so old and new data
+	// don't collide.
+	if e.originalID == id && e.ended {
+		newGen := e.generation + 1
+		internalID := id*gcDeadMaxSessions + uint64(newGen)
+		newIdx := internalID % gcDeadMaxSessions
+		ne := &gcDeadSessionTable[newIdx]
+
+		// Walk forward through generations to find the next uncreated one.
+		// The gen 0 slot always has the oldest generation, so we may need to
+		// skip past already-created-and-ended higher generations.
+		for ne.id == internalID {
+			if !ne.ended {
+				// This generation is still active — can't reuse yet.
+				if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+					print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: generation ", uint64(newGen), " still active\n")
+				}
+				return
+			}
+			newGen++
+			internalID = id*gcDeadMaxSessions + uint64(newGen)
+			newIdx = internalID % gcDeadMaxSessions
+			ne = &gcDeadSessionTable[newIdx]
+		}
+
+		// Initialize new session entry.
+		ne.endPC = 0
+		ne.ended = false
+		ne.printed = 0
+		ne.joinCount = 1
+		ne.numStartSites = 1
+		ne.startSites[0] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
+		for j := 1; j < gcDeadMaxStartSites; j++ {
+			ne.startSites[j] = gcDeadStartSite{}
+		}
+		ne.allocs = 0
+		ne.allocBytes = 0
+		ne.frees = 0
+		ne.freeBytes = 0
+		ne.cumAllocs = 0
+		ne.cumAllocBytes = 0
+		ne.cumFrees = 0
+		ne.cumFreeBytes = 0
+		ne.allocBucketRefs = nil
+		ne.allocBucketRefsLen = 0
+		for j := range ne.goroutineStats {
+			ne.goroutineStats[j] = gcDeadGoroutineStat{}
+		}
+		ne.goroutineStats[0].goid = gp.goid
+		ne.id = internalID
+		ne.originalID = id
+		ne.generation = newGen
+
+		if debug.gcdeadtrace > 0 {
+			if gcDeadSessionCount.Add(1) == 1 {
+				gcDeadSavedRate = MemProfileRate
+				MemProfileRate = 1
+			}
+		}
+
+		gp.gcDeadSessionActive = true
+		gp.gcDeadSessionID = internalID
+
+		if debug.gcdeadtrace > 0 {
+			pc := sys.GetCallerPC()
+			f := findfunc(pc)
+			if f.valid() {
+				file, line := funcline(f, pc)
+				print("runtime: gcdeadsession: session ", id, "#", uint64(newGen), " started at ", file, ":", line, "\n")
+			}
+		}
+		return
+	}
+
 	// If session has already ended, don't join.
 	if e.ended {
 		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
@@ -1722,7 +1827,7 @@ func GcDeadSessionStart(id uint64) {
 	}
 
 	// If this is the first time this sessionId is being used, initialize entry.
-	if e.id != id {
+	if e.originalID != id {
 		if e.id != 0 && (debug.gcdeadsession > 0 || debug.gcdeadtrace > 0) {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") overwriting slot occupied by session ", e.id, "\n")
 		}
@@ -1758,6 +1863,8 @@ func GcDeadSessionStart(id uint64) {
 		// Publish the initialized entry last so that a concurrently joining
 		// goroutine sees a consistent snapshot.
 		e.id = id
+		e.originalID = id
+		e.generation = 0
 
 		if debug.gcdeadtrace > 0 {
 			// Ensure all allocations are profiled for accurate session tracking.
@@ -1818,7 +1925,7 @@ func GcDeadSessionStart(id uint64) {
 		f := findfunc(pc)
 		if f.valid() {
 			file, line := funcline(f, pc)
-			print("runtime: gcdeadsession: session ", id, " started at ", file, ":", line, "\n")
+			print("runtime: gcdeadsession: session ", id, "#0 started at ", file, ":", line, "\n")
 		}
 	}
 }
@@ -1832,15 +1939,30 @@ func GcDeadSessionEnd(id uint64) {
 		return
 	}
 	gp := getg().m.curg
-	if gp == nil || !gp.gcDeadSessionActive || gp.gcDeadSessionID != id {
+	if gp == nil || !gp.gcDeadSessionActive {
 		if debug.gcdeadtrace > 0 {
-			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (active=", gp != nil && gp.gcDeadSessionActive, ", id=")
-			if gp != nil {
-				print(gp.gcDeadSessionID)
-			} else {
-				print("nil")
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (active=", gp != nil && gp.gcDeadSessionActive, ")\n")
+		}
+		return
+	}
+
+	// For gcdeadtrace>0, gp.gcDeadSessionID holds the internal ID which may
+	// differ from the user-provided id (due to generation suffixes for reused
+	// IDs). Verify the user-provided id matches the session's originalID.
+	sid := gp.gcDeadSessionID
+	if gcDeadSessionTable != nil {
+		sidx := sid % gcDeadMaxSessions
+		e := &gcDeadSessionTable[sidx]
+		if e.id != sid || e.originalID != id {
+			if debug.gcdeadtrace > 0 {
+				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (internal=", sid, ", originalID=", e.originalID, ")\n")
 			}
-			print(")\n")
+			return
+		}
+	} else if sid != id {
+		// gcdeadsession=1 only: no generation tracking.
+		if debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (active=true, id mismatch)\n")
 		}
 		return
 	}
@@ -1853,7 +1975,7 @@ func GcDeadSessionEnd(id uint64) {
 	// so they can subsequently start new sessions.
 	lock(&allglock)
 	for _, g := range allgs {
-		if g.gcDeadSessionID == id {
+		if g.gcDeadSessionID == sid {
 			g.gcDeadSessionActive = false
 			g.gcDeadSessionID = 0
 		}
@@ -1865,15 +1987,17 @@ func GcDeadSessionEnd(id uint64) {
 		return
 	}
 
-	idx := id % gcDeadMaxSessions
+	idx := sid % gcDeadMaxSessions
 	e := &gcDeadSessionTable[idx]
-	if e.id != id || e.ended {
+	if e.ended {
 		if debug.gcdeadtrace > 0 {
-			if e.ended {
-				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session already ended\n")
-			} else {
-				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: hash slot occupied by session ", e.id, "\n")
-			}
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session already ended\n")
+		}
+		return
+	}
+	if e.id != sid {
+		if debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: hash slot occupied by session ", e.id, "\n")
 		}
 		return
 	}
@@ -1892,7 +2016,11 @@ func GcDeadSessionEnd(id uint64) {
 	f := findfunc(pc)
 	if f.valid() {
 		file, line := funcline(f, pc)
-		print("runtime: gcdeadsession: session ", id, " ended at ", file, ":", line, "\n")
+		if e.generation > 0 {
+			print("runtime: gcdeadsession: session ", e.originalID, "#", uint64(e.generation), " ended at ", file, ":", line, "\n")
+		} else {
+			print("runtime: gcdeadsession: session ", id, "#0 ended at ", file, ":", line, "\n")
+		}
 	}
 
 	// Force a full GC to immediately collect and report

@@ -813,6 +813,386 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
   src/runtime/gc_test.go            — 测试函数
 
 
+9. 完整流程全景：一次分配的一生
+================================
+
+本章以一条分配语句 `obj := make([]byte, 256)` 为例，追踪它从诞生到在 gcdeadtrace
+输出中出现的完整路径。
+
+场景假设：用户代码在两个 GcDeadSessionStart/End 之间分配了一个对象：
+
+```go
+runtime.GcDeadSessionStart(42)          // 步骤 1
+obj := make([]byte, 256)                // 步骤 2
+// ... 使用 obj ...
+runtime.GcDeadSessionEnd(42)            // 步骤 3 → 触发 GC，步骤 4-7 在 GC 内部完成
+```
+
+整个流程分为 7 个阶段，按执行顺序逐一描述。
+
+**—— 以下是快速讲解版，约 3 分钟读完 ——**
+
+gcdeadtrace 的核心思路可以概括为四句话：
+
+1. **标记归属** — 每次分配时，在对象上挂一个 special 标签，写上"此对象属于会话 42，
+   分配站点是 bucket X"。
+2. **记录计数** — 同时在会话表中记录"会话 42 分配了 1 个对象、256 字节"，
+   在 allocBucketRefs 中按 bucket + goroutine 记录"站点 X 分配了 1 个对象"。
+3. **精确回收** — GC 回收对象时，通过 special 标签找到它属于哪个会话，
+   只更新对应会话的释放计数，完全不干扰其他会话。
+4. **汇总输出** — 每个 GC 周期结束时，用累计分配减去累计释放算出存活量，
+   用本轮释放减去上轮快照算出本轮死亡量，按会话、按站点组织成三部分输出。
+
+这四步对应的关键机制：
+
+- **specialGcDeadSession** — 对象级别的会话标记。每个会话对象都挂一个 special，
+  释放时通过它回调 gcDeadRecordFree，实现跨会话精确隔离。
+- **gcDeadSessionTable** — 4096 条目的会话表，按 sessionID 哈希索引。
+  记录会话级 allocs/frees/cumAllocs/cumFrees 计数器。
+- **allocBucketRefs** — 每会话的分配站点明细表，动态扩展。
+  记录每个 bucket + goid 的 frees/bytes/cumFrees，用于站点级输出。
+- **gcDeadTracePrint 六阶段流水线** — Phase 1 用 `cumFrees - prevCumFrees`
+  算 freed，`frees - cumFrees` 算 alive。Phase 3 按调用栈符号化合并。
+  Phase 5 更新 prevCumFrees 准备下一轮。
+
+数据流简图（三步走）：
+
+```
+GcDeadSessionStart(42)
+  │
+  ▼
+┌─分配时 (mProf_Malloc)────────────────────────────────────┐
+│ ① 会话表: e.allocs++                                     │
+│ ② allocBucketRefs: refs[j].frees++                       │
+│ ③ special{sessionID=42, bucket=b} → addspecial(p)       │
+└──────────────────────────────────────────────────────────┘
+  │
+  ▼  GC 触发
+┌─释放时 (gcDeadRecordFree, 通过 special 回调)──────────────┐
+│ ④ 会话表: e.cumFrees++                                   │
+│ ⑤ allocBucketRefs: refs[j].cumFrees++                    │
+└──────────────────────────────────────────────────────────┘
+  │
+  ▼  GC 结束 STW
+┌─汇总输出 (gcDeadTracePrint)──────────────────────────────┐
+│ ⑥ freed = cumFrees - prevCumFrees  → [session #42]      │
+│ ⑦ alive = frees - cumFrees          → per-session 行     │
+│ ⑧ prevCumFrees = cumFrees           （准备下一轮）        │
+└──────────────────────────────────────────────────────────┘
+```
+
+核心公式只有两个：
+- `本轮 freed = cumFrees - prevCumFrees`
+- `当前 alive = frees - cumFrees`
+
+mProf_Malloc 写 allocs/frees/bytes（只增不减），gcDeadRecordFree 写 cumFrees
+（只增不减），两者严格分离，互不干扰。gcDeadTracePrint 做减法得出增量。
+
+**—— 快速讲解结束，以下是完整文字描述 ——**
+
+
+9.1 GcDeadSessionStart — 会话创建
+----------------------------------
+
+GcDeadSessionStart(42) 被调用时，首先检查两个 GODEBUG 开关。如果都没开，直接返回，
+零开销。
+
+当 gcdeadsession=1 或 gcdeadtrace=1 时，进入会话机制逻辑。如果是首次调用，会惰性
+分配会话表：gcDeadSessionTable 是一个 [4096]gcDeadSessionInfo 的指针，通过
+persistentalloc 分配，不启用时完全不占内存。调用 getg().m.curg 获取当前 goroutine，
+如果当前不在 goroutine 上下文（如系统线程），则跳过。
+
+如果当前 goroutine 已经在某个活跃会话中（gp.gcDeadSessionActive 为 true），检查
+之前绑定的会话是否已被其他 goroutine 结束（通过 gp.gcDeadSessionID 查找对应表条目
+的 ended 标志）。如果已结束，自动清理 goroutine 的会话状态并继续。如果未结束，说明
+重复调用 Start，幂等返回。
+
+接下来计算表索引 `idx = 42 % 4096 = 42`，获取表条目 `e = &gcDeadSessionTable[42]`。
+此处有一段复用检测逻辑：如果 e.originalID == 42 且 e.ended 为 true，说明会话 42
+曾经用过并已结束，现在是重复使用。此时创建一个新的 generation：从 e.generation
+读取当前最高代际，用公式 `internalID = 42 * 4096 + (generation + 1)` 计算内部 ID，
+然后在新哈希槽上初始化条目。这保证了不同代际的会话数据不冲突，输出中显示为
+`session #42#1`。
+
+如果没有检测到复用，检查 e.ended。如果已结束，返回（不加入已结束的会话）。
+
+然后检查 e.originalID 是否等于 42。如果不相等，是首次初始化：设置所有计数器为零，
+记录起始位置（startSites[0]），最终发布时设置 `e.id = 42`、`e.originalID = 42`、
+`e.generation = 0`。如果相等，说明是另一个 goroutine 加入同一会话，通过 CAS 在
+startSites 数组中添加自己的位置。
+
+最后设置 goroutine 状态：`gp.gcDeadSessionID = 42`、`gp.gcDeadSessionActive = true`。
+如果 gcdeadtrace>0 且是首次创建会话，还会递增 gcDeadSessionCount，如果是第一个
+活跃会话则保存 MemProfileRate 并设为 1（确保每个分配都被采集），并输出
+"session 42#0 started at file:line"。
+
+
+9.2 mProf_Malloc — 分配时的标准 profiling
+-------------------------------------------
+
+当 `make([]byte, 256)` 执行时，mallocgc 内部调用 profilealloc，最终到达
+mProf_Malloc。这是每个堆分配的必经之路（MemProfileRate=1 时）。
+
+首先执行标准的内存 profiling：通过 callers() 采集当前调用栈 PC，调用 stkbucket()
+按 size + 调用栈哈希查找或创建全局 bucket。bucket 是全局共享的，相同 size 和调用栈
+的分配共享同一个 bucket。然后更新 bucket 的 `mpc.allocs++` 和
+`mpc.alloc_bytes += size`，服务于 pprof 和 ReadMemStats。
+
+这个标准 profiling 与 gcdeadtrace 无关，但 gcdeadtrace 复用了它的 bucket 指针
+来做站点级归属。
+
+
+9.3 mProf_Malloc — gcdeadtrace 会话追踪（B1：会话级计数）
+----------------------------------------------------------
+
+标准 profiling 完成后，进入 gcdeadtrace 代码块（由 debug.gcdeadtrace > 0 控制）。
+检查 `mp.curg` 是否非空且 `gp.gcDeadSessionActive` 为 true。如果不满足，跳过
+整个 gcdeadtrace 追踪。
+
+满足条件后，用 `gp.gcDeadSessionID`（内部 ID，可能是 42 或 42*4096+1 等）计算
+表索引并查找条目。校验 `e.id == sid && !e.ended` 通过后，执行四个原子操作更新
+会话级计数：
+
+- `atomic.Xadduintptr(&e.allocs, 1)` — 本轮分配数
+- `atomic.Xadduintptr(&e.allocBytes, 256)` — 本轮分配字节
+- `atomic.Xadduintptr(&e.cumAllocs, 1)` — 累计分配数（永不清零）
+- `atomic.Xadduintptr(&e.cumAllocBytes, 256)` — 累计分配字节
+
+同时更新 per-goroutine 统计：在 e.goroutineStats 数组中线性查找匹配的 goid，
+更新 `allocs++` 和 `allocBytes += size`。这样输出时能展示每个 goroutine 在
+会话内的分配和释放明细。
+
+最后解析类型名称：如果 typ 非空，调用 `toRType(typ).string()` 获取类型字符串
+（如 "[]uint8"），存储在 allocBucketRefs 中用于输出时的 `@typeName` 注解。
+
+
+9.4 mProf_Malloc — allocBucketRefs 站点级记录（B2）
+-----------------------------------------------------
+
+会话级计数之后，进入站点级记录。这里的核心数据结构是 allocBucketRefs——
+一个动态扩展的 `gcDeadSessionBucketRef` 数组，为当前会话关联的每个分配站点
+（按 bucket 指针 + goid 区分）维护独立的计数。
+
+第一次访问时，allocBucketRefs 为 nil，代码会通过 persistentalloc 懒惰地分配
+初始容量（gcDeadPerSessionSites = 2048 个槽位）。然后跳回搜索入口。
+
+后续每次分配走线性探测流程，全部无锁（仅在扩容瞬态加锁）：
+
+第一轮遍历：按 `bucket 指针 + goid` 双条件匹配。如果找到已存在的记录（同一分配
+站点、同一 goroutine），对其 `frees++` 和 `bytes += size` 做原子递增，然后跳到
+后续的 special 挂载步骤。这种命中场景最常见：同一个 goroutine 反复从同一代码位置
+分配对象。
+
+第二轮遍历：如果第一轮未命中，查找空槽（bucket 为 nil 的槽位）。找到后非原子地
+写入 `{bucket, goid, frees:1, bytes:size, typeName}`，然后跳到 special 挂载。
+
+两轮都未找到且没有空槽：说明数组满了。此时对 gcDeadSessionInfo 的
+allocBucketRefsLock 加锁，double-check 确认数组未被其他 goroutine 扩容后，
+通过 persistentalloc 分配两倍大小的新数组，拷贝旧数据并在末尾插入当前记录，
+然后更新指针和长度后解锁。如果 double-check 发现已被其他 goroutine 扩容，直接
+解锁并跳回搜索入口重试。
+
+allocBucketRefs 的单条记录包含以下字段：
+
+- bucket (unsafe.Pointer)：指向 bucket 的指针，用于站点标识
+- goid (uint64)：分配时的 goroutine ID
+- frees (uintptr)：累计分配次数（自该会话首次分配以来）
+- bytes (uintptr)：累计分配字节
+- cumFrees (uintptr)：累计释放次数（由 gcDeadRecordFree 更新）
+- cumFreeBytes (uintptr)：累计释放字节
+- prevCumFrees / prevCumFreeBytes (uintptr)：上轮 GC 时的 cumFrees 快照，
+  用于计算本轮 freed 增量
+- typeName (string)：类型名称，如 "[]uint8"
+
+
+9.5 mProf_Malloc — 挂载 specialGcDeadSession（B3）
+-----------------------------------------------------
+
+站点级记录完成后，进入 special 挂载阶段。这个 special 是 gcdeadtrace 实现
+**精确释放归属**的关键：对象在释放时必须通过 special 知道它属于哪个会话。
+
+从 mheap_.specialGcDeadSessionAlloc（fixalloc 分配器）分配一个
+specialGcDeadSession 结构体，填入以下信息：
+
+- `ss.special.kind = _KindSpecialGcDeadSession` — 标记为 gcdeadtrace 专用
+- `ss.sessionID = gp.gcDeadSessionID` — 内部会话 ID
+- `ss.goid = gp.goid` — 当前 goroutine ID（用于输出中 per-goroutine 归属）
+- `ss.b = b` — bucket 指针（用于释放时查找 allocBucketRefs）
+- `ss.typ = typ` — 类型元数据（用于释放时获取 typeName）
+
+然后调用 `addspecial(p, &ss.special, false)` 将这个 special 挂载到对象 p
+所在 span 的 specials 链表上。每个 span 的 specials 链表是一个单向链表，
+按 kind 分类。如果该对象已经有同类型的 special，addspecial 返回 false，
+此时释放刚分配的 special 结构体。
+
+至此，堆上每个会话对象都与一个 specialGcDeadSession 关联。后续 GC sweep 时，
+sweep 代码会遍历已死亡 span 的 specials 链表，遇到 _KindSpecialGcDeadSession
+就回调 gcDeadRecordFree，从而精确地知道这个释放的对象属于哪个会话、从哪个
+bucket 分配。这个机制是跨会话隔离的基石：即使两个不同会话从相同的分配站点
+分配内存，它们的 special 携带不同的 sessionID，释放时各自更新对应会话的计数器。
+
+与 mProf_Free 的区别值得注意：mProf_Free 仅在 bucket 级别更新 `frees++`，
+不涉及任何会话归属。gcdeadtrace 的释放追踪完全通过 special 回调完成，两者是
+独立的路径。
+
+
+9.6 GcDeadSessionEnd — 会话结束 + 触发 GC
+--------------------------------------------
+
+GcDeadSessionEnd(42) 被调用时，首先核实当前 goroutine 确实在某个活跃会话中。
+如果 gp.gcDeadSessionActive 为 false，直接返回。
+
+然后检查 gcDeadSessionTable，用 gp.gcDeadSessionID（内部 ID）查找条目，验证
+`e.originalID == id` 确保用户传入的原始 ID 匹配。通过后：
+
+- 清理当前 goroutine 状态：`gp.gcDeadSessionActive = false`，
+  `gp.gcDeadSessionID = 0`
+- 遍历 allgs（持有 allglock），清理所有 `gcDeadSessionID` 等于内部 ID 的 goroutine
+  状态。这确保即使有其他 goroutine 也加入了此会话，它们都能被释放以启动新会话。
+- 如果 gcdeadtrace > 0：设置 `e.endPC` 为调用者 PC、`e.ended = true`，
+  递减 `gcDeadSessionCount`（到 0 则恢复 MemProfileRate 为原始值），
+  输出 "session 42#0 ended at file:line"。
+- 最后调用 `GC()` 强制触发一次垃圾回收，立即产生输出。
+
+
+9.7 GC 标记与 Sweep — 对象回收与 gcDeadRecordFree
+----------------------------------------------------
+
+GC() 启动后，标记阶段扫描器发现 obj 已无引用（用户代码将 obj 置 nil 或超出
+作用域），将其标记为死亡。span 的 specials 链表随之进入待处理状态。
+
+sweep 阶段按 page 粒度回收内存。sweepone 函数每次找一个未清扫的 span，调用
+sweepspan 处理。sweepspan 内遍历 span 上的所有已死亡对象，对每个对象调用
+freeSpecial。freeSpecial 遍历对象的 specials 链表，按 kind 分发：
+
+遇到 `_KindSpecialGcDeadSession` 时，从 special 中提取 sessionID、bucket
+指针 b、goid 和 typ，调用 gcDeadRecordFree。gcDeadRecordFree 的完整流程：
+
+首先计算索引 `idx = sessionID % 4096`，获取会话表条目 e。校验 `e.id == sessionID`
+确保表条目未被其他会话覆盖。如果不匹配，静默丢弃（该会话已被重用，旧数据丢失）。
+
+匹配成功后执行四部分更新，全部使用原子操作：
+
+1. 会话级 freed 计数：`e.frees++`、`e.freeBytes += size`（累积释放量，
+   用于输出中的 per-session freed 统计）。同时更新 `e.cumFrees++`、
+   `e.cumFreeBytes += size`（累计值永不清零）。
+
+2. per-goroutine 释放统计：在 e.goroutineStats 数组中按 goid 匹配，
+   更新 `frees++` 和 `freeBytes += size`。
+
+3. 站点级累计释放：将 special 中存储的 bucket 指针转为 unsafe.Pointer，
+   在 e.allocBucketRefs 数组中线性查找匹配的 bucket 指针。找到后更新
+   `cumFrees++` 和 `cumFreeBytes += size`。如果找不到（槽位已被覆盖），
+   该站点 freed 数据丢失，但会话级计数仍准确。
+
+4. 类型名解析：`toRType(typ).string()` 获取类型字符串用于输出注解。
+
+一个需注意的细节：allocBucketRefs 查找时仅按 bucket 指针匹配，不做 goid 匹配。
+这是因为 gcDeadRecordFree 使用 special 中存储的 goid（分配时的 goroutine），
+不是当前执行释放的 goroutine。如果同一个 bucket 被多个 goroutine 分配，
+释放时按 bucket 匹配会累加到一个记录上。这是设计上可接受的近似。
+
+
+9.8 gcDeadTracePrint — GC 结束时的六阶段输出
+-----------------------------------------------
+
+所有 sweep 完成后，在 GC 标记结束的 STW 阶段末尾，gcMarkDone 调用
+gcDeadTracePrint（仅在 gcdeadtrace > 0 时生效）。这是一个六阶段流水线，
+全部在 STW 中执行以保证数据一致性。
+
+**Phase 0 — 原始 bucket 数据收集。** 遍历全局 mbuckets 链表，对每个
+gcDeadFrees > 0 的 bucket，将其调用栈 PC、释放次数和字节数写入 raw 数组。
+此时 raw 数组只含非 session 的全局 freed 站点，session 数据在下一阶段加入。
+
+**Phase 1 — 交叉引用 allocBucketRefs（核心计算阶段）。** 遍历整个
+gcDeadSessionTable，对每个活跃会话遍历其 allocBucketRefs。用两个关键公式
+计算 freed 和 alive 计数：
+
+- `本轮 freed = cumFrees - prevCumFrees`：自上次 GC 以来该站点释放了多少对象
+- `当前 alive = frees - cumFrees`：该站点分配的仍存活的对象数
+
+对于 freed > 0 的对象，构造 sessionRefs 条目，包含 sessionID、originalID、
+generation、objs、bytes 和 typeName，挂载到匹配的 raw 条目上（按 PC 元组匹配，
+不做字符串比较，纯指针比较）。如果找不到匹配 raw 条目且未超限，创建新 raw 条目。
+alive 的归属同理，写入 aliveSessionRefs。
+
+此时 session 数据的 originalID 和 generation 从会话表传播到了 raw 条目中。
+后续输出时，如果 generation > 0，会显示为 `session #42#1`，否则显示为
+`session #42`（兼容旧格式）。
+
+**Phase 2 — per-session 分解输出。** 再次遍历 gcDeadSessionTable，对每个
+有数据的会话输出按 session 汇总行："session #42: N allocs (M bytes),
+K freed (L bytes), P alive (Q bytes)"，附带 start 位置、join 位置和 end 位置。
+清零 per-cycle 计数器（frees/freeBytes），保留累计计数器（cumAllocs/cumFrees）。
+
+**Phase 3 — 符号化 + 合并。** 将 raw 条目中的 PC 解析为函数名、文件名和行号。
+按符号化后的 key（函数+文件+行号三元组）合并站点。合并时，sessionRefs 按
+sessionID 去重累加（同一 session 在同一站点的 freed 计数合并）。
+
+**Phase 4 — 排序。** 所有合并后的站点按 bytes 降序排列。
+
+**Phase 5 — 格式化输出 + 更新 prevCumFrees。** 组织三部分输出：
+
+1. per-session 分解（Phase 2 已完成追加到缓冲区）
+2. freed 报告："gcdeadsession:freed: N objs (M bytes) freed from K sites"，
+   每个站点显示调用栈和 [session #42: X objs, Y bytes @typeName]
+3. alive 报告：格式同上
+
+输出完成后，遍历所有会话表条目的 allocBucketRefs，设置
+`prevCumFrees = cumFrees`、`prevCumFreeBytes = cumFreeBytes`，为下一轮 GC
+的 freed delta 计算设好基线。
+
+**Phase 6 — 写入输出。** 将 4MB 缓冲区的内容通过 write(2) 写入 stderr。
+如果配置了 gcdeadtracefile，同步追加写入到文件。如果缓冲区溢出，写入
+"..TRUNCATED" 标记。
+
+
+最终用户看到的输出示例：
+
+```
+=== GC #1 ===
+gcdeadsession by session:
+  session #42: 1 allocs (256 bytes), 1 freed (256 bytes), 0 alive (0 bytes)
+    [first: main.go:15 (gid=1), end: main.go:19]
+
+gcdeadsession:freed: 1 session objs (256 bytes) freed from 1 sites
+  main.main (main.go:15): 1 session objs, 256 session bytes
+    [session #42: 1 objs, 256 bytes @[]uint8]
+
+gcdeadsession:alive: 0 session objs (0 bytes) still alive from 0 sites
+```
+
+
+9.9 mProf_Malloc 和 gcDeadRecordFree 的对称性
+------------------------------------------------
+
+mProf_Malloc 和 gcDeadRecordFree 是 gcdeadtrace 数据采集的两个端点，它们操作的
+是同一组计数器的不同子集。两者的更新内容对照如下：
+
+**会话级计数：** mProf_Malloc 更新 e.allocs++、e.allocBytes += size、
+e.cumAllocs++、e.cumAllocBytes += size。gcDeadRecordFree 完全不触及 allocs 系列
+计数器，它更新 e.frees++、e.freeBytes += size、e.cumFrees++、
+e.cumFreeBytes += size。分配和释放的计数器严格分离，不存在一个函数同时更新两边。
+
+**goroutine 统计：** mProf_Malloc 更新 goroutineStats[gid].allocs++ 和
+allocBytes。gcDeadRecordFree 更新 goroutineStats[gid].frees++ 和 freeBytes。
+由于 goid 来自 special 中记录的值（而非当前释放的 goroutine），这个 freed 归属
+准确地反映了分配时 goroutine 的释放量，即使释放由不同的 goroutine 执行。
+
+**allocBucketRefs：** mProf_Malloc 更新 refs[j].frees++、refs[j].bytes += size，
+并在首次插入时写入 typeName。gcDeadRecordFree 更新 refs[j].cumFrees++、
+refs[j].cumFreeBytes += size。typeName 在分配时写入一次后不再修改。
+
+**匹配条件不同：** mProf_Malloc 按 bucket 指针 + goid 双条件匹配，这是因为分配
+时精确知道当前 goroutine。gcDeadRecordFree 仅按 bucket 指针匹配，不做 goid 过滤，
+因为释放时不能假定只有分配时的 goroutine 能触发释放（对象可能被传递）。
+
+**核心区分：** allocs 类计数器只增不减，仅由 mProf_Malloc 写入；frees 类计数器
+也只增不减，仅由 gcDeadRecordFree 写入。两者之差（cumAllocs - cumFrees）就是
+当前会话尚在堆上的存活对象数。这个公式是 gcDeadTracePrint Phase 1 中 alive 计数
+的理论基础。
+
+
 附录: GODEBUG 使用说明
 =======================
 
