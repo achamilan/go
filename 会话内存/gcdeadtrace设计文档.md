@@ -832,61 +832,77 @@ runtime.GcDeadSessionEnd(42)            // 步骤 3 → 触发 GC，步骤 4-7 �
 
 **—— 以下是快速讲解版，约 3 分钟读完 ——**
 
-gcdeadtrace 的核心思路可以概括为四句话：
+gcdeadtrace 的目标是追踪每个会话内分配对象的最终结局：对象死亡时属于哪个会话、
+死在哪个分配站点。实现依赖分配时和释放时两个采集点。
 
-1. **标记归属** — 每次分配时，在对象上挂一个 special 标签，写上"此对象属于会话 42，
-   分配站点是 bucket X"。
-2. **记录计数** — 同时在会话表中记录"会话 42 分配了 1 个对象、256 字节"，
-   在 allocBucketRefs 中按 bucket + goroutine 记录"站点 X 分配了 1 个对象"。
-3. **精确回收** — GC 回收对象时，通过 special 标签找到它属于哪个会话，
-   只更新对应会话的释放计数，完全不干扰其他会话。
-4. **汇总输出** — 每个 GC 周期结束时，用累计分配减去累计释放算出存活量，
-   用本轮释放减去上轮快照算出本轮死亡量，按会话、按站点组织成三部分输出。
+**分配时（mProf_Malloc）采集三条信息：**
 
-这四步对应的关键机制：
+1. 对象所属会话（sessionID）
+2. 对象的分配站点（调用栈 + 分配大小）
+3. 对象的类型名称
 
-- **specialGcDeadSession** — 对象级别的会话标记。每个会话对象都挂一个 special，
-  释放时通过它回调 gcDeadRecordFree，实现跨会话精确隔离。
-- **gcDeadSessionTable** — 4096 条目的会话表，按 sessionID 哈希索引。
-  记录会话级 allocs/frees/cumAllocs/cumFrees 计数器。
-- **allocBucketRefs** — 每会话的分配站点明细表，动态扩展。
-  记录每个 bucket + goid 的 frees/bytes/cumFrees，用于站点级输出。
-- **gcDeadTracePrint 六阶段流水线** — Phase 1 用 `cumFrees - prevCumFrees`
-  算 freed，`frees - cumFrees` 算 alive。Phase 3 按调用栈符号化合并。
-  Phase 5 更新 prevCumFrees 准备下一轮。
+sessionID 用于区分不同会话的数据；调用栈 + 大小定义站点，用于在输出中按站点归类；
+类型名称用于站点行上的 `@[]uint8` 注解。
 
-数据流简图（三步走）：
+分配站点由调用栈和分配大小共同决定，两者缺一不可：
 
-```
-GcDeadSessionStart(42)
-  │
-  ▼
-┌─分配时 (mProf_Malloc)────────────────────────────────────┐
-│ ① 会话表: e.allocs++                                     │
-│ ② allocBucketRefs: refs[j].frees++                       │
-│ ③ special{sessionID=42, bucket=b} → addspecial(p)       │
-└──────────────────────────────────────────────────────────┘
-  │
-  ▼  GC 触发
-┌─释放时 (gcDeadRecordFree, 通过 special 回调)──────────────┐
-│ ④ 会话表: e.cumFrees++                                   │
-│ ⑤ allocBucketRefs: refs[j].cumFrees++                    │
-└──────────────────────────────────────────────────────────┘
-  │
-  ▼  GC 结束 STW
-┌─汇总输出 (gcDeadTracePrint)──────────────────────────────┐
-│ ⑥ freed = cumFrees - prevCumFrees  → [session #42]      │
-│ ⑦ alive = frees - cumFrees          → per-session 行     │
-│ ⑧ prevCumFrees = cumFrees           （准备下一轮）        │
-└──────────────────────────────────────────────────────────┘
+```go
+func doAlloc(size uintptr) {
+    obj := make([]byte, size)   // 调用栈: doAlloc
+}
+
+doAlloc(256)  // 站点 A: 调用栈=doAlloc + 大小=256
+doAlloc(512)  // 站点 B: 调用栈=doAlloc + 大小=512（大小不同）
+
+func doAlloc2() {
+    obj := make([]byte, 256)    // 站点 C: 调用栈=doAlloc2 + 大小=256（调用栈不同）
+}
 ```
 
-核心公式只有两个：
-- `本轮 freed = cumFrees - prevCumFrees`
-- `当前 alive = frees - cumFrees`
+相同站点的所有分配在输出中汇总为一条站点行。
 
-mProf_Malloc 写 allocs/frees/bytes（只增不减），gcDeadRecordFree 写 cumFrees
-（只增不减），两者严格分离，互不干扰。gcDeadTracePrint 做减法得出增量。
+**释放时（gcDeadRecordFree）采集一条信息：**
+
+4. 对象所属会话的释放事件
+
+**最终输出包含三个部分：**
+
+```
+=== GC #1 ===
+gcdeadsession by session:
+  session #42: 1 allocs (256 bytes), 1 freed (256 bytes), 0 alive (0 bytes)
+    [first: main.go:15 (gid=1), end: main.go:19]
+
+gcdeadsession:freed: 1 session objs (256 bytes) freed from 1 sites
+  main.main (main.go:15): 1 session objs, 256 session bytes
+    [session #42: 1 objs, 256 bytes @[]uint8]
+
+gcdeadsession:alive: 0 session objs (0 bytes) still alive from 0 sites
+```
+
+- by session：每个会话的总览（分配数、释放数、存活数）
+- freed：按站点列出本轮 GC 回收的会话对象及其会话归属
+- alive：按站点列出当前仍存活的会话对象及其会话归属
+
+**数据流简图：**
+
+```
+分配时 (mProf_Malloc)
+  → 采集 sessionID、调用栈、类型
+  → 更新会话表计数
+  → 挂 special 标签到对象
+       ↓
+释放时 (gcDeadRecordFree, 通过 special 回调)
+  → 采集释放事件（所属会话 + 站点）
+  → 更新会话表释放计数
+       ↓
+汇总输出 (gcDeadTracePrint)
+  → freed = 本轮释放 − 上轮快照
+  → alive = 累计分配 − 累计释放
+  → 输出 per-session 总览、freed 站点明细、alive 站点明细
+```
+
+整体流程可概括为：**分配时记"谁从哪来"，释放时记"谁走了"，GC 结束时算"还剩谁、死在哪"**。
 
 **—— 快速讲解结束，以下是完整文字描述 ——**
 
