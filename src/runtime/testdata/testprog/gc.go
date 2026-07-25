@@ -36,6 +36,8 @@ func init() {
 	register("GCDeadTraceStartAfterEnd", GCDeadTraceStartAfterEnd)
 	register("GCDeadSessionOnly", GCDeadSessionOnly)
 	register("GCDeadSessionOnlyMem", GCDeadSessionOnlyMem)
+	register("GCDeadTraceSessionReuse", GCDeadTraceSessionReuse)
+	register("GCDeadTraceConcurrentReuse", GCDeadTraceConcurrentReuse)
 }
 
 func GCSys() {
@@ -352,6 +354,18 @@ var (
 	gcDeadAfterEndS1Alive []byte // session 501 alloc from g1, stays alive
 	gcDeadAfterEndS1Die   []byte // session 501 alloc from g2, will die
 	gcDeadAfterEndS2Alive []byte // session 502 alloc from g2, stays alive
+
+	// gcDeadSessionReuse sinks for GCDeadTraceSessionReuse test.
+	gcDeadReuseGen0 []byte // session 42 gen 0 alloc, will die
+	gcDeadReuseGen1 []byte // session 42 gen 1 alloc, will die
+	gcDeadReuseGen2 []byte // session 42 gen 2 alloc, will die
+	gcDeadReuseAlive []byte // session 42 gen 3 alloc, stays alive
+
+	// gcDeadConcurReuse sinks for GCDeadTraceConcurrentReuse test.
+	gcDeadConcurA []byte // session 42 gen 0 alloc from goroutine A, will die
+	gcDeadConcurB []byte // session 42 gen 0 alloc from goroutine B, will die
+	gcDeadConcurC []byte // session 42 gen 1 alloc from goroutine A/B, will die
+	gcDeadConcurD []byte // session 42 gen 1 alloc from goroutine A/B, will die
 )
 
 func GCDeadTrace() {
@@ -797,6 +811,107 @@ func GCDeadTraceStartAfterEnd() {
 
 	// Nil dying references.
 	gcDeadAfterEndS1Die = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadTraceSessionReuse tests session ID reuse with generation suffix.
+// The same sessionID 42 is started/ended 4 times in sequence, each producing
+// a different generation (gen 0, 1, 2, 3). The output should show distinct
+// session entries with #0, #1, #2 suffixes (gen 0 displays without suffix).
+//
+// Generations 0-2 are freed (nil'd before GC), generation 3 stays alive.
+// Expected output lines:
+//
+//	session #42: 1 allocs (256 bytes), 1 freed (256 bytes), 0 alive (0 bytes)
+//	session #42#1: 1 allocs (512 bytes), 1 freed (512 bytes), 0 alive (0 bytes)
+//	session #42#2: 1 allocs (128 bytes), 1 freed (128 bytes), 0 alive (0 bytes)
+//	session #42#3: 1 allocs (1024 bytes), 0 freed (0 bytes), 1 alive (1024 bytes)
+func GCDeadTraceSessionReuse() {
+	runtime.MemProfileRate = 1
+
+	// Generation 0: session 42, first use — no suffix in output.
+	runtime.GcDeadSessionStart(42)
+	gcDeadReuseGen0 = make([]byte, 256) // will die
+	runtime.GcDeadSessionEnd(42)
+
+	// Generation 1: session 42, reused — suffix #1 in output.
+	runtime.GcDeadSessionStart(42)
+	gcDeadReuseGen1 = make([]byte, 512) // will die
+	runtime.GcDeadSessionEnd(42)
+
+	// Generation 2: session 42, reused — suffix #2 in output.
+	runtime.GcDeadSessionStart(42)
+	gcDeadReuseGen2 = make([]byte, 128) // will die
+	runtime.GcDeadSessionEnd(42)
+
+	// Generation 3: session 42, reused — suffix #3 in output.
+	runtime.GcDeadSessionStart(42)
+	gcDeadReuseAlive = make([]byte, 1024) // stays alive
+	runtime.GcDeadSessionEnd(42)
+
+	// Nil dying references so GC frees them.
+	gcDeadReuseGen0 = nil
+	gcDeadReuseGen1 = nil
+	gcDeadReuseGen2 = nil
+
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadTraceConcurrentReuse tests concurrent session ID reuse with
+// generation suffix. Two goroutines share session 42 in gen 0, then both
+// call Start(42) again after gen 0 ends — verifying lock-protected generation
+// creation (no TOCTOU race) and concurrent join of gen>0.
+//
+// Expected per-session output (all 4 allocs freed):
+//
+//	session #42: 2 allocs (768 bytes), 2 freed (768 bytes), 0 alive (0 bytes)
+//	session #42#1: 2 allocs (192 bytes), 2 freed (192 bytes), 0 alive (0 bytes)
+func GCDeadTraceConcurrentReuse() {
+	runtime.MemProfileRate = 1
+
+	var wg sync.WaitGroup
+
+	// Phase 1: Two goroutines share session 42, gen 0.
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(42)
+		gcDeadConcurA = make([]byte, 256)
+		runtime.GcDeadSessionEnd(42)
+	}()
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(42)
+		gcDeadConcurB = make([]byte, 512)
+		runtime.GcDeadSessionEnd(42)
+	}()
+	wg.Wait()
+
+	// Phase 2: Both call Start(42) again concurrently after gen 0 ended.
+	// Both should join gen 1 (lock-protected generation creation).
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(42)
+		gcDeadConcurC = make([]byte, 128)
+		runtime.GcDeadSessionEnd(42)
+	}()
+	go func() {
+		defer wg.Done()
+		runtime.GcDeadSessionStart(42)
+		gcDeadConcurD = make([]byte, 64)
+		runtime.GcDeadSessionEnd(42)
+	}()
+	wg.Wait()
+
+	// Nil dying references.
+	gcDeadConcurA = nil
+	gcDeadConcurB = nil
+	gcDeadConcurC = nil
+	gcDeadConcurD = nil
 
 	runtime.GC()
 	fmt.Println("OK")

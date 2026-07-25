@@ -559,6 +559,105 @@ func TestGcDeadTraceStartAfterEnd(t *testing.T) {
 	}
 }
 
+// TestGcDeadTraceSessionReuse verifies that reusing the same sessionID produces
+// generation suffixes (#1, #2, etc.) in the output, and that each generation's
+// allocations are tracked independently.
+func TestGcDeadTraceSessionReuse(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceSessionReuse", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "gcdeadsession by session:") {
+		t.Fatalf("expected gcdeadsession by session output, got:\n%s", got)
+	}
+
+	// Should contain generation suffixes for reused sessions.
+	hasGen0 := false
+	hasGen1 := false
+	hasGen2 := false
+	hasGen3 := false
+	hasOK := false
+	for _, l := range strings.Split(got, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		// Gen 0 displays as "session #42:" (no suffix).
+		if strings.Contains(l, "session #42:") && !strings.Contains(l, "session #42#") {
+			t.Logf("found gen 0: %s", l)
+			hasGen0 = true
+		}
+		// Gen 1 displays as "session #42#1:".
+		if strings.Contains(l, "session #42#1:") {
+			t.Logf("found gen 1: %s", l)
+			hasGen1 = true
+		}
+		// Gen 2 displays as "session #42#2:".
+		if strings.Contains(l, "session #42#2:") {
+			t.Logf("found gen 2: %s", l)
+			hasGen2 = true
+		}
+		// Gen 3 displays as "session #42#3:".
+		if strings.Contains(l, "session #42#3:") {
+			t.Logf("found gen 3: %s", l)
+			hasGen3 = true
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+	if !hasGen0 {
+		t.Errorf("expected session #42 (gen 0) in per-session breakdown")
+	}
+	if !hasGen1 {
+		t.Errorf("expected session #42#1 (gen 1, first reuse) in per-session breakdown")
+	}
+	if !hasGen2 {
+		t.Errorf("expected session #42#2 (gen 2, second reuse) in per-session breakdown")
+	}
+	if !hasGen3 {
+		t.Errorf("expected session #42#3 (gen 3, third reuse) in per-session breakdown")
+	}
+	t.Logf("found all 4 generations of session 42, output:\n%s", got)
+}
+
+// TestGcDeadTraceConcurrentReuse verifies that concurrent Start/End of the
+// same reused session ID works correctly — no TOCTOU race, generation created
+// under lock, and concurrent goroutines join the existing gen>0 session.
+func TestGcDeadTraceConcurrentReuse(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceConcurrentReuse", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "gcdeadsession by session:") {
+		t.Fatalf("expected gcdeadsession by session output, got:\n%s", got)
+	}
+
+	hasOK := false
+	hasGen0 := false
+	hasGen1 := false
+	for _, l := range strings.Split(got, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "OK" {
+			hasOK = true
+		}
+		if strings.Contains(l, "session #42:") && !strings.Contains(l, "session #42#") {
+			t.Logf("found gen 0: %s", l)
+			hasGen0 = true
+		}
+		if strings.Contains(l, "session #42#1:") {
+			t.Logf("found gen 1: %s", l)
+			hasGen1 = true
+		}
+	}
+	if !hasOK {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+	if !hasGen0 {
+		t.Errorf("expected session #42 (gen 0) in per-session breakdown")
+	}
+	if !hasGen1 {
+		t.Errorf("expected session #42#1 (gen 1, concurrent reuse) in per-session breakdown")
+	}
+	t.Logf("concurrent reuse OK, output:\n%s", got)
+}
+
 // TestGcDeadSessionOnlyMem verifies that GODEBUG=gcdeadsession=1 alone does NOT
 // allocate the 519 MB session table. As a control, also verifies that
 // GODEBUG=gcdeadtrace=1 DOES allocate the table.
