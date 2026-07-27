@@ -124,6 +124,7 @@ const (
 	PatternConcurrent               // Multi-session concurrent tracking
 	PatternCustomTypes              // Custom types: struct, map, interface, string
 	PatternRePrint                  // Session re-print on end verification
+	PatternReuse                    // Session ID reuse with generation suffix
 )
 
 func (p AllocPattern) String() string {
@@ -142,6 +143,8 @@ func (p AllocPattern) String() string {
 		return "customtypes"
 	case PatternRePrint:
 		return "reprint"
+	case PatternReuse:
+		return "reuse"
 	default:
 		return "unknown"
 	}
@@ -281,6 +284,8 @@ func (w *WorkerActor) doAllocBurst() {
 		w.patternCustomTypes()
 	case PatternRePrint:
 		w.patternRePrint()
+	case PatternReuse:
+		w.patternReuse()
 	}
 }
 
@@ -410,6 +415,25 @@ func (w *WorkerActor) patternRePrint() {
 	w.sessionActive = false
 
 	// GC 3: endPC != 0, printed=1 → re-printed with "end:".
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
+
+// patternReuse: demonstrates generation suffix on reused session IDs.
+// Uses a fixed session ID (5001) across bursts. Each Start/End cycle
+// creates a new generation, shown as #0, #1, #2 in output.
+func (w *WorkerActor) patternReuse() {
+	const reuseID uint64 = 5001
+
+	runtime.GcDeadSessionStart(reuseID)
+	w.scratch = make([]byte, 256) // will die next burst
+	atomic.AddInt64(&w.stats.TotalAllocs, 1)
+	atomic.AddInt64(&w.stats.TotalBytes, 256)
+	runtime.GcDeadSessionEnd(reuseID)
+
+	// Nil so GC frees it and shows it in output.
+	w.scratch = nil
+
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 }
@@ -821,7 +845,7 @@ func checksum(blocks [][]byte) uint64 {
 
 func main() {
 	duration := flag.Duration("duration", 10*time.Second, "total run duration")
-	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes")
+	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse")
 	flag.Parse()
 
 	fmt.Println("========================================")
@@ -841,6 +865,7 @@ func main() {
 		fmt.Println("    worker-fullydead   — per-site fully-dead detection")
 		fmt.Println("    worker-concurrent  — two concurrent sessions, same site")
 		fmt.Println("    worker-customtypes — struct, map, interface, string types")
+		fmt.Println("    worker-reuse       — session ID reuse with generation suffix (#1, #2, ...)")
 		fmt.Println("  (gcdeadtrace session output appears on stderr via GODEBUG=gcdeadtrace=1)")
 		fmt.Println()
 	}
@@ -857,6 +882,7 @@ func main() {
 		_ = system.AddWorker("worker-fullydead", PatternFullyDead)
 		_ = system.AddWorker("worker-concurrent", PatternConcurrent)
 		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
+		_ = system.AddWorker("worker-reuse", PatternReuse)
 	case "loop":
 		_ = system.AddWorker("worker-loop", PatternLoop)
 	case "mixed":
@@ -871,6 +897,8 @@ func main() {
 		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
 	case "reprint":
 		_ = system.AddWorker("worker-reprint", PatternRePrint)
+	case "reuse":
+		_ = system.AddWorker("worker-reuse", PatternReuse)
 	default:
 		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint)", *mode)
 	}
