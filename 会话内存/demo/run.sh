@@ -72,6 +72,30 @@ case "$MODE" in
         SESSION3010=$(grep -c "session #3001:" "$OUT_STDERR" 2>/dev/null || echo 0)
         check "concurrent session output" "$SESSION3010"
         ;;
+    concurrentgrowth)
+        S6001=$(grep -c "session #6001:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        FREED=$(grep -c "gcdeadsession:freed:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        ALIVE=$(grep -c "gcdeadsession:alive:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        check "session 6001 output" "$S6001"
+        check "freed output present" "$FREED"
+        check "alive output present" "$ALIVE"
+        ;;
+    sessionrefoverflow)
+        S7000=$(grep -c "session #7000:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        FREED=$(grep -c "gcdeadsession:freed:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        ALIVE=$(grep -c "gcdeadsession:alive:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        check "session 7000 output" "$S7000"
+        check "freed output present" "$FREED"
+        check "alive output present" "$ALIVE"
+        ;;
+    largeoutput)
+        S8000=$(grep -c "session #8000:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        FREED=$(grep -c "gcdeadsession:freed:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        ALIVE=$(grep -c "gcdeadsession:alive:" "$OUT_STDERR" 2>/dev/null || echo 0)
+        check "session 8000 output" "$S8000"
+        check "freed output present" "$FREED"
+        check "alive output present" "$ALIVE"
+        ;;
     *)
         TOTAL_GC=$(grep -c "=== GC #" "$OUT_STDERR" 2>/dev/null || echo 0)
         TOTAL_SESS=$(grep -c "gcdeadsession by session:" "$OUT_STDERR" 2>/dev/null || echo 0)

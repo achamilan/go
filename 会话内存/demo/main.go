@@ -18,6 +18,15 @@ var (
 	concurrentSinkA2 []byte
 	concurrentSinkB1 []byte
 	concurrentSinkB2 []byte
+
+	// Sink variables for concurrent-growth test.
+	demoGrowthSink [][]byte
+
+	// Sink variables for session-ref-overflow test.
+	demoRefSink [][]byte
+
+	// Sink variables for large-output test.
+	demoLargeSink [][]byte
 )
 
 // Custom type definitions for gcdeadtrace type tracking demo.
@@ -125,6 +134,9 @@ const (
 	PatternCustomTypes              // Custom types: struct, map, interface, string
 	PatternRePrint                  // Session re-print on end verification
 	PatternReuse                    // Session ID reuse with generation suffix
+	PatternConcurrentGrowth         // Concurrent alloc/free with array growth
+	PatternSessionRefOverflow       // >16 sessions at one call site
+	PatternLargeOutput              // Many sessions × many sites → large output
 )
 
 func (p AllocPattern) String() string {
@@ -145,6 +157,12 @@ func (p AllocPattern) String() string {
 		return "reprint"
 	case PatternReuse:
 		return "reuse"
+	case PatternConcurrentGrowth:
+		return "concurrentgrowth"
+	case PatternSessionRefOverflow:
+		return "sessionrefoverflow"
+	case PatternLargeOutput:
+		return "largeoutput"
 	default:
 		return "unknown"
 	}
@@ -286,6 +304,12 @@ func (w *WorkerActor) doAllocBurst() {
 		w.patternRePrint()
 	case PatternReuse:
 		w.patternReuse()
+	case PatternConcurrentGrowth:
+		w.patternConcurrentGrowth()
+	case PatternSessionRefOverflow:
+		w.patternSessionRefOverflow()
+	case PatternLargeOutput:
+		w.patternLargeOutput()
 	}
 }
 
@@ -436,6 +460,99 @@ func (w *WorkerActor) patternReuse() {
 
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
+
+//go:noinline
+func gcDeadGrowthAllocDemo() {
+	_ = make([]byte, 128)
+}
+
+// patternConcurrentGrowth: exercises the concurrent allocBucketRefs array growth
+// path. Spawns 8 goroutines inside a single session doing rapid alloc/free.
+func (w *WorkerActor) patternConcurrentGrowth() {
+	const growthID uint64 = 6001
+	runtime.GcDeadSessionStart(growthID)
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 500; i++ {
+				gcDeadGrowthAllocDemo()
+			}
+		}()
+	}
+	wg.Wait()
+
+	runtime.GcDeadSessionEnd(growthID)
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+}
+
+// patternSessionRefOverflow: creates >16 sessions that all allocate from
+// the same call site, exercising the gcDeadSessionRefSlots overflow path.
+// Sessions start/end on the worker goroutine (stable session table entries),
+// allocations in parallel goroutines (realistic multi-goroutine usage).
+func (w *WorkerActor) patternSessionRefOverflow() {
+	const nSessions = 25
+	demoRefSink = make([][]byte, nSessions)
+
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionStart(uint64(7000 + i))
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < nSessions; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			demoRefSink[idx] = make([]byte, 64)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionEnd(uint64(7000 + i))
+	}
+
+	runtime.GC()
+	demoRefSink = nil
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 2)
+}
+
+// patternLargeOutput: creates many sessions with multiple allocation sites
+// to produce large gcdeadtrace output, testing the 8MB buffer and alive-first order.
+// patternLargeOutput: creates many sessions with multiple allocation sites
+// to produce large gcdeadtrace output, testing the 8MB buffer and alive-first order.
+// Sessions start/end on the worker goroutine (stable session table entries),
+// allocations in parallel goroutines (realistic multi-goroutine usage).
+func (w *WorkerActor) patternLargeOutput() {
+	const nSessions = 100
+	const allocsPerSession = 3
+	demoLargeSink = make([][]byte, nSessions*allocsPerSession)
+
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionStart(uint64(8000 + i))
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < nSessions; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			demoLargeSink[idx*allocsPerSession] = make([]byte, 128)
+			demoLargeSink[idx*allocsPerSession+1] = make([]byte, 256)
+			demoLargeSink[idx*allocsPerSession+2] = make([]byte, 512)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionEnd(uint64(8000 + i))
+	}
+
+	runtime.GC()
+	demoLargeSink = nil
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 2)
 }
 
 // patternFullyDead: TestGcDeadTraceFullyDead-like — per-site fully dead detection.
@@ -845,7 +962,7 @@ func checksum(blocks [][]byte) uint64 {
 
 func main() {
 	duration := flag.Duration("duration", 10*time.Second, "total run duration")
-	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse")
+	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse, concurrentgrowth, sessionrefoverflow, largeoutput")
 	flag.Parse()
 
 	fmt.Println("========================================")
@@ -859,13 +976,16 @@ func main() {
 
 	if *mode == "all" {
 		fmt.Println("  Workers:")
-		fmt.Println("    worker-loop        — loop alloc, all die")
-		fmt.Println("    worker-mixed       — multi-site, some live/some die")
-		fmt.Println("    worker-session     — single session tracking")
-		fmt.Println("    worker-fullydead   — per-site fully-dead detection")
-		fmt.Println("    worker-concurrent  — two concurrent sessions, same site")
-		fmt.Println("    worker-customtypes — struct, map, interface, string types")
-		fmt.Println("    worker-reuse       — session ID reuse with generation suffix (#1, #2, ...)")
+		fmt.Println("    worker-loop              — loop alloc, all die")
+		fmt.Println("    worker-mixed             — multi-site, some live/some die")
+		fmt.Println("    worker-session           — single session tracking")
+		fmt.Println("    worker-fullydead         — per-site fully-dead detection")
+		fmt.Println("    worker-concurrent        — two concurrent sessions, same site")
+		fmt.Println("    worker-customtypes       — struct, map, interface, string types")
+		fmt.Println("    worker-reuse             — session ID reuse with generation suffix (#1, #2, ...)")
+		fmt.Println("    worker-concurrentgrowth  — concurrent alloc/free with array growth")
+		fmt.Println("    worker-sessionrefoverflow — >16 sessions at one call site overflow")
+		fmt.Println("    worker-largeoutput       — many sessions × many sites → large output")
 		fmt.Println("  (gcdeadtrace session output appears on stderr via GODEBUG=gcdeadtrace=1)")
 		fmt.Println()
 	}
@@ -883,6 +1003,9 @@ func main() {
 		_ = system.AddWorker("worker-concurrent", PatternConcurrent)
 		_ = system.AddWorker("worker-customtypes", PatternCustomTypes)
 		_ = system.AddWorker("worker-reuse", PatternReuse)
+		_ = system.AddWorker("worker-concurrentgrowth", PatternConcurrentGrowth)
+		_ = system.AddWorker("worker-sessionrefoverflow", PatternSessionRefOverflow)
+		_ = system.AddWorker("worker-largeoutput", PatternLargeOutput)
 	case "loop":
 		_ = system.AddWorker("worker-loop", PatternLoop)
 	case "mixed":
@@ -899,8 +1022,14 @@ func main() {
 		_ = system.AddWorker("worker-reprint", PatternRePrint)
 	case "reuse":
 		_ = system.AddWorker("worker-reuse", PatternReuse)
+	case "concurrentgrowth":
+		_ = system.AddWorker("worker-concurrentgrowth", PatternConcurrentGrowth)
+	case "sessionrefoverflow":
+		_ = system.AddWorker("worker-sessionrefoverflow", PatternSessionRefOverflow)
+	case "largeoutput":
+		_ = system.AddWorker("worker-largeoutput", PatternLargeOutput)
 	default:
-		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint)", *mode)
+		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint, reuse, concurrentgrowth, sessionrefoverflow, largeoutput)", *mode)
 	}
 
 	// Start all actors.

@@ -21,7 +21,7 @@ to the output/ directory, and prints a verification summary.
 
 | Position | Name     | Default | Description |
 |----------|----------|---------|-------------|
-| 1        | mode     | all     | all, reuse, session, concurrent, loop, mixed, fullydead, customtypes, reprint |
+| 1        | mode     | all     | all, reuse, session, concurrent, loop, mixed, fullydead, customtypes, reprint, concurrentgrowth, sessionrefoverflow, largeoutput |
 | 2        | duration | 10s     | Run duration (e.g. 5s, 30s, 2m) |
 
 ## Output Files
@@ -34,4 +34,7 @@ to the output/ directory, and prints a verification summary.
 After running, the skill prints PASS/FAIL checks:
 - **reuse mode**: gen 0/1/2+ started + per-session lines with `#1`/`#2` suffix
 - **session mode**: session breakdown output present
+- **concurrentgrowth mode**: session 6001 output + freed/alive sections
+- **sessionrefoverflow mode**: session 7000-7024 output + freed/alive sections
+- **largeoutput mode**: session 8000-8099 output + freed/alive sections
 - **other modes**: any GC output and session breakdown present

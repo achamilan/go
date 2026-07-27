@@ -53,6 +53,21 @@ case "$MODE" in
         verify "freed output present"      "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"      "gcdeadsession:alive:" "$OUT_STDERR"
         ;;
+    concurrentgrowth)
+        verify "session 6001 output"     "session #6001:" "$OUT_STDERR"
+        verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
+        verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
+        ;;
+    sessionrefoverflow)
+        verify "session 7000 output"     "session #7000:" "$OUT_STDERR"
+        verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
+        verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
+        ;;
+    largeoutput)
+        verify "session 8000 output"     "session #8000:" "$OUT_STDERR"
+        verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
+        verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
+        ;;
     *)
         verify "any GC output"            "=== GC #" "$OUT_STDERR"
         verify "any session breakdown"    "gcdeadsession by session:" "$OUT_STDERR"

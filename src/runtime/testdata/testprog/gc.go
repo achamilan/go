@@ -38,6 +38,9 @@ func init() {
 	register("GCDeadSessionOnlyMem", GCDeadSessionOnlyMem)
 	register("GCDeadTraceSessionReuse", GCDeadTraceSessionReuse)
 	register("GCDeadTraceConcurrentReuse", GCDeadTraceConcurrentReuse)
+	register("GCDeadTraceConcurrentGrowth", GCDeadTraceConcurrentGrowth)
+	register("GCDeadTraceSessionRefOverflow", GCDeadTraceSessionRefOverflow)
+	register("GCDeadTraceLargeOutput", GCDeadTraceLargeOutput)
 }
 
 func GCSys() {
@@ -330,6 +333,9 @@ func GCMemoryLimitNoGCPercent() {
 }
 
 var deadSink []byte
+
+// gcDeadOverflowSink keeps allocations alive for overflow/large-output tests.
+var gcDeadOverflowSink [][]byte
 
 // gcDeadSession sinks for GCDeadTraceSession test.
 // Package-level to ensure heap allocation via escape analysis.
@@ -914,6 +920,134 @@ func GCDeadTraceConcurrentReuse() {
 	gcDeadConcurD = nil
 
 	runtime.GC()
+	fmt.Println("OK")
+}
+
+//go:noinline
+func gcDeadGrowthAlloc() {
+	deadSink = make([]byte, 128)
+	deadSink = nil
+}
+
+// GCDeadTraceConcurrentGrowth exercises the concurrent allocBucketRefs array
+// growth path in mProf_Malloc. Multiple goroutines share a single session and
+// rapidly allocate and free objects, triggering the lock-grow pattern in
+// mProf_Malloc's allocBucketRefs array. Under TSan, this verifies that
+// gcDeadRecordFree's allocBucketRefs access is properly locked (Root Cause 1).
+//
+// The test allocates from enough distinct sites (via gcDeadGrowthAlloc and
+// inline make calls) to trigger array growth, then passes with OK on completion.
+func GCDeadTraceConcurrentGrowth() {
+	runtime.MemProfileRate = 1
+
+	const nWorkers = 8
+	const nIter = 500
+	var wg sync.WaitGroup
+
+	runtime.GcDeadSessionStart(901)
+
+	for w := 0; w < nWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < nIter; i++ {
+				gcDeadGrowthAlloc()
+				b := make([]byte, 64)
+				_ = b
+			}
+		}()
+	}
+	wg.Wait()
+
+	runtime.GcDeadSessionEnd(901)
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadTraceSessionRefOverflow creates >16 concurrent sessions that all
+// allocate from the same call site. When objects are freed and the output is
+// built, the per-site session ref slots (gcDeadSessionRefSlots=16) overflow.
+// The fix accumulates the overflow into droppedFrees/droppedFreeBytes and
+// appends "[+N objs from other sessions]" markers (Root Cause 3).
+func GCDeadTraceSessionRefOverflow() {
+	runtime.MemProfileRate = 1
+
+	const nSessions = 25
+	var wg sync.WaitGroup
+	gcDeadOverflowSink = make([][]byte, nSessions)
+
+	// Start all sessions from the main goroutine.
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionStart(uint64(1000 + i))
+	}
+
+	// Allocate in parallel from the same call site.
+	for i := 0; i < nSessions; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			gcDeadOverflowSink[idx] = make([]byte, 64)
+		}(i)
+	}
+	wg.Wait()
+
+	// End all sessions from the main goroutine.
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionEnd(uint64(1000 + i))
+	}
+
+	// First GC: all allocations are still alive (held by gcDeadOverflowSink).
+	runtime.GC()
+
+	// Now release everything.
+	gcDeadOverflowSink = nil
+	runtime.GC()
+
+	fmt.Println("OK")
+}
+
+// GCDeadTraceLargeOutput creates many sessions and allocation sites to produce
+// a large gcdeadtrace output, stress-testing the 8 MB output buffer and
+// verifying that the alive section (now written before the freed section) is
+// not silently truncated (Root Cause 4).
+func GCDeadTraceLargeOutput() {
+	runtime.MemProfileRate = 1
+
+	const nSessions = 100
+	const allocsPerSession = 3
+	var wg sync.WaitGroup
+	gcDeadOverflowSink = make([][]byte, nSessions*allocsPerSession)
+
+	// Start all sessions from the main goroutine to avoid concurrent
+	// GcDeadSessionEnd calls triggering overlapping GCs.
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionStart(uint64(2000 + i))
+	}
+
+	// Allocate in parallel — each goroutine allocates into the global sink.
+	for i := 0; i < nSessions; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			gcDeadOverflowSink[idx*allocsPerSession] = make([]byte, 128)
+			gcDeadOverflowSink[idx*allocsPerSession+1] = make([]byte, 256)
+			gcDeadOverflowSink[idx*allocsPerSession+2] = make([]byte, 512)
+		}(i)
+	}
+	wg.Wait()
+
+	// End all sessions from the main goroutine.
+	for i := 0; i < nSessions; i++ {
+		runtime.GcDeadSessionEnd(uint64(2000 + i))
+	}
+
+	// First GC: all allocations alive.
+	runtime.GC()
+
+	// Release everything and run another GC for freed section.
+	gcDeadOverflowSink = nil
+	runtime.GC()
+
 	fmt.Println("OK")
 }
 

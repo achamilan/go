@@ -621,19 +621,20 @@ func mProf_Free(b *bucket, size uintptr) {
 // this can be increased. Arrays are heap-allocated via persistentalloc
 // on first use, so this consumes ~2 MB of persistent memory at runtime
 // only when gcdeadtrace is enabled.
-const gcDeadTraceMaxSites = 4096
+const gcDeadTraceMaxSites = 8192
 
 // gcDeadTraceMaxFrames is the maximum number of user frames to
 // distinguish call sites. Increasing this helps separate objects
 // allocated by the same function called from different places.
 const gcDeadTraceMaxFrames = 3
 
-// gcDeadTraceBufSize is the output buffer size (4 MB).
+// gcDeadTraceBufSize is the output buffer size (8 MB).
 // In high-throughput scenarios with many sessions (up to 4096) and allocation
 // sites, output can easily exceed 1 MB. The per-session breakdown alone can
 // reach ~800 KB, and per-site freed/alive details add more. The alive section
-// is written last, so a too-small buffer causes alive data to be silently lost.
-const gcDeadTraceBufSize = 4 << 20
+// is now written first (before freed), so it is less likely to be truncated,
+// but the buffer must still be large enough to hold the full output.
+const gcDeadTraceBufSize = 8 << 20
 
 // gcDeadTrace storage types, defined at package level so persistentalloc
 // can compute their size.
@@ -650,6 +651,12 @@ type gcDeadRawEntry struct {
 	// Per-session alive attribution, cross-referenced from session table.
 	aliveSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
 	numAliveSessionRefs int
+
+	// Overflow counters for session refs that exceed gcDeadSessionRefSlots.
+	droppedFrees     uintptr // freed objects from overflow sessions
+	droppedFreeBytes uintptr // freed bytes from overflow sessions
+	droppedAliveFrees     uintptr // alive objects from overflow sessions
+	droppedAliveFreeBytes uintptr // alive bytes from overflow sessions
 }
 
 type gcDeadSite struct {
@@ -669,6 +676,12 @@ type gcDeadSite struct {
 	// Per-session alive attribution.
 	aliveSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
 	numAliveSessionRefs int
+
+	// Overflow counters for session refs that exceed gcDeadSessionRefSlots.
+	droppedFrees     uintptr
+	droppedFreeBytes uintptr
+	droppedAliveFrees     uintptr
+	droppedAliveFreeBytes uintptr
 }
 
 // Persistent storage for gcDeadTracePrint, allocated once on first use.
@@ -797,10 +810,14 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 	}
 
 	// Update allocBucketRefs.cumFrees for per-site freed/alive attribution.
-	// allocBucketRefs entries persist across GC cycles (created at allocation time),
-	// avoiding the loss of site attribution when per-cycle entries
-	// would be evicted.
-	if b != nil && e.allocBucketRefs != nil {
+	// Hold allocBucketRefsLock to prevent a concurrent array growth
+	// (in mProf_Malloc) from rendering our pointer stale. Without the lock,
+	// the atomic increment could land on the old, discarded array.
+	//
+	// b is always non-nil (stkbucket never returns nil), so the old
+	// b != nil check is removed.
+	lock(&e.allocBucketRefsLock)
+	if e.allocBucketRefs != nil {
 		bp := unsafe.Pointer(b)
 		refs := (*[1 << 20]gcDeadSessionBucketRef)(unsafe.Pointer(e.allocBucketRefs))
 		for j := uint32(0); j < e.allocBucketRefsLen; j++ {
@@ -811,6 +828,7 @@ func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, ty
 			}
 		}
 	}
+	unlock(&e.allocBucketRefsLock)
 }
 
 // gcDeadTracePrint prints a summary of freed profiled objects grouped by
@@ -856,6 +874,7 @@ func gcDeadTracePrint() {
 	// Session stats are now computed entirely from the session table,
 	// not from bucket-level heuristic counters. See Phase 2 and Phase 4.
 	rawCount := 0
+	droppedSiteCount := 0
 	totalSessionFrees := uintptr(0)
 	totalSessionBytes := uintptr(0)
 	totalSessionAlive := uintptr(0)
@@ -925,6 +944,8 @@ func gcDeadTracePrint() {
 				frees: f, bytes: b2,
 			}
 			rawCount++
+		} else {
+			droppedSiteCount++
 		}
 	}
 	unlock(&profMemActiveLock)
@@ -1032,6 +1053,10 @@ func gcDeadTracePrint() {
 							r.sessionRefs[ns].bytes = freedThisCycleBytes
 							r.sessionRefs[ns].typeName = br.typeName
 							r.numSessionRefs++
+						} else {
+							// Session refs overflow: accumulate into overflow counters.
+							r.droppedFrees += freedThisCycle
+							r.droppedFreeBytes += freedThisCycleBytes
 						}
 					}
 
@@ -1047,6 +1072,10 @@ func gcDeadTracePrint() {
 							r.aliveSessionRefs[ns].bytes = aliveBytes
 							r.aliveSessionRefs[ns].typeName = br.typeName
 							r.numAliveSessionRefs++
+						} else {
+							// Session refs overflow: accumulate into overflow counters.
+							r.droppedAliveFrees += aliveObjs
+							r.droppedAliveFreeBytes += aliveBytes
 						}
 					}
 					found = true
@@ -1106,6 +1135,8 @@ func gcDeadTracePrint() {
 						}
 						rawCount++
 					}
+				} else if !found {
+					droppedSiteCount++
 				}
 			}
 		}
@@ -1172,8 +1203,17 @@ func gcDeadTracePrint() {
 					ns := sites[idx].numSessionRefs
 					sites[idx].sessionRefs[ns] = *rr
 					sites[idx].numSessionRefs++
+				} else if !found {
+					sites[idx].droppedFrees += rr.objs
+					sites[idx].droppedFreeBytes += rr.bytes
 				}
 			}
+			// Propagate overflow from raw entry.
+			sites[idx].droppedFrees += r.droppedFrees
+			sites[idx].droppedFreeBytes += r.droppedFreeBytes
+			sites[idx].droppedAliveFrees += r.droppedAliveFrees
+			sites[idx].droppedAliveFreeBytes += r.droppedAliveFreeBytes
+
 			// Merge alive session refs.
 			for ri := 0; ri < r.numAliveSessionRefs; ri++ {
 				rr := &r.aliveSessionRefs[ri]
@@ -1190,6 +1230,9 @@ func gcDeadTracePrint() {
 					ns := sites[idx].numAliveSessionRefs
 					sites[idx].aliveSessionRefs[ns] = *rr
 					sites[idx].numAliveSessionRefs++
+				} else if !found {
+					sites[idx].droppedAliveFrees += rr.objs
+					sites[idx].droppedAliveFreeBytes += rr.bytes
 				}
 			}
 		} else if siteCount < gcDeadTraceMaxSites {
@@ -1200,6 +1243,10 @@ func gcDeadTracePrint() {
 				bytes:               r.bytes,
 				numSessionRefs:      r.numSessionRefs,
 				numAliveSessionRefs: r.numAliveSessionRefs,
+				droppedFrees:        r.droppedFrees,
+				droppedFreeBytes:    r.droppedFreeBytes,
+				droppedAliveFrees:     r.droppedAliveFrees,
+				droppedAliveFreeBytes: r.droppedAliveFreeBytes,
 			}
 			for ri := 0; ri < r.numSessionRefs; ri++ {
 				sites[siteCount].sessionRefs[ri] = r.sessionRefs[ri]
@@ -1208,6 +1255,8 @@ func gcDeadTracePrint() {
 				sites[siteCount].aliveSessionRefs[ri] = r.aliveSessionRefs[ri]
 			}
 			siteCount++
+		} else {
+			droppedSiteCount++
 		}
 	}
 
@@ -1455,94 +1504,19 @@ func gcDeadTracePrint() {
 		return
 	}
 
-	// Session freed report: objects allocated in session that have been freed.
-	if totalSessionFrees > 0 {
-		sessionSiteCount := uintptr(0)
-		for i := 0; i < siteCount; i++ {
-			if sites[i].numSessionRefs > 0 {
-				sessionSiteCount++
-			}
-		}
-
-		appendStr("gcdeadsession:freed: ")
-		appendUintptr(totalSessionFrees)
-		appendStr(" session objs (")
-		appendUintptr(totalSessionBytes)
-		appendStr(" bytes) freed from ")
-		appendUintptr(sessionSiteCount)
-		appendStr(" sites\n")
-
-		for i := 0; i < siteCount; i++ {
-			s := &sites[i]
-			if s.numSessionRefs == 0 {
-				continue
-			}
-			// Compute per-site freed count from sessionRefs.
-			siteFrees := uintptr(0)
-			siteBytes := uintptr(0)
-			for ri := 0; ri < s.numSessionRefs; ri++ {
-				siteFrees += s.sessionRefs[ri].objs
-				siteBytes += s.sessionRefs[ri].bytes
-			}
-			var linetmp [20]byte
-
-			appendStr("  ")
-			for j := 0; j < s.nframes; j++ {
-				if j > 0 {
-					appendStr(" < ")
-				}
-				lb := itoa(linetmp[:], uint64(s.funcs[j].line))
-				appendStr(s.funcs[j].name)
-				appendStr(" (")
-				appendStr(s.funcs[j].file)
-				appendStr(":")
-				appendStr(string(lb))
-				appendStr(")")
-			}
-
-			appendStr(": ")
-			appendUintptr(siteFrees)
-			appendStr(" session objs, ")
-			appendUintptr(siteBytes)
-			appendStr(" session bytes")
-			// Append per-session attribution.
-			for ri := 0; ri < s.numSessionRefs; ri++ {
-				r := &s.sessionRefs[ri]
-				appendStr(" [session #")
-				var tmp2 [20]byte
-				b := itoa(tmp2[:], r.originalID)
-				m := copy(buf[n:], b)
-				n += m
-				if r.generation > 0 {
-					appendStr("#")
-					b2 := itoa(tmp2[:], uint64(r.generation))
-					m = copy(buf[n:], b2)
-					n += m
-				}
-				appendStr(": ")
-				appendUintptr(r.objs)
-				appendStr(" objs, ")
-				appendUintptr(r.bytes)
-				appendStr(" bytes")
-				if r.typeName != "" {
-					appendStr(" @")
-					appendStr(r.typeName)
-				}
-				if r.goid != 0 {
-					appendStr(" (gid=")
-					var gidbuf [20]byte
-					b := itoa(gidbuf[:], r.goid)
-					m := copy(buf[n:], b)
-					n += m
-					appendStr(")")
-				}
-				appendStr("]")
-			}
-			appendStr("\n")
-		}
+	// Dropped site warning, emitted before per-site sections so it is visible
+	// even if the buffer overflows later.
+	if droppedSiteCount > 0 {
+		appendStr("gcdeadsession: warning: ")
+		appendUintptr(uintptr(droppedSiteCount))
+		appendStr(" allocation sites dropped (limit ")
+		appendUintptr(gcDeadTraceMaxSites)
+		appendStr(")\n")
 	}
 
 	// Session alive report: objects allocated in session that are still alive.
+	// Written before the freed report so that alive data is less likely to be
+	// truncated if the output buffer overflows.
 	if totalSessionAlive > 0 {
 		sessionSiteCount := uintptr(0)
 		for i := 0; i < siteCount; i++ {
@@ -1568,6 +1542,8 @@ func gcDeadTracePrint() {
 				sAlive += s.aliveSessionRefs[ri].objs
 				sAliveBytes += s.aliveSessionRefs[ri].bytes
 			}
+			sAlive += s.droppedAliveFrees
+			sAliveBytes += s.droppedAliveFreeBytes
 			if sAlive == 0 {
 				continue
 			}
@@ -1624,6 +1600,107 @@ func gcDeadTracePrint() {
 					appendStr(")")
 				}
 				appendStr("]")
+			}
+			// Append overflow marker if some sessions were dropped.
+			if s.droppedAliveFrees > 0 {
+				appendStr(" [+")
+				appendUintptr(s.droppedAliveFrees)
+				appendStr(" objs from other sessions]")
+			}
+			appendStr("\n")
+		}
+	}
+
+	// Session freed report: objects allocated in session that have been freed.
+	if totalSessionFrees > 0 {
+		sessionSiteCount := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].numSessionRefs > 0 || sites[i].droppedFrees > 0 {
+				sessionSiteCount++
+			}
+		}
+
+		appendStr("gcdeadsession:freed: ")
+		appendUintptr(totalSessionFrees)
+		appendStr(" session objs (")
+		appendUintptr(totalSessionBytes)
+		appendStr(" bytes) freed from ")
+		appendUintptr(sessionSiteCount)
+		appendStr(" sites\n")
+
+		for i := 0; i < siteCount; i++ {
+			s := &sites[i]
+			if s.numSessionRefs == 0 && s.droppedFrees == 0 {
+				continue
+			}
+			// Compute per-site freed count from sessionRefs.
+			siteFrees := uintptr(0)
+			siteBytes := uintptr(0)
+			for ri := 0; ri < s.numSessionRefs; ri++ {
+				siteFrees += s.sessionRefs[ri].objs
+				siteBytes += s.sessionRefs[ri].bytes
+			}
+			siteFrees += s.droppedFrees
+			siteBytes += s.droppedFreeBytes
+			var linetmp [20]byte
+
+			appendStr("  ")
+			for j := 0; j < s.nframes; j++ {
+				if j > 0 {
+					appendStr(" < ")
+				}
+				lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+				appendStr(s.funcs[j].name)
+				appendStr(" (")
+				appendStr(s.funcs[j].file)
+				appendStr(":")
+				appendStr(string(lb))
+				appendStr(")")
+			}
+
+			appendStr(": ")
+			appendUintptr(siteFrees)
+			appendStr(" session objs, ")
+			appendUintptr(siteBytes)
+			appendStr(" session bytes")
+			// Append per-session attribution.
+			for ri := 0; ri < s.numSessionRefs; ri++ {
+				r := &s.sessionRefs[ri]
+				appendStr(" [session #")
+				var tmp2 [20]byte
+				b := itoa(tmp2[:], r.originalID)
+				m := copy(buf[n:], b)
+				n += m
+				if r.generation > 0 {
+					appendStr("#")
+					b2 := itoa(tmp2[:], uint64(r.generation))
+					m = copy(buf[n:], b2)
+					n += m
+				}
+				appendStr(": ")
+				appendUintptr(r.objs)
+				appendStr(" objs, ")
+				appendUintptr(r.bytes)
+				appendStr(" bytes")
+				if r.typeName != "" {
+					appendStr(" @")
+					appendStr(r.typeName)
+				}
+				if r.goid != 0 {
+					appendStr(" (gid=")
+					var gidbuf [20]byte
+					b := itoa(gidbuf[:], r.goid)
+					m := copy(buf[n:], b)
+					n += m
+					appendStr(")")
+				}
+				appendStr("]")
+			}
+			// Append overflow marker if some sessions were dropped.
+			if s.droppedFrees > 0 {
+				appendStr(" [+")
+				appendUintptr(s.droppedFrees)
+				appendStr(" objs from other sessions]")
 			}
 			appendStr("\n")
 		}
@@ -1827,8 +1904,12 @@ func GcDeadSessionStart(id uint64) {
 		unlock(&gcDeadSessionTableLock)
 	}
 
-	// If session has already ended, don't join.
-	if e.ended {
+	// If this exact session has already ended, don't join.
+	// Note: we must also check e.originalID == id here, because with large
+	// session IDs, the hash slot may be occupied by a different ended session
+	// (collision). In that case we should fall through to the gen 0 init path
+	// below which overwrites the slot — not reject the new session.
+	if e.originalID == id && e.ended {
 		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: session already ended\n")
 		}
