@@ -32,6 +32,13 @@ v11: allocBucketRefs 改为动态扩展（指针 + 长度 + mutex），移除 20
      初始大小为 gcDeadPerSessionSites，满时翻倍扩容（persistentalloc），
      无溢出警告。mProf_Malloc 路径无锁探测，仅在扩容时加锁 re-check。
      所有遍历代码改为 for j := uint32(0); j < len; j++ + 数组指针转换。
+v12: 会话表（gcDeadSessionTable）从直接哈希（id % 4096 → 固定槽位）改为
+     开放寻址线性探测。新增 gcDeadFindSession 辅助函数，在所有查找路径
+     （gcDeadRecordFree、mProf_Malloc、GcDeadSessionEnd）替换直接数组索引。
+     GcDeadSessionStart 中新增 session 创建时的线性探测空闲槽位逻辑和
+     gcDeadSessionTableLock 保护。解决了两个活跃 session 哈希到同一槽位时
+     第二个 start 静默覆盖第一个的问题。代数重用代码适配线性探测：
+     使用 gcDeadFindSession(internalID) 而非连续槽位迭代。
 
 
 2. GODEBUG 开关
@@ -644,12 +651,35 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 5.3 per-session 表生命周期
 ----------------------------
 
-  表条目 (`gcDeadSessionTable[sessionID % 4096]`)：
+  哈希表结构（v12: 开放寻址 + 线性探测）：
+
+    表条目 (`gcDeadSessionTable[]`) 通过内部 ID % gcDeadMaxSessions 确定
+    起始探测位置。当目标槽位被其他活跃会话占用时，线性探测向前搜索
+    `((idx+1) % gcDeadMaxSessions)` 直到找到空闲或已结束的槽位。
+
+    查找 (`gcDeadFindSession(id)`):
+      1. idx = id % gcDeadMaxSessions
+      2. for i < gcDeadMaxSessions:
+         - e.id == id → 找到，返回 e
+         - e.id == 0  → 空槽（从未使用），终止搜索，返回 nil
+         - 否则 idx = (idx+1) % gcDeadMaxSessions，继续
+      3. 遍历全部 4096 槽未找到 → 返回 nil
+
+    插入（GcDeadSessionStart 中，持 gcDeadSessionTableLock）：
+      1. gcDeadFindSession(id) 检查是否已存在
+      2. 若不存在：从 id % gcDeadMaxSessions 开始线性探测空闲槽
+         （e.id == 0 || e.ended），初始化后发布 e.id = id
+      3. 若已存在且未结束：加入已有会话
+
+    空槽作为探测链终止符（e.id == 0）。由于条目永不删除（仅 ended=true），
+    空槽必然代表从未使用的位置。已结束条目（ended=true, id!=0）在搜索中
+    被跳过。
 
   创建：
     GcDeadSessionStart(id) 被调用
-    - 若 e.id != id → 初始化条目
-    - 若 e.id == id → 只新增 startSites
+    - 通过 gcDeadFindSession(id) 查找是否已存在
+    - 若不存在 → 线性探测空闲槽位，初始化条目
+    - 若已存在且未结束 → 新增 startSites
 
   活跃期：
     分配: 更新 allocs/cumAllocs (仅 gcdeadtrace>0)
@@ -661,15 +691,123 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
     - ended 后不接受新分配归属
     - 已挂载 special 的对象释放时仍能回写 freed 数据
 
-  重用：
-    当 hash 冲突时，新 session 覆盖旧条目
-    gcDeadRecordFree 检查 e.id == sessionID → 旧 specials 回调安全忽略
+  重用（会话 ID 复用 / 代数跟踪）：
+    当同一 originalID 的会话结束后再次 Start，创建新代数（generation++）。
+    内部 ID = originalID * gcDeadMaxSessions + generation。
+    gcDeadFindSession(internalID) 定位已有代。新代线性探测空闲槽位。
 
   常量:
     最大并发 sessions:    4096 (gcDeadMaxSessions)
     Per-session 站点上限: 动态扩展（初始 2048，满时翻倍）
     最大 start 位置数:    32   (gcDeadMaxStartSites)
     Session 归属 slot 数: 16   (gcDeadSessionRefSlots)
+
+
+5.4 哈希碰撞与线性探测（v12）
+-------------------------------
+
+  5.4.1 问题：直接哈希碰撞导致数据丢失
+
+  gcDeadSessionTable 原本使用直接哈希 `id % gcDeadMaxSessions` 确定槽位。
+  当两个不同 session 的 ID 映射到同一槽位时（例如 ID=1 和 ID=4097 都
+  映射到槽位 1），第二个 GcDeadSessionStart 静默覆盖第一个的条目。
+
+  影响：
+  - 第一个 session 的所有计数（allocs/frees/cumFrees）被清零
+  - 第一个 session 的 allocBucketRefs 指针被清空（站点级归属丢失）
+  - gcDeadRecordFree 检查 e.id != sessionID 后直接返回 → freed 数据丢失
+  - 但 goroutine 的 gcDeadSessionActive 仍为 true → 新分配仍递增计数
+    到一个被清空的条目 → 这些分配也被丢失
+
+  5.4.2 修复方案：开放寻址 + 线性探测
+
+  核心思路是将直接哈希表改为开放寻址哈希表：当目标槽位被占用时，
+  线性向前探测 `(idx+1) % gcDeadMaxSessions` 直到找到空闲槽位。
+
+  新增 gcDeadFindSession(id) 辅助函数：
+
+    func gcDeadFindSession(id uint64) *gcDeadSessionInfo {
+        table := gcDeadSessionTable
+        if table == nil { return nil }
+        idx := id % gcDeadMaxSessions
+        for i := uint64(0); i < gcDeadMaxSessions; i++ {
+            e := &table[idx]
+            if e.id == id { return e }    // 精确匹配
+            if e.id == 0 { return nil }   // 空槽 → 终止
+            idx = (idx + 1) % gcDeadMaxSessions
+        }
+        return nil  // 全表扫描未找到
+    }
+
+  性质：
+  - 空槽（e.id == 0）作为探测链终止符。由于条目永不物理删除（仅
+    ended=true），空槽必然代表从未使用的槽位。
+  - 已结束条目（ended=true, e.id != 0）在搜索中被跳过（e.id != id
+    且 e.id != 0 → 继续探测）。
+  - 最多遍历全部 4096 槽后终止，防止活锁。
+
+  5.4.3 查找路径变更
+
+  所有直接索引访问都替换为 gcDeadFindSession：
+
+  | 函数 | 原代码 | 新代码 |
+  |------|--------|--------|
+  | gcDeadRecordFree | table[sessionID%4096] | gcDeadFindSession(sessionID) |
+  | mProf_Malloc (alloc) | table[sid%4096] | gcDeadFindSession(sid) |
+  | mProf_Malloc (special) | table[sid%4096] | gcDeadFindSession(sid) |
+  | GcDeadSessionEnd (第1次) | table[sid%4096] | gcDeadFindSession(sid) |
+  | GcDeadSessionEnd (第2次) | table[sid%4096] + e.id!=sid | gcDeadFindSession(sid) |
+  | GcDeadSessionStart (已结束检查) | table[sid%4096] | gcDeadFindSession(sid) |
+
+  5.4.4 插入路径变更
+
+  GcDeadSessionStart 中的 gen 0 会话创建改为持锁线性探测：
+
+    1. gcDeadFindSession(id) 查找是否已存在
+    2. 若已存在且未结束 → 加入（joinExisting）
+    3. 若不存在：
+       a. lock(gcDeadSessionTableLock)
+       b. 再次 gcDeadFindSession(id)（TOCTOU 预防）
+       c. 从 id % gcDeadMaxSessions 开始线性探测空闲槽
+          （e.id == 0 || e.ended）
+       d. 找到后初始化条目，e.id = id 最后发布
+       e. unlock(&gcDeadSessionTableLock)
+
+  锁保护原因：两个不同 session 可能线性探测到同一空闲槽位。
+  若无锁，第二个 session 的写入会与第一个 session 的初始化发生竞争。
+
+  5.4.5 代数重用适配
+
+  代数重用（generation > 0）原使用连续槽位假设：
+  `for ne.id == internalID { newIdx = internalID % 4096; ne = &table[newIdx] }`
+
+  改为基于 gcDeadFindSession 的查找：
+
+    for {
+        internalID = id*gcDeadMaxSessions + uint64(newGen)
+        ne = gcDeadFindSession(internalID)
+        if ne == nil {
+            // 该代数不存在 → 线性探测空闲槽创建
+            probeIdx = internalID % gcDeadMaxSessions
+            for i := 0; i < gcDeadMaxSessions; i++ {
+                if table[probeIdx].id == 0 || table[probeIdx].ended {
+                    ne = &table[probeIdx]; break
+                }
+                probeIdx = (probeIdx + 1) % gcDeadMaxSessions
+            }
+            break
+        }
+        if !ne.ended { goto joinExisting /* 加入 */ }
+        newGen++ // 该代已结束 → 尝试下一代数
+    }
+
+  5.4.6 测试验证
+
+  TestGcDeadTraceHashCollision:
+    - 5 个 session（ID = 1, 4097, 8193, 12289, 16385）
+    - 所有 ID % 4096 == 1，触发线性探测
+    - 验证 per-session 输出包含全部 5 个 session
+    - 验证 freed 和 alive 数据完整
 
 
 6. 历史修复记录 — Bucket 级启发式修复（v6）
@@ -742,14 +880,20 @@ gcdeadsession:alive: 2 session objs (1048 bytes) still alive from 1 sites
 7.1 会话表容量限制 (gcDeadMaxSessions = 4096)
   会话表首次调用 GcDeadSessionStart 时通过 persistentalloc 分配。
   不启用时零内存开销（v9 惰性分配指针）。
-  当并发 session 数超过 4096 时，新 session 覆盖旧 session 的表条目，
-  旧 session 后续释放数据丢失：
+  当并发 session 数超过 4096 时，线性探测失败（找不到空闲槽位），
+  新 session 创建被拒绝（打印 "session table full" 警告）。
 
-    - per-session freed 计数少 1
-    - allocBucketRefs 站点归属丢失
-    - alive 计数偏高（cumFrees 偏小）
+  安全性：线性探测 + gcDeadFindSession 保证所有查找精确匹配内部 ID，
+  不会误计到其他 session。gcDeadSessionTableLock 保护插入操作防止并发竞争。
 
-  安全性：e.id != sessionID 严格检查保证不误计到其他 session。
+  v12 修复（线性探测）：
+    修复前：直接哈希 id % 4096 → 固定槽位。两个不同活跃 session 映射到
+    同一槽位时，第二个 GcDeadSessionStart 静默覆盖第一个，导致第一个
+    session 的 freed/alive 数据丢失。
+
+    修复后：开放寻址线性探测。当目标槽位被占用时，向前搜索空闲槽。
+    所有查找通过 gcDeadFindSession 统一进行。不同的活跃 session 即使
+    id % 4096 相同也能共存于表中。
 
 7.2 Per-Session 分配站点跟踪 (gcDeadPerSessionSites = 2048)
   v10 从 1024 扩展。v11 改为动态扩展：初始 2048，满时翻倍，

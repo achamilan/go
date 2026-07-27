@@ -471,9 +471,8 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 		if gp != nil && gp.gcDeadSessionActive {
 			// Record in the session table for per-session tracking.
 			sid := gp.gcDeadSessionID
-			idx := sid % gcDeadMaxSessions
-			e := &gcDeadSessionTable[idx]
-			if e.id == sid && !e.ended {
+			e := gcDeadFindSession(sid)
+			if e != nil && !e.ended {
 				atomic.Xadduintptr(&e.allocs, 1)
 				atomic.Xadduintptr(&e.allocBytes, size)
 				atomic.Xadduintptr(&e.cumAllocs, 1)
@@ -577,9 +576,8 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 		gp := mp.curg
 		if gp != nil && gp.gcDeadSessionActive {
 			sid := gp.gcDeadSessionID
-			idx := sid % gcDeadMaxSessions
-			e := &gcDeadSessionTable[idx]
-			if e.id == sid && !e.ended {
+			e := gcDeadFindSession(sid)
+			if e != nil && !e.ended {
 				lock(&mheap_.speciallock)
 				ss := (*specialGcDeadSession)(mheap_.specialGcDeadSessionAlloc.alloc())
 				unlock(&mheap_.speciallock)
@@ -776,23 +774,46 @@ type gcDeadSessionInfo struct {
 	allocBucketRefsLock mutex
 }
 
-// Session tracking table. Entries are indexed by session ID % gcDeadMaxSessions.
+// Session tracking table. Uses open addressing with linear probing to resolve
+// hash collisions (hash is session internal ID % gcDeadMaxSessions).
 // Lazily allocated via persistentalloc on first GcDeadSessionStart call so that
 // there is zero memory overhead when gcdeadtrace/gcdeadsession is disabled.
+//
+// Linear probing invariant: empty slots (e.id == 0) act as probe chain
+// terminators. Ended sessions (e.ended == true, e.id != 0) are skipped over
+// during search. Since entries are never deleted (only marked ended), empty
+// slots always represent never-used positions.
 var gcDeadSessionTable *[gcDeadMaxSessions]gcDeadSessionInfo
 var gcDeadSessionTableLock mutex
+
+// gcDeadFindSession finds the session entry for the given internal ID using
+// linear probing to resolve hash collisions. Returns nil if the session
+// table is nil or the session is not found.
+func gcDeadFindSession(id uint64) *gcDeadSessionInfo {
+	table := gcDeadSessionTable
+	if table == nil {
+		return nil
+	}
+	idx := id % gcDeadMaxSessions
+	for i := uint64(0); i < gcDeadMaxSessions; i++ {
+		e := &table[idx]
+		if e.id == id {
+			return e
+		}
+		if e.id == 0 {
+			return nil
+		}
+		idx = (idx + 1) % gcDeadMaxSessions
+	}
+	return nil
+}
 
 // gcDeadRecordFree attributes a freed object to its session via sessionID and
 // to its allocation site via bucket pointer.
 // Called from freeSpecial when a _KindSpecialGcDeadSession special is freed.
 func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, typ *_type) {
-	table := gcDeadSessionTable
-	if table == nil {
-		return
-	}
-	idx := sessionID % gcDeadMaxSessions
-	e := &table[idx]
-	if e.id != sessionID {
+	e := gcDeadFindSession(sessionID)
+	if e == nil {
 		return
 	}
 	atomic.Xadduintptr(&e.frees, 1)
@@ -1804,9 +1825,8 @@ func GcDeadSessionStart(id uint64) {
 		// Check if the goroutine's current session has already ended
 		// (e.g. another goroutine called End for this session).
 		sid := gp.gcDeadSessionID
-		oldIdx := sid % gcDeadMaxSessions
-		oldE := &gcDeadSessionTable[oldIdx]
-		if oldE.ended {
+		oldE := gcDeadFindSession(sid)
+		if oldE == nil || oldE.ended {
 			gp.gcDeadSessionActive = false
 			gp.gcDeadSessionID = 0
 		} else {
@@ -1817,38 +1837,55 @@ func GcDeadSessionStart(id uint64) {
 		}
 	}
 
-	idx := id % gcDeadMaxSessions
-	e := &gcDeadSessionTable[idx]
+	// Search for an existing gen 0 session with this id using linear probing.
+	e := gcDeadFindSession(id)
 
-	// Check for session ID reuse: same originalID, session has ended.
-	// Create a new generation with its own hash slot so old and new data
-	// don't collide.
+	// Check for session ID reuse: same originalID, gen 0 session has ended.
+	// Create a new generation with its own id so old and new data don't collide.
 	var ne *gcDeadSessionInfo
 	var internalID uint64
 	var newGen uint32
+	var probeIdx uint64
 
-	if e.originalID == id && e.ended {
+	if e != nil && e.originalID == id && e.ended {
 		lock(&gcDeadSessionTableLock)
 		// Re-check after acquiring lock (TOCTOU prevention).
-		if e.originalID == id && e.ended {
+		e = gcDeadFindSession(id)
+		if e != nil && e.originalID == id && e.ended {
 			newGen = e.generation + 1
-			internalID = id*gcDeadMaxSessions + uint64(newGen)
-			newIdx := internalID % gcDeadMaxSessions
-			ne = &gcDeadSessionTable[newIdx]
 
 			// Walk forward through generations to find the next uncreated one.
-			// The gen 0 slot always has the oldest generation, so we may need to
-			// skip past already-created-and-ended higher generations.
-			for ne.id == internalID {
+			for {
+				internalID = id*gcDeadMaxSessions + uint64(newGen)
+				ne = gcDeadFindSession(internalID)
+				if ne == nil {
+					// This generation doesn't exist yet — create it.
+					// Linear probe for a free slot.
+					probeIdx = internalID % gcDeadMaxSessions
+					for i := uint64(0); i < gcDeadMaxSessions; i++ {
+						candidate := &gcDeadSessionTable[probeIdx]
+						if candidate.id == 0 {
+							ne = candidate
+							break
+						}
+						probeIdx = (probeIdx + 1) % gcDeadMaxSessions
+					}
+					if ne == nil {
+						if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+							print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") failed: session table full\n")
+						}
+						unlock(&gcDeadSessionTableLock)
+						return
+					}
+					break
+				}
 				if !ne.ended {
 					// Another goroutine already created this generation — join it.
 					unlock(&gcDeadSessionTableLock)
-					goto joinReusedGen
+					goto joinExisting
 				}
+				// This generation exists but is ended — try next generation.
 				newGen++
-				internalID = id*gcDeadMaxSessions + uint64(newGen)
-				newIdx = internalID % gcDeadMaxSessions
-				ne = &gcDeadSessionTable[newIdx]
 			}
 
 			// Initialize new session entry (originalID/generation before id).
@@ -1904,160 +1941,90 @@ func GcDeadSessionStart(id uint64) {
 		unlock(&gcDeadSessionTableLock)
 	}
 
-	// If this exact session has already ended, don't join.
-	// Note: we must also check e.originalID == id here, because with large
-	// session IDs, the hash slot may be occupied by a different ended session
-	// (collision). In that case we should fall through to the gen 0 init path
-	// below which overwrites the slot — not reject the new session.
-	if e.originalID == id && e.ended {
+	// Check if gen 0 session already exists — join it.
+	if e != nil && e.originalID == id && !e.ended {
+		goto joinExisting
+	}
+
+	// If this exact session has already ended, don't create a new one.
+	if e != nil && e.originalID == id && e.ended {
 		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
 			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: session already ended\n")
 		}
 		return
 	}
 
-joinReusedGen:
-	// Join a generation>0 session that another goroutine already created.
-	// ne and internalID are set by the reuse block above.
-	if ne != nil {
-		// Record start site via CAS loop.
-		for {
-			n := atomic.Loadint32(&ne.numStartSites)
-			if n >= gcDeadMaxStartSites {
-				if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
-					print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") joining goroutine ", gp.goid, " start site not recorded (max ", gcDeadMaxStartSites, " reached)\n")
-				}
-				break
-			}
-			if atomic.Casint32(&ne.numStartSites, n, n+1) {
-				ne.startSites[n] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
-				break
-			}
-		}
-		// Register goroutine in stats table if not already present.
-		found := false
-		for j := range ne.goroutineStats {
-			if ne.goroutineStats[j].goid == gp.goid {
-				found = true
-				break
-			}
-			if ne.goroutineStats[j].goid == 0 {
-				ne.goroutineStats[j].goid = gp.goid
-				found = true
-				break
-			}
-		}
-		if !found {
-			if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
-				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") goroutine ", gp.goid, " stats not recorded (all ", gcDeadMaxStartSites, " slots full, LRU overwriting)\n")
-			}
-			ne.goroutineStats[0].goid = gp.goid
-			ne.goroutineStats[0].allocs = 0
-			ne.goroutineStats[0].allocBytes = 0
-			ne.goroutineStats[0].frees = 0
-			ne.goroutineStats[0].freeBytes = 0
-		}
-		gp.gcDeadSessionActive = true
-		gp.gcDeadSessionID = internalID
+	// First time this sessionId is being used: create gen 0 entry.
+	// Use linear probing to find a free slot, starting from id % gcDeadMaxSessions.
+	lock(&gcDeadSessionTableLock)
 
-		if debug.gcdeadtrace > 0 {
-			pc := sys.GetCallerPC()
-			f := findfunc(pc)
-			if f.valid() {
-				file, line := funcline(f, pc)
-				print("runtime: gcdeadsession: session ", id, "#", uint64(ne.generation), " joined at ", file, ":", line, "\n")
-			}
+	// Re-check after acquiring lock (TOCTOU): another goroutine may have created it.
+	e = gcDeadFindSession(id)
+	if e != nil {
+		unlock(&gcDeadSessionTableLock)
+		if !e.ended {
+			goto joinExisting
+		}
+		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: session already ended\n")
 		}
 		return
 	}
 
-	// If this is the first time this sessionId is being used, initialize entry.
-	if e.originalID != id {
-		if e.id != 0 && (debug.gcdeadsession > 0 || debug.gcdeadtrace > 0) {
-			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") overwriting slot occupied by session ", e.id, "\n")
+	// Linear probe for a free slot.
+	probeIdx = id % gcDeadMaxSessions
+	for i := uint64(0); i < gcDeadMaxSessions; i++ {
+		candidate := &gcDeadSessionTable[probeIdx]
+		if candidate.id == 0 {
+			e = candidate
+			break
 		}
-		// setting e.id, otherwise a concurrently joining goroutine (which sees
-		// e.id == id) may write to goroutineStats/startSites only
-		// to have them erased by the ongoing initialization.
-		e.endPC = 0
-		e.ended = false
-		e.printed = 0
-		e.joinCount = 1
-		e.numStartSites = 1
-		e.startSites[0] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
-		// Clear remaining start site slots.
-		for j := 1; j < gcDeadMaxStartSites; j++ {
-			e.startSites[j] = gcDeadStartSite{}
+		probeIdx = (probeIdx + 1) % gcDeadMaxSessions
+	}
+	if e == nil {
+		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") failed: session table full\n")
 		}
-		e.allocs = 0
-		e.allocBytes = 0
-		e.frees = 0
-		e.freeBytes = 0
-		e.cumAllocs = 0
-		e.cumAllocBytes = 0
-		e.cumFrees = 0
-		e.cumFreeBytes = 0
-		// Clear alloc bucket refs from any previous session.
-		e.allocBucketRefs = nil
-		e.allocBucketRefsLen = 0
-		// Clear goroutine stats from any previous session.
-		for j := range e.goroutineStats {
-			e.goroutineStats[j] = gcDeadGoroutineStat{}
-		}
-		e.goroutineStats[0].goid = gp.goid
-		// Publish the initialized entry last. originalID/generation are set
-		// before id so that a concurrent reader sees consistent identity fields.
-		e.originalID = id
-		e.generation = 0
-		e.id = id
+		unlock(&gcDeadSessionTableLock)
+		return
+	}
 
-		if debug.gcdeadtrace > 0 {
-			// Ensure all allocations are profiled for accurate session tracking.
-			// MemProfileRate is set to 1 on first session start so that every
-			// allocation reaches mProf_Malloc and session counters are updated.
-			if gcDeadSessionCount.Add(1) == 1 {
-				gcDeadSavedRate = MemProfileRate
-				MemProfileRate = 1
-			}
-		}
-	} else {
-		// Joining goroutine: record its start site via CAS loop.
-		for {
-			n := atomic.Loadint32(&e.numStartSites)
-			if n >= gcDeadMaxStartSites {
-				if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
-					print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") joining goroutine ", gp.goid, " start site not recorded (max ", gcDeadMaxStartSites, " reached)\n")
-				}
-				break
-			}
-			if atomic.Casint32(&e.numStartSites, n, n+1) {
-				e.startSites[n] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
-				break
-			}
-		}
-		// Register goroutine in stats table if not already present.
-		found := false
-		for j := range e.goroutineStats {
-			if e.goroutineStats[j].goid == gp.goid {
-				found = true
-				break
-			}
-			if e.goroutineStats[j].goid == 0 {
-				e.goroutineStats[j].goid = gp.goid
-				found = true
-				break
-			}
-		}
-		if !found {
-			// All slots full: overwrite first (LRU-approximate).
-			if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
-				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") goroutine ", gp.goid, " stats not recorded (all ", gcDeadMaxStartSites, " slots full, LRU overwriting)\n")
-			}
-			e.goroutineStats[0].goid = gp.goid
-			e.goroutineStats[0].allocs = 0
-			e.goroutineStats[0].allocBytes = 0
-			e.goroutineStats[0].frees = 0
-			e.goroutineStats[0].freeBytes = 0
+	// Initialize new gen 0 session entry.
+	e.endPC = 0
+	e.ended = false
+	e.printed = 0
+	e.joinCount = 1
+	e.numStartSites = 1
+	e.startSites[0] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
+	for j := 1; j < gcDeadMaxStartSites; j++ {
+		e.startSites[j] = gcDeadStartSite{}
+	}
+	e.allocs = 0
+	e.allocBytes = 0
+	e.frees = 0
+	e.freeBytes = 0
+	e.cumAllocs = 0
+	e.cumAllocBytes = 0
+	e.cumFrees = 0
+	e.cumFreeBytes = 0
+	e.allocBucketRefs = nil
+	e.allocBucketRefsLen = 0
+	for j := range e.goroutineStats {
+		e.goroutineStats[j] = gcDeadGoroutineStat{}
+	}
+	e.goroutineStats[0].goid = gp.goid
+	// Publish the initialized entry last. originalID/generation are set
+	// before id so that a concurrent reader sees consistent identity fields.
+	e.originalID = id
+	e.generation = 0
+	e.id = id
+
+	unlock(&gcDeadSessionTableLock)
+
+	if debug.gcdeadtrace > 0 {
+		if gcDeadSessionCount.Add(1) == 1 {
+			gcDeadSavedRate = MemProfileRate
+			MemProfileRate = 1
 		}
 	}
 
@@ -2065,12 +2032,76 @@ joinReusedGen:
 	gp.gcDeadSessionID = id
 
 	if debug.gcdeadtrace > 0 {
-		// Print session start location.
 		pc := sys.GetCallerPC()
 		f := findfunc(pc)
 		if f.valid() {
 			file, line := funcline(f, pc)
 			print("runtime: gcdeadsession: session ", id, "#0 started at ", file, ":", line, "\n")
+		}
+	}
+	return
+
+joinExisting:
+	// Join an existing session (gen 0 or generation>0).
+	// ne (for generation>0) or e (for gen 0) is set by the code above.
+	if ne == nil {
+		ne = e
+	}
+	// Record start site via CAS loop.
+	for {
+		n := atomic.Loadint32(&ne.numStartSites)
+		if n >= gcDeadMaxStartSites {
+			if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+				print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") joining goroutine ", gp.goid, " start site not recorded (max ", gcDeadMaxStartSites, " reached)\n")
+			}
+			break
+		}
+		if atomic.Casint32(&ne.numStartSites, n, n+1) {
+			ne.startSites[n] = gcDeadStartSite{goid: gp.goid, pc: sys.GetCallerPC()}
+			break
+		}
+	}
+	// Register goroutine in stats table if not already present.
+	found := false
+	for j := range ne.goroutineStats {
+		if ne.goroutineStats[j].goid == gp.goid {
+			found = true
+			break
+		}
+		if ne.goroutineStats[j].goid == 0 {
+			ne.goroutineStats[j].goid = gp.goid
+			found = true
+			break
+		}
+	}
+	if !found {
+		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
+			print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") goroutine ", gp.goid, " stats not recorded (all ", gcDeadMaxStartSites, " slots full, LRU overwriting)\n")
+		}
+		ne.goroutineStats[0].goid = gp.goid
+		ne.goroutineStats[0].allocs = 0
+		ne.goroutineStats[0].allocBytes = 0
+		ne.goroutineStats[0].frees = 0
+		ne.goroutineStats[0].freeBytes = 0
+	}
+
+	gp.gcDeadSessionActive = true
+	if ne.generation > 0 {
+		gp.gcDeadSessionID = internalID
+	} else {
+		gp.gcDeadSessionID = id
+	}
+
+	if debug.gcdeadtrace > 0 {
+		pc := sys.GetCallerPC()
+		f := findfunc(pc)
+		if f.valid() {
+			file, line := funcline(f, pc)
+			if ne.generation > 0 {
+				print("runtime: gcdeadsession: session ", id, "#", uint64(ne.generation), " joined at ", file, ":", line, "\n")
+			} else {
+				print("runtime: gcdeadsession: session ", id, "#0 joined at ", file, ":", line, "\n")
+			}
 		}
 	}
 }
@@ -2096,9 +2127,8 @@ func GcDeadSessionEnd(id uint64) {
 	// IDs). Verify the user-provided id matches the session's originalID.
 	sid := gp.gcDeadSessionID
 	if gcDeadSessionTable != nil {
-		sidx := sid % gcDeadMaxSessions
-		e := &gcDeadSessionTable[sidx]
-		if e.id != sid || e.originalID != id {
+		e := gcDeadFindSession(sid)
+		if e == nil || e.originalID != id {
 			if debug.gcdeadtrace > 0 {
 				print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: not in this session (internal=", sid, ", originalID=", e.originalID, ")\n")
 			}
@@ -2132,17 +2162,16 @@ func GcDeadSessionEnd(id uint64) {
 		return
 	}
 
-	idx := sid % gcDeadMaxSessions
-	e := &gcDeadSessionTable[idx]
-	if e.ended {
+	e := gcDeadFindSession(sid)
+	if e == nil {
 		if debug.gcdeadtrace > 0 {
-			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session already ended\n")
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session not found\n")
 		}
 		return
 	}
-	if e.id != sid {
+	if e.ended {
 		if debug.gcdeadtrace > 0 {
-			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: hash slot occupied by session ", e.id, "\n")
+			print("runtime: gcdeadsession: GcDeadSessionEnd(", id, ") skipped: session already ended\n")
 		}
 		return
 	}

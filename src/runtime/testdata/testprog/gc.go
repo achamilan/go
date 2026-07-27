@@ -41,6 +41,7 @@ func init() {
 	register("GCDeadTraceConcurrentGrowth", GCDeadTraceConcurrentGrowth)
 	register("GCDeadTraceSessionRefOverflow", GCDeadTraceSessionRefOverflow)
 	register("GCDeadTraceLargeOutput", GCDeadTraceLargeOutput)
+	register("GCDeadTraceHashCollision", GCDeadTraceHashCollision)
 }
 
 func GCSys() {
@@ -785,26 +786,33 @@ func GCDeadTraceStartAfterEnd() {
 	runtime.MemProfileRate = 1
 
 	var wg sync.WaitGroup
-	var g2Joined sync.WaitGroup
-	g2Joined.Add(1)
 
-	// Goroutine 1: starts session 501, waits for g2 to join, then ends.
+	// Use channels for one-shot synchronization.
+	g1Active := make(chan struct{})    // g1 → g2: session 501 is active, you can join
+	g2JoinedCh := make(chan struct{})  // g2 → g1: I've joined, you can end
+	g1EndedCh := make(chan struct{})   // g1 → g2: End(501) done
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runtime.GcDeadSessionStart(501)
 		gcDeadAfterEndS1Alive = alloc256Live() // Session 501 alloc, stays alive
-		g2Joined.Done()                        // signal g2: session 501 is active
-		runtime.GcDeadSessionEnd(501)          // End — should also clear g2's state
+		close(g1Active)                         // signal g2: session 501 active
+		gcDeadAfterEndS1Die = allocSameBucket() // Session 501 alloc, will die
+		<-g2JoinedCh                            // wait for g2 to confirm join
+		runtime.GcDeadSessionEnd(501)           // End — clears g2's session state
+		close(g1EndedCh)                        // signal g2: End done
 	}()
 
-	// Goroutine 2: joins session 501, then after g1's End, starts session 502.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		<-g1Active                              // wait for g1 to have session 501 active
 		runtime.GcDeadSessionStart(501)         // Join session 501
 		gcDeadAfterEndS1Die = allocSameBucket() // Session 501 alloc, will die
-		g2Joined.Wait()                         // wait for g1 to End(501)
+		close(g2JoinedCh)                        // signal g1: join confirmed, you can end
+
+		<-g1EndedCh                              // wait for g1's End(501)
 
 		// After g1's End(501), our fix should allow starting a new session.
 		// Previously this was blocked (gcDeadSessionActive was still true).
@@ -1113,6 +1121,46 @@ func GCDeadSessionOnlyMem() {
 		return
 	}
 	fmt.Printf("OK: OtherSys delta = %d bytes (< %d), no table allocation\n", delta, threshold)
+}
+
+// GCDeadTraceHashCollision verifies that multiple sessions whose IDs hash to
+// the same slot (id % gcDeadMaxSessions == 1) can coexist via linear probing.
+// Test creates 5 sessions (IDs 1, 4097, 8193, 12289, 16385; all map to slot 1),
+// each on its own goroutine with serialized Start calls. Each goroutine does
+// Start → Alloc → End. All 5 sessions must appear in per-session output.
+func GCDeadTraceHashCollision() {
+	runtime.MemProfileRate = 1
+
+	const nSessions = 5
+	sessionIDs := [nSessions]uint64{1, 4097, 8193, 12289, 16385} // all % 4096 == 1
+	gcDeadOverflowSink = make([][]byte, nSessions)
+
+	// Serialize Start calls with a channel: each goroutine signals that it has
+	// completed Start before the next goroutine begins.
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < nSessions; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sid := sessionIDs[idx]
+			runtime.GcDeadSessionStart(sid)
+			done <- struct{}{} // signal Start complete
+			gcDeadOverflowSink[idx] = make([]byte, 64)
+			runtime.GcDeadSessionEnd(sid)
+		}(i)
+		<-done // wait for this goroutine's Start to complete
+	}
+	wg.Wait()
+	close(done)
+
+	runtime.GC()
+
+	// Release for freed output.
+	gcDeadOverflowSink = nil
+	runtime.GC()
+
+	fmt.Println("OK")
 }
 
 // Test SetMemoryLimit functionality.

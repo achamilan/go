@@ -488,7 +488,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		var sites []*siteInfo
 		tObjs, tBytes := 0, 0
 		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
-		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalObjs > sites[j].TotalObjs })
+		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalBytes > sites[j].TotalBytes })
 		for _, si := range sites {
 			var refs []string
 			for r := range si.Refs { refs = append(refs, r) }

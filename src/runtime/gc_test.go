@@ -782,6 +782,36 @@ func TestGcDeadSessionOnly(t *testing.T) {
 	}
 }
 
+// TestGcDeadTraceHashCollision verifies that sessions with colliding hash slots
+// (id % gcDeadMaxSessions == 1) all appear in the per-session output and produce
+// correct freed/alive data. Tests the linear probing fix (v12).
+func TestGcDeadTraceHashCollision(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadTraceHashCollision", "GODEBUG=gcdeadtrace=1")
+	if !strings.Contains(got, "gcdeadsession by session:") {
+		t.Fatalf("expected gcdeadsession by session output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:freed:") {
+		t.Fatalf("expected gcdeadsession:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadsession:alive:") {
+		t.Fatalf("expected gcdeadsession:alive output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at end, got:\n%s", got)
+	}
+
+	// Verify all 5 colliding sessions appear in per-session breakdown.
+	// Session IDs: 1, 4097, 8193, 12289, 16385 (all % 4096 == 1).
+	for _, sid := range []string{"session #1:", "session #4097:", "session #8193:",
+		"session #12289:", "session #16385:"} {
+		if !strings.Contains(got, sid) {
+			t.Errorf("missing per-session line: %s", sid)
+		}
+	}
+
+	t.Logf("hash collision test OK, output:\n%s", got)
+}
+
 func TestGCTestMoveStackOnNextCall(t *testing.T) {
 	if asan.Enabled {
 		t.Skip("extra allocations with -asan causes this to fail; see #70079")
