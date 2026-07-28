@@ -438,28 +438,81 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		for _, se := range gc.Sessions { sessSet[se.ID] = true }
 	}
 
-	s.addRow("Mode:", data.Mode)
-	s.addRow("GC Cycles:", fmt.Sprint(len(gcs)))
-	s.addRow("Sessions:", fmt.Sprint(len(sessSet)))
-	s.addRow("Total Freed:", fmt.Sprint(tf))
-	s.addRow("Total Freed Bytes:", fmt.Sprintf("%d (%.2f MB)", tfBytes, float64(tfBytes)/1024/1024))
-	s.addRow("Total Alive:", fmt.Sprint(ta))
-	s.addRow("Total Alive Bytes:", fmt.Sprintf("%d (%.2f MB)", taBytes, float64(taBytes)/1024/1024))
-	s.addBlank()
-
-	// Per-GC Summary
-	s.addHeaderRow("GC", "Sessions", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes")
-	for _, gc := range gcs {
-		fO, fB, aO, aB := "0", "0", "0", "0"
-		if gc.Freed != nil { fO = fmt.Sprint(gc.Freed.Objs); fB = fmt.Sprint(gc.Freed.Bytes) }
-		if gc.Alive != nil { aO = fmt.Sprint(gc.Alive.Objs); aB = fmt.Sprint(gc.Alive.Bytes) }
-		s.addRow(fmt.Sprint(gc.GC), fmt.Sprint(len(gc.Sessions)), fO, fB, aO, aB)
+	// siteInfo struct for site attribution aggregation.
+	type sInfo struct {
+		Func, Loc          string
+		TotalObjs, TotalBytes int
+		Refs               map[string]bool
 	}
-	s.addBlank()
 
-	// Session Detail
-	s.addHeaderRow("Session", "GID", "First GC", "Last GC", "Start", "End",
-		"Total Allocs", "Alloc Bytes", "Total Frees", "Free Bytes", "Max Alive", "Max Alive Bytes")
+	// ── Pre-compute summary statistics for the top-of-sheet summary ──
+	// Freed site totals.
+	fSumObjs, fSumBytes := 0, 0
+	fSumMap := make(map[string]*sInfo)
+	for _, gc := range gcs {
+		for _, site := range gc.FreedSites {
+			key := site.Func + "|" + site.Loc
+			si, ok := fSumMap[key]
+			if !ok { si = &sInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; fSumMap[key] = si }
+			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes
+		}
+	}
+	for _, si := range fSumMap { fSumObjs += si.TotalObjs; fSumBytes += si.TotalBytes }
+
+	// Alive site totals.
+	aSumObjs, aSumBytes := 0, 0
+	aSumMap := make(map[string]*sInfo)
+	for _, gc := range gcs {
+		for _, site := range gc.AliveSites {
+			key := site.Func + "|" + site.Loc
+			si, ok := aSumMap[key]
+			if !ok { si = &sInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; aSumMap[key] = si }
+			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes
+		}
+	}
+	for _, si := range aSumMap { aSumObjs += si.TotalObjs; aSumBytes += si.TotalBytes }
+
+	// Cross-reference by file:line for Both/Only counts.
+	type sumLineAgg struct {
+		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
+	}
+	fSumByLine := make(map[string]*sumLineAgg)
+	aSumByLine := make(map[string]*sumLineAgg)
+	for _, si := range fSumMap {
+		loc := firstFileLine(si.Func, si.Loc)
+		if loc == "" { continue }
+		a, ok := fSumByLine[loc]
+		if !ok { a = &sumLineAgg{}; fSumByLine[loc] = a }
+		a.FreedObjs += si.TotalObjs; a.FreedBytes += si.TotalBytes
+	}
+	for _, si := range aSumMap {
+		loc := firstFileLine(si.Func, si.Loc)
+		if loc == "" { continue }
+		a, ok := aSumByLine[loc]
+		if !ok { a = &sumLineAgg{}; aSumByLine[loc] = a }
+		a.AliveObjs += si.TotalObjs; a.AliveBytes += si.TotalBytes
+	}
+	nBoth, nOnly := 0, 0
+	tBFreedObjs, tBFreedBytes, tBAliveObjs, tBAliveBytes := 0, 0, 0, 0
+	tOFreedObjs, tOFreedBytes := 0, 0
+	for loc := range fSumByLine {
+		if _, ok := aSumByLine[loc]; ok {
+			nBoth++
+			tBFreedObjs += fSumByLine[loc].FreedObjs
+			tBFreedBytes += fSumByLine[loc].FreedBytes
+			tBAliveObjs += aSumByLine[loc].AliveObjs
+			tBAliveBytes += aSumByLine[loc].AliveBytes
+		}
+	}
+	for loc := range fSumByLine {
+		if _, ok := aSumByLine[loc]; !ok {
+			nOnly++
+			tOFreedObjs += fSumByLine[loc].FreedObjs
+			tOFreedBytes += fSumByLine[loc].FreedBytes
+		}
+	}
+
+	// Build sids for session totals (used by both summary and session detail).
 	sids := make(map[int]*sessAgg)
 	for _, gc := range gcs {
 		for _, se := range gc.Sessions {
@@ -480,29 +533,81 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	var sorted []int
 	for id := range sids { sorted = append(sorted, id) }
 	sort.Ints(sorted)
-	// Accumulate totals across all sessions.
-	tAllocs, tAllocBytes, tFrees, tFreeBytes := 0, 0, 0, 0
+
+	// Session totals (from sids).
+	sAllocs, sAllocBytes, sFrees, sFreeBytes := 0, 0, 0, 0
 	for _, id := range sorted {
 		sa := sids[id]
-		tAllocs += sa.CumAllocs
-		tAllocBytes += sa.CumAllocBytes
-		tFrees += sa.CumFrees
-		tFreeBytes += sa.CumFreeBytes
+		sAllocs += sa.CumAllocs; sAllocBytes += sa.CumAllocBytes
+		sFrees += sa.CumFrees; sFreeBytes += sa.CumFreeBytes
 	}
-	lastAlive := 0
-	lastAliveBytes := 0
+	sLastAlive, sLastAliveBytes := 0, 0
 	for i := len(gcs) - 1; i >= 0; i-- {
 		if gcs[i].Alive != nil {
-			lastAlive = gcs[i].Alive.Objs
-			lastAliveBytes = gcs[i].Alive.Bytes
+			sLastAlive = gcs[i].Alive.Objs
+			sLastAliveBytes = gcs[i].Alive.Bytes
 			break
 		}
 	}
+
+	// ── Write rows ──
+	s.addRow("Mode:", data.Mode)
+	s.addRow("GC Cycles:", fmt.Sprint(len(gcs)))
+	s.addRow("Sessions:", fmt.Sprint(len(sessSet)))
+	s.addRow("Total Freed:", fmt.Sprint(tf))
+	s.addRow("Total Freed Bytes:", fmt.Sprintf("%d (%.2f MB)", tfBytes, float64(tfBytes)/1024/1024))
+	s.addRow("Total Alive:", fmt.Sprint(ta))
+	s.addRow("Total Alive Bytes:", fmt.Sprintf("%d (%.2f MB)", taBytes, float64(taBytes)/1024/1024))
+	s.addBlank()
+
+	// Summary block with section-level totals at the top of the sheet.
+	s.addRow("=== Summary ===")
+	s.addRow("Session Detail (alloc/freed/alive)",
+		fmt.Sprintf("%d / %d / %d objs", sAllocs, sFrees, sLastAlive),
+		fmt.Sprintf("%s / %s / %s",
+			fmt.Sprintf("%d (%.2f MB)", sAllocBytes, float64(sAllocBytes)/1024/1024),
+			fmt.Sprintf("%d (%.2f MB)", sFreeBytes, float64(sFreeBytes)/1024/1024),
+			fmt.Sprintf("%d (%.2f MB)", sLastAliveBytes, float64(sLastAliveBytes)/1024/1024)),
+		"", "")
+	s.addRow("Freed Sites",
+		fmt.Sprintf("%d lines, %d objs", len(fSumMap), fSumObjs),
+		fmt.Sprintf("%d (%.2f MB)", fSumBytes, float64(fSumBytes)/1024/1024),
+		"", "")
+	s.addRow("Alive Sites",
+		fmt.Sprintf("%d lines, %d objs", len(aSumMap), aSumObjs),
+		fmt.Sprintf("%d (%.2f MB)", aSumBytes, float64(aSumBytes)/1024/1024),
+		"", "")
+	s.addRow("Both Freed & Alive",
+		fmt.Sprintf("%d lines (%d freed, %d alive)", nBoth, tBFreedObjs, tBAliveObjs),
+		fmt.Sprintf("freed %s / alive %s",
+			fmt.Sprintf("%d (%.2f MB)", tBFreedBytes, float64(tBFreedBytes)/1024/1024),
+			fmt.Sprintf("%d (%.2f MB)", tBAliveBytes, float64(tBAliveBytes)/1024/1024)),
+		"", "")
+	s.addRow("Only in Freed (fully dead)",
+		fmt.Sprintf("%d lines, %d objs", nOnly, tOFreedObjs),
+		fmt.Sprintf("%d (%.2f MB)", tOFreedBytes, float64(tOFreedBytes)/1024/1024),
+		"", "")
+	s.addBlank()
+
+	// Per-GC Summary
+	s.addHeaderRow("GC", "Sessions", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes")
+	for _, gc := range gcs {
+		fO, fB, aO, aB := "0", "0", "0", "0"
+		if gc.Freed != nil { fO = fmt.Sprint(gc.Freed.Objs); fB = fmt.Sprint(gc.Freed.Bytes) }
+		if gc.Alive != nil { aO = fmt.Sprint(gc.Alive.Objs); aB = fmt.Sprint(gc.Alive.Bytes) }
+		s.addRow(fmt.Sprint(gc.GC), fmt.Sprint(len(gc.Sessions)), fO, fB, aO, aB)
+	}
+	s.addBlank()
+
+	// Session Detail
+	s.addHeaderRow("Session", "GID", "First GC", "Last GC", "Start", "End",
+		"Total Allocs", "Alloc Bytes", "Total Frees", "Free Bytes", "Max Alive", "Max Alive Bytes")
+	// sids and sorted already computed above for the summary block.
 	// Total row at top for quick reference.
 	s.addRow("Total", "", "", "", "", "",
-		fmt.Sprint(tAllocs), fmt.Sprintf("%d (%.2f MB)", tAllocBytes, float64(tAllocBytes)/1024/1024),
-		fmt.Sprint(tFrees), fmt.Sprintf("%d (%.2f MB)", tFreeBytes, float64(tFreeBytes)/1024/1024),
-		fmt.Sprint(lastAlive), fmt.Sprintf("%d (%.2f MB)", lastAliveBytes, float64(lastAliveBytes)/1024/1024))
+		fmt.Sprint(sAllocs), fmt.Sprintf("%d (%.2f MB)", sAllocBytes, float64(sAllocBytes)/1024/1024),
+		fmt.Sprint(sFrees), fmt.Sprintf("%d (%.2f MB)", sFreeBytes, float64(sFreeBytes)/1024/1024),
+		fmt.Sprint(sLastAlive), fmt.Sprintf("%d (%.2f MB)", sLastAliveBytes, float64(sLastAliveBytes)/1024/1024))
 	for _, id := range sorted {
 		sa := sids[id]
 		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(sa.GID),
@@ -527,8 +632,6 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		tObjs, tBytes := 0, 0
 		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
 		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalBytes > sites[j].TotalBytes })
-		// Total row at top for quick reference.
-		s.addRow("Total", "", fmt.Sprint(tObjs), fmt.Sprintf("%d (%.2f MB)", tBytes, float64(tBytes)/1024/1024), "")
 		for _, si := range sites {
 			var refs []string
 			for r := range si.Refs { refs = append(refs, r) }
@@ -622,31 +725,6 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 	if len(bothLines) == 0 {
 		s.addRow("(none)")
-	} else {
-		// Total row at top for quick reference.
-		tFO, tFB, tAO, tAB := 0, 0, 0, 0
-		for _, loc := range bothLines {
-			fa := freedByLine[loc]
-			aa := aliveByLine[loc]
-			tFO += fa.FreedObjs; tFB += fa.FreedBytes
-			tAO += aa.AliveObjs; tAB += aa.AliveBytes
-		}
-		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024),
-			fmt.Sprint(tAO), fmt.Sprintf("%d (%.2f MB)", tAB, float64(tAB)/1024/1024), "", "")
-		// Rewind: re-iterate data rows below the total line.
-		for _, loc := range bothLines {
-			fa := freedByLine[loc]
-			aa := aliveByLine[loc]
-			funcs := make([]string, 0, len(fa.Funcs))
-			for f := range fa.Funcs { funcs = append(funcs, f) }
-			for f := range aa.Funcs { funcs = append(funcs, f) }
-			sort.Strings(funcs)
-			fnStr := strings.Join(funcs, "; ")
-			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
-			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-				fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
-				fmt.Sprint(len(funcs)), fnStr)
-		}
 	}
 
 	// Freed only — sorted by Freed Bytes desc
@@ -665,13 +743,6 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	if len(onlyLines) == 0 {
 		s.addRow("(none)")
 	} else {
-		// Total row at top for quick reference.
-		tFO, tFB := 0, 0
-		for _, loc := range onlyLines {
-			fa := freedByLine[loc]
-			tFO += fa.FreedObjs; tFB += fa.FreedBytes
-		}
-		s.addRow("Total", "", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
 		for _, loc := range onlyLines {
 			fa := freedByLine[loc]
 			types := make([]string, 0, len(fa.Types))
