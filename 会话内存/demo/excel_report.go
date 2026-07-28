@@ -459,18 +459,22 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 	for _, si := range fSumMap { fSumObjs += si.TotalObjs; fSumBytes += si.TotalBytes }
 
-	// Alive site totals.
+	// Alive site totals — use LAST GC cycle's snapshot (alive is NOT additive across cycles).
 	aSumObjs, aSumBytes := 0, 0
 	aSumMap := make(map[string]*sInfo)
-	for _, gc := range gcs {
-		for _, site := range gc.AliveSites {
-			key := site.Func + "|" + site.Loc
-			si, ok := aSumMap[key]
-			if !ok { si = &sInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; aSumMap[key] = si }
-			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes
+	for i := len(gcs) - 1; i >= 0; i-- {
+		if len(gcs[i].AliveSites) > 0 {
+			for _, site := range gcs[i].AliveSites {
+				key := site.Func + "|" + site.Loc
+				if _, ok := aSumMap[key]; !ok {
+					aSumMap[key] = &sInfo{Func: site.Func, Loc: site.Loc, TotalObjs: site.Objs, TotalBytes: site.Bytes, Refs: make(map[string]bool)}
+					aSumObjs += site.Objs
+					aSumBytes += site.Bytes
+				}
+			}
+			break
 		}
 	}
-	for _, si := range aSumMap { aSumObjs += si.TotalObjs; aSumBytes += si.TotalBytes }
 
 	// Cross-reference by file:line for Both/Only counts.
 	type sumLineAgg struct {
