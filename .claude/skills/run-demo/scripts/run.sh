@@ -50,21 +50,25 @@ case "$MODE" in
         ;;
     session|concurrent|loop|mixed|fullydead|customtypes|reprint)
         verify "session breakdown output" "gcdeadsession by session:" "$OUT_STDERR"
+        verify "alloc output present"      "gcdeadsession:alloc:" "$OUT_STDERR"
         verify "freed output present"      "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"      "gcdeadsession:alive:" "$OUT_STDERR"
         ;;
     concurrentgrowth)
         verify "session 6001 output"     "session #6001:" "$OUT_STDERR"
+        verify "alloc output present"     "gcdeadsession:alloc:" "$OUT_STDERR"
         verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
         ;;
     sessionrefoverflow)
         verify "session 7000 output"     "session #7000:" "$OUT_STDERR"
+        verify "alloc output present"     "gcdeadsession:alloc:" "$OUT_STDERR"
         verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
         ;;
     largeoutput)
         verify "session 8000 output"     "session #8000:" "$OUT_STDERR"
+        verify "alloc output present"     "gcdeadsession:alloc:" "$OUT_STDERR"
         verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
         ;;

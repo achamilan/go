@@ -650,11 +650,17 @@ type gcDeadRawEntry struct {
 	aliveSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
 	numAliveSessionRefs int
 
+	// Per-session alloc attribution (cumulative allocs per (session, bucket)).
+	allocSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
+	numAllocSessionRefs  int
+
 	// Overflow counters for session refs that exceed gcDeadSessionRefSlots.
-	droppedFrees     uintptr // freed objects from overflow sessions
-	droppedFreeBytes uintptr // freed bytes from overflow sessions
-	droppedAliveFrees     uintptr // alive objects from overflow sessions
+	droppedFrees         uintptr // freed objects from overflow sessions
+	droppedFreeBytes     uintptr // freed bytes from overflow sessions
+	droppedAliveFrees    uintptr // alive objects from overflow sessions
 	droppedAliveFreeBytes uintptr // alive bytes from overflow sessions
+	droppedAllocFrees    uintptr // alloc objects from overflow sessions
+	droppedAllocFreeBytes uintptr // alloc bytes from overflow sessions
 }
 
 type gcDeadSite struct {
@@ -675,11 +681,17 @@ type gcDeadSite struct {
 	aliveSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
 	numAliveSessionRefs int
 
+	// Per-session alloc attribution (cumulative allocs per (session, site)).
+	allocSessionRefs     [gcDeadSessionRefSlots]gcDeadSessionRef
+	numAllocSessionRefs  int
+
 	// Overflow counters for session refs that exceed gcDeadSessionRefSlots.
 	droppedFrees     uintptr
 	droppedFreeBytes uintptr
 	droppedAliveFrees     uintptr
 	droppedAliveFreeBytes uintptr
+	droppedAllocFrees     uintptr
+	droppedAllocFreeBytes uintptr
 }
 
 // Persistent storage for gcDeadTracePrint, allocated once on first use.
@@ -1099,6 +1111,23 @@ func gcDeadTracePrint() {
 							r.droppedAliveFreeBytes += aliveBytes
 						}
 					}
+
+					// Add alloc session attribution (cumulative).
+					// br.frees is the total alloc count for this (session, bucket).
+					if r.numAllocSessionRefs < len(r.allocSessionRefs) {
+						ns := r.numAllocSessionRefs
+						r.allocSessionRefs[ns].sessionID = se.id
+						r.allocSessionRefs[ns].originalID = se.originalID
+						r.allocSessionRefs[ns].generation = se.generation
+						r.allocSessionRefs[ns].goid = br.goid
+						r.allocSessionRefs[ns].objs = br.frees
+						r.allocSessionRefs[ns].bytes = br.bytes
+						r.allocSessionRefs[ns].typeName = br.typeName
+						r.numAllocSessionRefs++
+					} else {
+						r.droppedAllocFrees += br.frees
+						r.droppedAllocFreeBytes += br.bytes
+					}
 					found = true
 					break
 				}
@@ -1123,7 +1152,7 @@ func gcDeadTracePrint() {
 						}
 					}
 
-					if freedThisCycle > 0 || aliveObjs > 0 {
+					if freedThisCycle > 0 || aliveObjs > 0 || br.frees > 0 {
 						// Create a new raw entry for this previously unseen bucket.
 						raw[rawCount] = gcDeadRawEntry{
 							pcs: bpcs, nframes: bNframes,
@@ -1154,6 +1183,16 @@ func gcDeadTracePrint() {
 							r.aliveSessionRefs[ns].typeName = br.typeName
 							r.numAliveSessionRefs++
 						}
+
+						// Add alloc session attribution (cumulative).
+						r.allocSessionRefs[0].sessionID = se.id
+						r.allocSessionRefs[0].originalID = se.originalID
+						r.allocSessionRefs[0].generation = se.generation
+						r.allocSessionRefs[0].goid = br.goid
+						r.allocSessionRefs[0].objs = br.frees
+						r.allocSessionRefs[0].bytes = br.bytes
+						r.allocSessionRefs[0].typeName = br.typeName
+						r.numAllocSessionRefs = 1
 						rawCount++
 					}
 				} else if !found {
@@ -1234,6 +1273,8 @@ func gcDeadTracePrint() {
 			sites[idx].droppedFreeBytes += r.droppedFreeBytes
 			sites[idx].droppedAliveFrees += r.droppedAliveFrees
 			sites[idx].droppedAliveFreeBytes += r.droppedAliveFreeBytes
+			sites[idx].droppedAllocFrees += r.droppedAllocFrees
+			sites[idx].droppedAllocFreeBytes += r.droppedAllocFreeBytes
 
 			// Merge alive session refs.
 			for ri := 0; ri < r.numAliveSessionRefs; ri++ {
@@ -1256,6 +1297,28 @@ func gcDeadTracePrint() {
 					sites[idx].droppedAliveFreeBytes += rr.bytes
 				}
 			}
+
+			// Merge alloc session refs.
+			for ri := 0; ri < r.numAllocSessionRefs; ri++ {
+				rr := &r.allocSessionRefs[ri]
+				found := false
+				for si := 0; si < sites[idx].numAllocSessionRefs; si++ {
+					if sites[idx].allocSessionRefs[si].sessionID == rr.sessionID {
+						sites[idx].allocSessionRefs[si].objs += rr.objs
+						sites[idx].allocSessionRefs[si].bytes += rr.bytes
+						found = true
+						break
+					}
+				}
+				if !found && sites[idx].numAllocSessionRefs < len(sites[idx].allocSessionRefs) {
+					ns := sites[idx].numAllocSessionRefs
+					sites[idx].allocSessionRefs[ns] = *rr
+					sites[idx].numAllocSessionRefs++
+				} else if !found {
+					sites[idx].droppedAllocFrees += rr.objs
+					sites[idx].droppedAllocFreeBytes += rr.bytes
+				}
+			}
 		} else if siteCount < gcDeadTraceMaxSites {
 			sites[siteCount] = gcDeadSite{
 				funcs:               key,
@@ -1268,12 +1331,18 @@ func gcDeadTracePrint() {
 				droppedFreeBytes:    r.droppedFreeBytes,
 				droppedAliveFrees:     r.droppedAliveFrees,
 				droppedAliveFreeBytes: r.droppedAliveFreeBytes,
+				numAllocSessionRefs:  r.numAllocSessionRefs,
+				droppedAllocFrees:    r.droppedAllocFrees,
+				droppedAllocFreeBytes: r.droppedAllocFreeBytes,
 			}
 			for ri := 0; ri < r.numSessionRefs; ri++ {
 				sites[siteCount].sessionRefs[ri] = r.sessionRefs[ri]
 			}
 			for ri := 0; ri < r.numAliveSessionRefs; ri++ {
 				sites[siteCount].aliveSessionRefs[ri] = r.aliveSessionRefs[ri]
+			}
+			for ri := 0; ri < r.numAllocSessionRefs; ri++ {
+				sites[siteCount].allocSessionRefs[ri] = r.allocSessionRefs[ri]
 			}
 			siteCount++
 		} else {
@@ -1629,6 +1698,115 @@ func gcDeadTracePrint() {
 				appendStr(" objs from other sessions]")
 			}
 			appendStr("\n")
+		}
+	}
+
+	// Session alloc report: cumulative allocation breakdown by session per site.
+	// Shows how many objects each session allocated at each call site.
+	// This is cumulative data: it includes both alive and freed objects.
+	{
+		sessionSiteCount := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].numAllocSessionRefs > 0 || sites[i].droppedAllocFrees > 0 {
+				sessionSiteCount++
+			}
+		}
+		if sessionSiteCount > 0 {
+			appendStr("gcdeadsession:alloc: ")
+			// Compute total allocs from per-site data for the summary line.
+			totalAllocObjs := uintptr(0)
+			totalAllocBytes := uintptr(0)
+			for i := 0; i < siteCount; i++ {
+				s := &sites[i]
+				for ri := 0; ri < s.numAllocSessionRefs; ri++ {
+					totalAllocObjs += s.allocSessionRefs[ri].objs
+					totalAllocBytes += s.allocSessionRefs[ri].bytes
+				}
+				totalAllocObjs += s.droppedAllocFrees
+				totalAllocBytes += s.droppedAllocFreeBytes
+			}
+			appendUintptr(totalAllocObjs)
+			appendStr(" session objs (")
+			appendUintptr(totalAllocBytes)
+			appendStr(" bytes) from ")
+			appendUintptr(sessionSiteCount)
+			appendStr(" sites\n")
+
+			for i := 0; i < siteCount; i++ {
+				s := &sites[i]
+				if s.numAllocSessionRefs == 0 && s.droppedAllocFrees == 0 {
+					continue
+				}
+				siteAllocs := uintptr(0)
+				siteAllocBytes := uintptr(0)
+				for ri := 0; ri < s.numAllocSessionRefs; ri++ {
+					siteAllocs += s.allocSessionRefs[ri].objs
+					siteAllocBytes += s.allocSessionRefs[ri].bytes
+				}
+				siteAllocs += s.droppedAllocFrees
+				siteAllocBytes += s.droppedAllocFreeBytes
+				var linetmp [20]byte
+
+				appendStr("  ")
+				for j := 0; j < s.nframes; j++ {
+					if j > 0 {
+						appendStr(" < ")
+					}
+					lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+					appendStr(s.funcs[j].name)
+					appendStr(" (")
+					appendStr(s.funcs[j].file)
+					appendStr(":")
+					appendStr(string(lb))
+					appendStr(")")
+				}
+
+				appendStr(": ")
+				appendUintptr(siteAllocs)
+				appendStr(" session objs, ")
+				appendUintptr(siteAllocBytes)
+				appendStr(" session bytes")
+				// Append per-session alloc attribution.
+				for ri := 0; ri < s.numAllocSessionRefs; ri++ {
+					r := &s.allocSessionRefs[ri]
+					appendStr(" [session #")
+					var tmp2 [20]byte
+					b := itoa(tmp2[:], r.originalID)
+					m := copy(buf[n:], b)
+					n += m
+					if r.generation > 0 {
+						appendStr("#")
+						b2 := itoa(tmp2[:], uint64(r.generation))
+						m = copy(buf[n:], b2)
+						n += m
+					}
+					appendStr(": ")
+					appendUintptr(r.objs)
+					appendStr(" objs, ")
+					appendUintptr(r.bytes)
+					appendStr(" bytes")
+					if r.typeName != "" {
+						appendStr(" @")
+						appendStr(r.typeName)
+					}
+					if r.goid != 0 {
+						appendStr(" (gid=")
+						var gidbuf [20]byte
+						b := itoa(gidbuf[:], r.goid)
+						m := copy(buf[n:], b)
+						n += m
+						appendStr(")")
+					}
+					appendStr("]")
+				}
+				// Append overflow marker if some sessions were dropped.
+				if s.droppedAllocFrees > 0 {
+					appendStr(" [+")
+					appendUintptr(s.droppedAllocFrees)
+					appendStr(" objs from other sessions]")
+				}
+				appendStr("\n")
+			}
 		}
 	}
 

@@ -374,25 +374,29 @@ func (xb *xlsxBuilder) writeFile(w *zip.Writer, name, content string) {
 // ── build sheets from parsed data ─────────────────────────────────
 
 type sessAgg struct {
-	GID, FirstGC, LastGC      int
-	Start, End                string
-	CumAllocs, CumFrees       int
-	MaxAlive, MaxAliveBytes   int
+	GID, FirstGC, LastGC            int
+	Start, End                      string
+	CumAllocs, CumAllocBytes        int
+	CumFrees, CumFreeBytes          int
+	MaxAlive, MaxAliveBytes         int
 }
 
 func buildOverviewSheet(allData []*ParsedData) *xlsxSheet {
 	s := &xlsxSheet{name: "Overview", colWidths: make([]float64, 20)}
-	s.addHeaderRow("Mode", "GC Cycles", "Sessions", "Freed Objs", "Alive Objs", "Avg Freed/GC", "Avg Alive/GC")
+	s.addHeaderRow("Mode", "GC Cycles", "Sessions", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "Avg Freed/GC", "Avg Alive/GC")
 	for _, d := range allData {
 		tf := 0
+		tfBytes := 0
 		for _, gc := range d.GCCycles {
-			if gc.Freed != nil { tf += gc.Freed.Objs }
+			if gc.Freed != nil { tf += gc.Freed.Objs; tfBytes += gc.Freed.Bytes }
 		}
 		// Total Alive: last GC cycle with alive data (current snapshot), not sum.
 		ta := 0
+		taBytes := 0
 		for i := len(d.GCCycles) - 1; i >= 0; i-- {
 			if d.GCCycles[i].Alive != nil {
 				ta = d.GCCycles[i].Alive.Objs
+				taBytes = d.GCCycles[i].Alive.Bytes
 				break
 			}
 		}
@@ -402,7 +406,8 @@ func buildOverviewSheet(allData []*ParsedData) *xlsxSheet {
 		}
 		gcN := len(d.GCCycles)
 		s.addRow(d.Mode, fmt.Sprint(gcN), fmt.Sprint(len(sessSet)),
-			fmt.Sprint(tf), fmt.Sprint(ta),
+			fmt.Sprint(tf), fmt.Sprintf("%d (%.2f MB)", tfBytes, float64(tfBytes)/1024/1024),
+			fmt.Sprint(ta), fmt.Sprintf("%d (%.2f MB)", taBytes, float64(taBytes)/1024/1024),
 			fmt.Sprintf("%.1f", float64(tf)/float64(gcN)),
 			fmt.Sprintf("%.1f", float64(ta)/float64(gcN)))
 	}
@@ -414,14 +419,17 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	gcs := data.GCCycles
 
 	tf := 0
+	tfBytes := 0
 	for _, gc := range gcs {
-		if gc.Freed != nil { tf += gc.Freed.Objs }
+		if gc.Freed != nil { tf += gc.Freed.Objs; tfBytes += gc.Freed.Bytes }
 	}
 	// Total Alive: last GC cycle with alive data (current snapshot), not sum.
 	ta := 0
+	taBytes := 0
 	for i := len(gcs) - 1; i >= 0; i-- {
 		if gcs[i].Alive != nil {
 			ta = gcs[i].Alive.Objs
+			taBytes = gcs[i].Alive.Bytes
 			break
 		}
 	}
@@ -434,7 +442,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	s.addRow("GC Cycles:", fmt.Sprint(len(gcs)))
 	s.addRow("Sessions:", fmt.Sprint(len(sessSet)))
 	s.addRow("Total Freed:", fmt.Sprint(tf))
+	s.addRow("Total Freed Bytes:", fmt.Sprintf("%d (%.2f MB)", tfBytes, float64(tfBytes)/1024/1024))
 	s.addRow("Total Alive:", fmt.Sprint(ta))
+	s.addRow("Total Alive Bytes:", fmt.Sprintf("%d (%.2f MB)", taBytes, float64(taBytes)/1024/1024))
 	s.addBlank()
 
 	// Per-GC Summary
@@ -448,7 +458,8 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	s.addBlank()
 
 	// Session Detail
-	s.addHeaderRow("Session", "GID", "First GC", "Last GC", "Start", "End", "Total Allocs", "Total Frees", "Max Alive")
+	s.addHeaderRow("Session", "GID", "First GC", "Last GC", "Start", "End",
+		"Total Allocs", "Alloc Bytes", "Total Frees", "Free Bytes", "Max Alive", "Max Alive Bytes")
 	sids := make(map[int]*sessAgg)
 	for _, gc := range gcs {
 		for _, se := range gc.Sessions {
@@ -459,7 +470,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			}
 			sa.LastGC = gc.GC
 			sa.CumAllocs += se.Allocs
+			sa.CumAllocBytes += se.AllocBytes
 			sa.CumFrees += se.Frees
+			sa.CumFreeBytes += se.FreeBytes
 			if se.Alive > sa.MaxAlive { sa.MaxAlive = se.Alive; sa.MaxAliveBytes = se.AliveBytes }
 			if se.End != "" { sa.End = se.End }
 		}
@@ -467,13 +480,36 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	var sorted []int
 	for id := range sids { sorted = append(sorted, id) }
 	sort.Ints(sorted)
+	// Accumulate totals across all sessions.
+	tAllocs, tAllocBytes, tFrees, tFreeBytes := 0, 0, 0, 0
 	for _, id := range sorted {
 		sa := sids[id]
+		tAllocs += sa.CumAllocs
+		tAllocBytes += sa.CumAllocBytes
+		tFrees += sa.CumFrees
+		tFreeBytes += sa.CumFreeBytes
+		// Final alive: from last GC cycle for this session.
 		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(sa.GID),
 			fmt.Sprintf("GC#%d", sa.FirstGC), fmt.Sprintf("GC#%d", sa.LastGC),
 			shortLoc(sa.Start), shortLoc(sa.End),
-			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.MaxAlive))
+			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumAllocBytes),
+			fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.CumFreeBytes),
+			fmt.Sprint(sa.MaxAlive), fmt.Sprint(sa.MaxAliveBytes))
 	}
+	// Total row
+	lastAlive := 0
+	lastAliveBytes := 0
+	for i := len(gcs) - 1; i >= 0; i-- {
+		if gcs[i].Alive != nil {
+			lastAlive = gcs[i].Alive.Objs
+			lastAliveBytes = gcs[i].Alive.Bytes
+			break
+		}
+	}
+	s.addRow("Total", "", "", "", "", "",
+		fmt.Sprint(tAllocs), fmt.Sprintf("%d (%.2f MB)", tAllocBytes, float64(tAllocBytes)/1024/1024),
+		fmt.Sprint(tFrees), fmt.Sprintf("%d (%.2f MB)", tFreeBytes, float64(tFreeBytes)/1024/1024),
+		fmt.Sprint(lastAlive), fmt.Sprintf("%d (%.2f MB)", lastAliveBytes, float64(lastAliveBytes)/1024/1024))
 
 	// Freed Site Attribution
 	s.addBlank()
