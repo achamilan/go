@@ -488,15 +488,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		tAllocBytes += sa.CumAllocBytes
 		tFrees += sa.CumFrees
 		tFreeBytes += sa.CumFreeBytes
-		// Final alive: from last GC cycle for this session.
-		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(sa.GID),
-			fmt.Sprintf("GC#%d", sa.FirstGC), fmt.Sprintf("GC#%d", sa.LastGC),
-			shortLoc(sa.Start), shortLoc(sa.End),
-			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumAllocBytes),
-			fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.CumFreeBytes),
-			fmt.Sprint(sa.MaxAlive), fmt.Sprint(sa.MaxAliveBytes))
 	}
-	// Total row
 	lastAlive := 0
 	lastAliveBytes := 0
 	for i := len(gcs) - 1; i >= 0; i-- {
@@ -506,10 +498,20 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			break
 		}
 	}
+	// Total row at top for quick reference.
 	s.addRow("Total", "", "", "", "", "",
 		fmt.Sprint(tAllocs), fmt.Sprintf("%d (%.2f MB)", tAllocBytes, float64(tAllocBytes)/1024/1024),
 		fmt.Sprint(tFrees), fmt.Sprintf("%d (%.2f MB)", tFreeBytes, float64(tFreeBytes)/1024/1024),
 		fmt.Sprint(lastAlive), fmt.Sprintf("%d (%.2f MB)", lastAliveBytes, float64(lastAliveBytes)/1024/1024))
+	for _, id := range sorted {
+		sa := sids[id]
+		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(sa.GID),
+			fmt.Sprintf("GC#%d", sa.FirstGC), fmt.Sprintf("GC#%d", sa.LastGC),
+			shortLoc(sa.Start), shortLoc(sa.End),
+			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumAllocBytes),
+			fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.CumFreeBytes),
+			fmt.Sprint(sa.MaxAlive), fmt.Sprint(sa.MaxAliveBytes))
+	}
 
 	// Freed Site Attribution
 	s.addBlank()
@@ -525,6 +527,8 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		tObjs, tBytes := 0, 0
 		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
 		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalBytes > sites[j].TotalBytes })
+		// Total row at top for quick reference.
+		s.addRow("Total", "", fmt.Sprint(tObjs), fmt.Sprintf("%d (%.2f MB)", tBytes, float64(tBytes)/1024/1024), "")
 		for _, si := range sites {
 			var refs []string
 			for r := range si.Refs { refs = append(refs, r) }
@@ -536,7 +540,6 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			loc := firstFileLine(si.Func, si.Loc)
 			s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
 		}
-		s.addRow("Total", "", fmt.Sprint(tObjs), fmt.Sprintf("%d (%.2f MB)", tBytes, float64(tBytes)/1024/1024), "")
 	}
 	freedMap := make(map[string]*siteInfo)
 	for _, gc := range gcs {
@@ -620,7 +623,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	if len(bothLines) == 0 {
 		s.addRow("(none)")
 	} else {
-		// Summary row
+		// Total row at top for quick reference.
 		tFO, tFB, tAO, tAB := 0, 0, 0, 0
 		for _, loc := range bothLines {
 			fa := freedByLine[loc]
@@ -630,6 +633,20 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		}
 		s.addRow("Total", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024),
 			fmt.Sprint(tAO), fmt.Sprintf("%d (%.2f MB)", tAB, float64(tAB)/1024/1024), "", "")
+		// Rewind: re-iterate data rows below the total line.
+		for _, loc := range bothLines {
+			fa := freedByLine[loc]
+			aa := aliveByLine[loc]
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			for f := range aa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
+			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+				fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
+				fmt.Sprint(len(funcs)), fnStr)
+		}
 	}
 
 	// Freed only — sorted by Freed Bytes desc
@@ -645,30 +662,30 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	sort.Slice(onlyLines, func(i, j int) bool {
 		return freedByLine[onlyLines[i]].FreedBytes > freedByLine[onlyLines[j]].FreedBytes
 	})
-	for _, loc := range onlyLines {
-		fa := freedByLine[loc]
-		types := make([]string, 0, len(fa.Types))
-		for t := range fa.Types { types = append(types, t) }
-		sort.Strings(types)
-		typeStr := strings.Join(types, "; ")
-		funcs := make([]string, 0, len(fa.Funcs))
-		for f := range fa.Funcs { funcs = append(funcs, f) }
-		sort.Strings(funcs)
-		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
-		s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-			fmt.Sprint(len(funcs)), fnStr)
-	}
 	if len(onlyLines) == 0 {
 		s.addRow("(none)")
 	} else {
-		// Summary row
+		// Total row at top for quick reference.
 		tFO, tFB := 0, 0
 		for _, loc := range onlyLines {
 			fa := freedByLine[loc]
 			tFO += fa.FreedObjs; tFB += fa.FreedBytes
 		}
 		s.addRow("Total", "", fmt.Sprint(tFO), fmt.Sprintf("%d (%.2f MB)", tFB, float64(tFB)/1024/1024), "", "")
+		for _, loc := range onlyLines {
+			fa := freedByLine[loc]
+			types := make([]string, 0, len(fa.Types))
+			for t := range fa.Types { types = append(types, t) }
+			sort.Strings(types)
+			typeStr := strings.Join(types, "; ")
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
+			s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+				fmt.Sprint(len(funcs)), fnStr)
+		}
 	}
 
 	// Reprint timeline
