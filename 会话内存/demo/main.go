@@ -27,6 +27,9 @@ var (
 
 	// Sink variables for large-output test.
 	demoLargeSink [][]byte
+
+	// Sink variables for session-lifecycle test.
+	sessionLifecycleSink [][]byte
 )
 
 // Custom type definitions for gcdeadtrace type tracking demo.
@@ -137,6 +140,7 @@ const (
 	PatternConcurrentGrowth         // Concurrent alloc/free with array growth
 	PatternSessionRefOverflow       // >16 sessions at one call site
 	PatternLargeOutput              // Many sessions × many sites → large output
+	PatternSessionLifecycle         // GC orchestration: isolate session-lifetime objects
 )
 
 func (p AllocPattern) String() string {
@@ -163,6 +167,8 @@ func (p AllocPattern) String() string {
 		return "sessionrefoverflow"
 	case PatternLargeOutput:
 		return "largeoutput"
+	case PatternSessionLifecycle:
+		return "sessionlifecycle"
 	default:
 		return "unknown"
 	}
@@ -310,6 +316,8 @@ func (w *WorkerActor) doAllocBurst() {
 		w.patternSessionRefOverflow()
 	case PatternLargeOutput:
 		w.patternLargeOutput()
+	case PatternSessionLifecycle:
+		w.patternSessionLifecycle()
 	}
 }
 
@@ -553,6 +561,56 @@ func (w *WorkerActor) patternLargeOutput() {
 	demoLargeSink = nil
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 2)
+}
+
+// patternSessionLifecycle: GC orchestration to isolate session-lifetime objects.
+//
+// Flow:
+//   Start session → allocate short-lived + session-lifetime objects
+//   → GC #1: short-lived freed, session-lifetime alive
+//   → End session → drop session-lifetime refs
+//   → GC #2: session-lifetime freed
+//
+// Result:
+//   GC #1 freed  = objects allocated and freed within the session (short-lived)
+//   GC #1 alive  = session-lifetime objects (still referenced)
+//   GC #2 freed  = session-lifetime objects (died when session ended)
+//   GC #2 alive  = should be 0 (all session objects resolved)
+//
+// Per-site output for GC #2 freed section identifies the exact allocation sites
+// of objects that lived the full session duration.
+func (w *WorkerActor) patternSessionLifecycle() {
+	const lifecycleID uint64 = 9001
+
+	runtime.GcDeadSessionStart(lifecycleID)
+
+	// Short-lived: allocated inside session, dies before GC #1.
+	scratch := make([]byte, 128)
+	_ = scratch
+
+	// Session-lifetime: kept alive until session end.
+	sessionLifecycleSink = make([][]byte, 3)
+	sessionLifecycleSink[0] = make([]byte, 256)  // site A, 256B
+	sessionLifecycleSink[1] = make([]byte, 512)  // site B, 512B
+	sessionLifecycleSink[2] = make([]byte, 1024) // site C, 1KB
+	atomic.AddInt64(&w.stats.SessionAllocs, 4)
+	atomic.AddInt64(&w.stats.SessionBytes, 128+256+512+1024)
+
+	// GC #1: scratch (128B) is already dead → appears in freed output.
+	//        session-lifetime (256+512+1024) still alive → appears in alive output.
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
+
+	// End session — session-lifetime objects' endPC is now set.
+	runtime.GcDeadSessionEnd(lifecycleID)
+
+	// Drop session-lifetime refs so GC #2 frees them.
+	sessionLifecycleSink = nil
+
+	// GC #2: session-lifetime objects now freed.
+	//        Per-site freed in this cycle = exactly the session-lifetime objects.
+	runtime.GC()
+	atomic.AddInt64(&w.stats.GCCycles, 1)
 }
 
 // patternFullyDead: TestGcDeadTraceFullyDead-like — per-site fully dead detection.
@@ -986,6 +1044,7 @@ func main() {
 		fmt.Println("    worker-concurrentgrowth  — concurrent alloc/free with array growth")
 		fmt.Println("    worker-sessionrefoverflow — >16 sessions at one call site overflow")
 		fmt.Println("    worker-largeoutput       — many sessions × many sites → large output")
+		fmt.Println("    worker-sessionlifecycle   — GC orchestration: isolate session-lifetime objects")
 		fmt.Println("  (gcdeadtrace session output appears on stderr via GODEBUG=gcdeadtrace=1)")
 		fmt.Println()
 	}
@@ -1006,6 +1065,7 @@ func main() {
 		_ = system.AddWorker("worker-concurrentgrowth", PatternConcurrentGrowth)
 		_ = system.AddWorker("worker-sessionrefoverflow", PatternSessionRefOverflow)
 		_ = system.AddWorker("worker-largeoutput", PatternLargeOutput)
+		_ = system.AddWorker("worker-sessionlifecycle", PatternSessionLifecycle)
 	case "loop":
 		_ = system.AddWorker("worker-loop", PatternLoop)
 	case "mixed":
@@ -1028,8 +1088,10 @@ func main() {
 		_ = system.AddWorker("worker-sessionrefoverflow", PatternSessionRefOverflow)
 	case "largeoutput":
 		_ = system.AddWorker("worker-largeoutput", PatternLargeOutput)
+	case "sessionlifecycle":
+		_ = system.AddWorker("worker-sessionlifecycle", PatternSessionLifecycle)
 	default:
-		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint, reuse, concurrentgrowth, sessionrefoverflow, largeoutput)", *mode)
+		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle)", *mode)
 	}
 
 	// Start all actors.

@@ -72,6 +72,13 @@ case "$MODE" in
         verify "freed output present"     "gcdeadsession:freed:" "$OUT_STDERR"
         verify "alive output present"     "gcdeadsession:alive:" "$OUT_STDERR"
         ;;
+    sessionlifecycle)
+        verify "session 9001 created"    "session #9001:" "$OUT_STDERR"
+        verify "gc #1 freed present"     "gcdeadsession:freed:" "$OUT_STDERR"
+        verify "gc #2 freed present"     "gcdeadsession:freed:" "$OUT_STDERR"
+        verify "gc #1 alive present"     "gcdeadsession:alive:" "$OUT_STDERR"
+        verify "two gc cycles output"    "=== GC #" "$OUT_STDERR"
+        ;;
     *)
         verify "any GC output"            "=== GC #" "$OUT_STDERR"
         verify "any session breakdown"    "gcdeadsession by session:" "$OUT_STDERR"
