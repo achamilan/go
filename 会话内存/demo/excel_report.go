@@ -664,12 +664,17 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	s.addRow("=== Alive Sites ===")
 	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Alive Objs", "Alive Bytes", "Session Refs")
 	aliveMap := make(map[string]*siteInfo)
-	for _, gc := range gcs {
-		for _, site := range gc.AliveSites {
-			key := site.Func + "|" + site.Loc
-			si, ok := aliveMap[key]
-			if !ok { si = &siteInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; aliveMap[key] = si }
-			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes; si.Refs[site.Refs] = true
+	for i := len(gcs) - 1; i >= 0; i-- {
+		if len(gcs[i].AliveSites) > 0 {
+			for _, site := range gcs[i].AliveSites {
+				key := site.Func + "|" + site.Loc
+				if _, ok := aliveMap[key]; !ok {
+					aliveMap[key] = &siteInfo{Func: site.Func, Loc: site.Loc,
+						TotalObjs: site.Objs, TotalBytes: site.Bytes, Refs: make(map[string]bool)}
+				}
+				aliveMap[key].Refs[site.Refs] = true
+			}
+			break
 		}
 	}
 	emitSites(aliveMap, "Alive")
