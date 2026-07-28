@@ -1475,7 +1475,7 @@ func gcDeadTracePrint() {
 		// residual frees in this cycle (e.g. previously alive objects freed).
 		printed := atomic.Load(&e.printed)
 		endPC := e.endPC
-		if allocs > 0 || (alive > 0 && printed == 0) || (endPC != 0 && printed == 1) || (frees > 0 && printed == 2) {
+		if allocs > 0 || (alive > 0 && printed == 0) || (endPC != 0 && printed == 1) || (frees > 0 && printed == 2) || (alive > 0 && printed == 2) {
 			if !hasSessionData {
 				appendStr("gcdeadsession by session:\n")
 				hasSessionData = true
