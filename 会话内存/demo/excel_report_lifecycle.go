@@ -40,7 +40,7 @@ import (
 // ── data types ─────────────────────────────────────────────────────
 
 type SessionEntry struct {
-	ID, GID                         int
+	ID, GID, Generation             int
 	Allocs, AllocBytes              int
 	Frees, FreeBytes                int
 	Alive, AliveBytes               int
@@ -90,6 +90,20 @@ func parseInt(s string) int {
 	return n
 }
 
+// sessionKey builds a unique display key for a (baseID, generation) pair.
+// Gen 0 sessions use just the ID; gen > 0 use "ID#gen".
+func sessionKey(id, gen int) string {
+	if gen == 0 {
+		return fmt.Sprintf("%d", id)
+	}
+	return fmt.Sprintf("%d#%d", id, gen)
+}
+
+// sessionDisplay formats a session key for display (e.g. "#9001", "#9001#1").
+func sessionDisplay(key string) string {
+	return "#" + key
+}
+
 func parseFile(path string) *ParsedData {
 	f, _ := os.Open(path)
 	defer f.Close()
@@ -115,8 +129,14 @@ func parseFile(path string) *ParsedData {
 		for i < len(lines) && !gcHeaderRe.MatchString(lines[i]) {
 			line := lines[i]
 			if sm := sessionRe.FindStringSubmatch(line); sm != nil {
+				rawID := strings.TrimPrefix(sm[1], "#")
+				gen := 0
+				if genIdx := strings.Index(rawID, "#"); genIdx >= 0 {
+					gen = parseInt(rawID[genIdx+1:])
+					rawID = rawID[:genIdx]
+				}
 				se := SessionEntry{
-					ID: parseInt(strings.TrimPrefix(sm[1], "#")),
+					ID: parseInt(rawID), Generation: gen,
 					Allocs: parseInt(sm[2]), AllocBytes: parseInt(sm[3]),
 					Frees: parseInt(sm[4]), FreeBytes: parseInt(sm[5]),
 					Alive: parseInt(sm[6]), AliveBytes: parseInt(sm[7]),
@@ -438,6 +458,13 @@ type SiteMatch struct {
 	AliveBytes int
 }
 
+// siteInfo aggregates per-site attribution across GC cycles.
+type siteInfo struct {
+	Func, Loc          string
+	TotalObjs, TotalBytes int
+	Refs               map[string]bool
+}
+
 // analyzeLifecycle performs the GC orchestration analysis for a given session ID.
 // Returns nil if no lifecycle pattern is detected for the session.
 func analyzeLifecycle(gcs []GCBlock, sessionID int) *LifecycleAnalysis {
@@ -521,10 +548,33 @@ func analyzeLifecycle(gcs []GCBlock, sessionID int) *LifecycleAnalysis {
 	return &la
 }
 
+// buildSiteSheet creates a standalone sheet from a site attribution map.
+// Used for non-lifecycle modes to split freed (短周期) and alive (会话周期) into separate sheets.
+func buildSiteSheet(name, title string, siteMap map[string]*siteInfo) *xlsxSheet {
+	s := &xlsxSheet{name: name, colWidths: make([]float64, 20)}
+	s.addRow(title)
+	s.addHeaderRow("Allocation Site", "File:Line", "Total Objs", "Total Bytes", "Session Refs")
+	var sites []*siteInfo
+	tObjs, tBytes := 0, 0
+	for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
+	sort.Slice(sites, func(i, j int) bool { return sites[i].TotalBytes > sites[j].TotalBytes })
+	for _, si := range sites {
+		var refs []string
+		for r := range si.Refs { refs = append(refs, r) }
+		sort.Strings(refs)
+		refStr := strings.Join(refs, "; ")
+		if len(refStr) > 10000 { refStr = refStr[:9997] + "..." }
+		loc := firstFileLine(si.Func, si.Loc)
+		s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
+	}
+	return s
+}
+
 // ── build mode sheet with lifecycle analysis ──────────────────────
 
-func buildModeSheet(data *ParsedData) *xlsxSheet {
+func buildModeSheet(data *ParsedData) []*xlsxSheet {
 	s := &xlsxSheet{name: data.Mode, colWidths: make([]float64, 20)}
+	var extraSheets []*xlsxSheet
 	gcs := data.GCCycles
 
 	tf := 0
@@ -541,9 +591,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			break
 		}
 	}
-	sessSet := make(map[int]bool)
+	sessSet := make(map[string]bool)
 	for _, gc := range gcs {
-		for _, se := range gc.Sessions { sessSet[se.ID] = true }
+		for _, se := range gc.Sessions { sessSet[sessionKey(se.ID, se.Generation)] = true }
 	}
 
 	// siteInfo struct for site attribution aggregation.
@@ -625,13 +675,14 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 	}
 
 	// Build sids for session totals (used by both summary and session detail).
-	sids := make(map[int]*sessAgg)
+	sids := make(map[string]*sessAgg)
 	for _, gc := range gcs {
 		for _, se := range gc.Sessions {
-			sa, ok := sids[se.ID]
+			sk := sessionKey(se.ID, se.Generation)
+			sa, ok := sids[sk]
 			if !ok {
 				sa = &sessAgg{GID: se.GID, FirstGC: gc.GC, Start: se.Start}
-				sids[se.ID] = sa
+				sids[sk] = sa
 			}
 			sa.LastGC = gc.GC
 			sa.CumAllocs += se.Allocs
@@ -642,9 +693,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			if se.End != "" { sa.End = se.End }
 		}
 	}
-	var sorted []int
-	for id := range sids { sorted = append(sorted, id) }
-	sort.Ints(sorted)
+	var sorted []string
+	for sk := range sids { sorted = append(sorted, sk) }
+	sort.Strings(sorted)
 
 	// Session totals (from sids).
 	sAllocs, sAllocBytes, sFrees, sFreeBytes := 0, 0, 0, 0
@@ -661,6 +712,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			break
 		}
 	}
+
+	// Run lifecycle analysis early so Summary section can reference its data.
+	la := analyzeLifecycle(gcs, 9001)
 
 	// ── Write rows ──
 	s.addRow("Mode:", data.Mode)
@@ -681,6 +735,15 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			fmt.Sprintf("%d (%.2f MB)", sFreeBytes, float64(sFreeBytes)/1024/1024),
 			fmt.Sprintf("%d (%.2f MB)", sLastAliveBytes, float64(sLastAliveBytes)/1024/1024)),
 		"", "")
+	// Session-level verification: allocs == frees + alive (session invariant).
+	sfMatch := "✓"
+	if sAllocs != sFrees+sLastAlive || sAllocBytes != sFreeBytes+sLastAliveBytes {
+		sfMatch = fmt.Sprintf("✗ (diff: %d objs, %d bytes)", sAllocs-sFrees-sLastAlive, sAllocBytes-sFreeBytes-sLastAliveBytes)
+	}
+	s.addRow("  └ 验证: alloc==freed+alive",
+		fmt.Sprintf("%d == %d + %d  %s", sAllocs, sFrees, sLastAlive, sfMatch),
+		fmt.Sprintf("%d == %d + %d  %s", sAllocBytes, sFreeBytes, sLastAliveBytes, sfMatch),
+		"", "")
 	s.addRow("Freed Sites",
 		fmt.Sprintf("%d lines, %d objs", len(fSumMap), fSumObjs),
 		fmt.Sprintf("%d (%.2f MB)", fSumBytes, float64(fSumBytes)/1024/1024),
@@ -695,9 +758,82 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			fmt.Sprintf("%d (%.2f MB)", tBFreedBytes, float64(tBFreedBytes)/1024/1024),
 			fmt.Sprintf("%d (%.2f MB)", tBAliveBytes, float64(tBAliveBytes)/1024/1024)),
 		"", "")
+	s.addRow("Site vs Session cross-check (应一致)",
+		fmt.Sprintf("freed: sites=%d, session=%d (%s)", fSumObjs, sFrees, checkMatch(fSumObjs, sFrees)),
+		fmt.Sprintf("alive: sites=%d, session=%d (%s)", aSumObjs, sLastAlive, checkMatch(aSumObjs, sLastAlive)),
+		"", "")
 	s.addRow("Only in Freed (fully dead)",
 		fmt.Sprintf("%d lines, %d objs", nOnly, tOFreedObjs),
 		fmt.Sprintf("%d (%.2f MB)", tOFreedBytes, float64(tOFreedBytes)/1024/1024),
+		"", "")
+
+	// 短周期 / 会话周期 / Late-alloc / Runtime-Persistent overview rows.
+	var shortObjs, shortBytes, shortLines int
+	var sessObjs, sessBytes, sessLines int
+	var lateObjs, lateBytes, lateLines int
+	var rpObjs, rpBytes, rpLines int
+	if la != nil {
+		// 1. 短周期: ShortLivedFreed (Phase 2).
+		for _, site := range la.ShortLivedFreed { shortObjs += site.Objs; shortBytes += site.Bytes }
+		shortLines = len(la.ShortLivedFreed)
+		// 2. 会话周期: MatchedSites freed (GC #1 alive → GC #2 freed).
+		for _, m := range la.MatchedSites { sessObjs += m.FreedObjs; sessBytes += m.FreedBytes }
+		sessLines = len(la.MatchedSites)
+		// 3. Late-alloc freed: SessionLifetimeFreed but NOT in MatchedSites → GC #1之后分配、GC #2释放.
+		matchedKey := make(map[string]bool)
+		for _, m := range la.MatchedSites { matchedKey[m.Site.Func+"|"+m.Site.Loc] = true }
+		for _, site := range la.SessionLifetimeFreed {
+			if !matchedKey[site.Func+"|"+site.Loc] {
+				lateObjs += site.Objs; lateBytes += site.Bytes; lateLines++
+			}
+		}
+		// 4. Runtime-Persistent: NotFreedSites (GC #1 alive, never freed).
+		for _, site := range la.NotFreedSites { rpObjs += site.Objs; rpBytes += site.Bytes }
+		rpLines = len(la.NotFreedSites)
+	} else {
+		// Non-lifecycle: split freed into 短周期/会话周期, all alive → Runtime.
+		for key := range fSumMap {
+			if _, ok := aSumMap[key]; ok {
+				sessObjs += fSumMap[key].TotalObjs
+				sessBytes += fSumMap[key].TotalBytes
+				sessLines++
+			} else {
+				shortObjs += fSumMap[key].TotalObjs
+				shortBytes += fSumMap[key].TotalBytes
+				shortLines++
+			}
+		}
+		// All alive sites → Runtime-Persistent.
+		rpObjs = aSumObjs
+		rpBytes = aSumBytes
+		rpLines = len(aSumMap)
+	}
+	s.addRow("短周期对象 (Freed Sites) → 独立 Sheet",
+		fmt.Sprintf("%d lines, %d objs", shortLines, shortObjs),
+		fmt.Sprintf("%d (%.2f MB)", shortBytes, float64(shortBytes)/1024/1024),
+		"", "")
+	s.addRow("会话周期对象 (Freed Sites) → 独立 Sheet",
+		fmt.Sprintf("%d lines, %d objs", sessLines, sessObjs),
+		fmt.Sprintf("%d (%.2f MB)", sessBytes, float64(sessBytes)/1024/1024),
+		"", "")
+	s.addRow("Late-alloc Freed (GC #1之后分配) → 独立 Sheet",
+		fmt.Sprintf("%d lines, %d objs", lateLines, lateObjs),
+		fmt.Sprintf("%d (%.2f MB)", lateBytes, float64(lateBytes)/1024/1024),
+		"", "")
+	s.addRow("Runtime-Persistent (Never Freed) → 独立 Sheet",
+		fmt.Sprintf("%d lines, %d objs", rpLines, rpObjs),
+		fmt.Sprintf("%d (%.2f MB)", rpBytes, float64(rpBytes)/1024/1024),
+		"", "")
+	// Data consistency check: 四类之和 == 总分配.
+	total := shortObjs + sessObjs + lateObjs + rpObjs
+	totalBytes := shortBytes + sessBytes + lateBytes + rpBytes
+	match := "✓"
+	if total != sAllocs || totalBytes != sAllocBytes {
+		match = fmt.Sprintf("✗ (diff: %d objs, %d bytes)", sAllocs-total, sAllocBytes-totalBytes)
+	}
+	s.addRow("数据验证: 总分配==短周期+会话周期+LateAlloc+Runtime",
+		fmt.Sprintf("%d == %d + %d + %d + %d = %d  %s", sAllocs, shortObjs, sessObjs, lateObjs, rpObjs, total, match),
+		fmt.Sprintf("%d == %d + %d + %d + %d = %d  %s", sAllocBytes, shortBytes, sessBytes, lateBytes, rpBytes, totalBytes, match),
 		"", "")
 	s.addBlank()
 
@@ -718,9 +854,9 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		fmt.Sprint(sAllocs), fmt.Sprintf("%d (%.2f MB)", sAllocBytes, float64(sAllocBytes)/1024/1024),
 		fmt.Sprint(sFrees), fmt.Sprintf("%d (%.2f MB)", sFreeBytes, float64(sFreeBytes)/1024/1024),
 		fmt.Sprint(sLastAlive), fmt.Sprintf("%d (%.2f MB)", sLastAliveBytes, float64(sLastAliveBytes)/1024/1024))
-	for _, id := range sorted {
-		sa := sids[id]
-		s.addRow(fmt.Sprintf("#%d", id), fmt.Sprint(sa.GID),
+	for _, sk := range sorted {
+		sa := sids[sk]
+		s.addRow(sessionDisplay(sk), fmt.Sprint(sa.GID),
 			fmt.Sprintf("GC#%d", sa.FirstGC), fmt.Sprintf("GC#%d", sa.LastGC),
 			shortLoc(sa.Start), shortLoc(sa.End),
 			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumAllocBytes),
@@ -728,30 +864,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			fmt.Sprint(sa.MaxAlive), fmt.Sprint(sa.MaxAliveBytes))
 	}
 
-	// Freed Site Attribution
-	s.addBlank()
-	s.addRow("=== Freed Sites ===")
-	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
-	type siteInfo struct {
-		Func, Loc          string
-		TotalObjs, TotalBytes int
-		Refs               map[string]bool
-	}
-	emitSites := func(siteMap map[string]*siteInfo, title string) {
-		var sites []*siteInfo
-		tObjs, tBytes := 0, 0
-		for _, si := range siteMap { sites = append(sites, si); tObjs += si.TotalObjs; tBytes += si.TotalBytes }
-		sort.Slice(sites, func(i, j int) bool { return sites[i].TotalBytes > sites[j].TotalBytes })
-		for _, si := range sites {
-			var refs []string
-			for r := range si.Refs { refs = append(refs, r) }
-			sort.Strings(refs)
-			refStr := strings.Join(refs, "; ")
-			if len(refStr) > 10000 { refStr = refStr[:9997] + "..." }
-			loc := firstFileLine(si.Func, si.Loc)
-			s.addRow(si.Func, loc, fmt.Sprint(si.TotalObjs), fmt.Sprint(si.TotalBytes), refStr)
-		}
-	}
+	// Build freedMap and aliveMap site-attribution data (exported to independent sheets).
 	freedMap := make(map[string]*siteInfo)
 	for _, gc := range gcs {
 		for _, site := range gc.FreedSites {
@@ -761,12 +874,6 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes; si.Refs[site.Refs] = true
 		}
 	}
-	emitSites(freedMap, "Freed")
-
-	// Alive Site Attribution
-	s.addBlank()
-	s.addRow("=== Alive Sites ===")
-	s.addHeaderRow("Allocation Site", "Alloc File:Line", "Alive Objs", "Alive Bytes", "Session Refs")
 	aliveMap := make(map[string]*siteInfo)
 	for i := len(gcs) - 1; i >= 0; i-- {
 		if len(gcs[i].AliveSites) > 0 {
@@ -781,17 +888,7 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			break
 		}
 	}
-	emitSites(aliveMap, "Alive")
-
-	// Cross-reference by Alloc File:Line
-	s.addBlank()
-	s.addRow("=== Alloc File:Line in Both Freed & Alive ===")
-	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "#Stacks", "Call Stacks")
-	type lineAgg struct {
-		FreedObjs, FreedBytes, AliveObjs, AliveBytes int
-		Funcs                                        map[string]bool
-		Types                                        map[string]bool
-	}
+	// Compute file:line cross-reference data (exported to independent sheets).
 	freedByLine := make(map[string]*lineAgg)
 	aliveByLine := make(map[string]*lineAgg)
 	for _, si := range freedMap {
@@ -813,84 +910,36 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		a.AliveBytes += si.TotalBytes
 		a.Funcs[si.Func] = true
 	}
-	// Both freed & alive — sorted by Freed Bytes desc
-	var bothLines []string
+	var bothLines, onlyLines []string
 	for loc := range freedByLine {
 		if _, ok := aliveByLine[loc]; ok {
 			bothLines = append(bothLines, loc)
+		} else {
+			onlyLines = append(onlyLines, loc)
 		}
 	}
 	sort.Slice(bothLines, func(i, j int) bool {
 		return freedByLine[bothLines[i]].FreedBytes > freedByLine[bothLines[j]].FreedBytes
 	})
-	for _, loc := range bothLines {
-		fa := freedByLine[loc]
-		aa := aliveByLine[loc]
-		funcs := make([]string, 0, len(fa.Funcs))
-		for f := range fa.Funcs { funcs = append(funcs, f) }
-		for f := range aa.Funcs { funcs = append(funcs, f) }
-		sort.Strings(funcs)
-		fnStr := strings.Join(funcs, "; ")
-		if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
-		s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-			fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
-			fmt.Sprint(len(funcs)), fnStr)
-	}
-	if len(bothLines) == 0 {
-		s.addRow("(none)")
-	}
-
-	// Freed only — sorted by Freed Bytes desc
-	s.addBlank()
-	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
-	s.addHeaderRow("Alloc File:Line", "Type", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
-	var onlyLines []string
-	for loc := range freedByLine {
-		if _, ok := aliveByLine[loc]; !ok {
-			onlyLines = append(onlyLines, loc)
-		}
-	}
 	sort.Slice(onlyLines, func(i, j int) bool {
 		return freedByLine[onlyLines[i]].FreedBytes > freedByLine[onlyLines[j]].FreedBytes
 	})
-	if len(onlyLines) == 0 {
-		s.addRow("(none)")
-	} else {
-		for _, loc := range onlyLines {
-			fa := freedByLine[loc]
-			types := make([]string, 0, len(fa.Types))
-			for t := range fa.Types { types = append(types, t) }
-			sort.Strings(types)
-			typeStr := strings.Join(types, "; ")
-			funcs := make([]string, 0, len(fa.Funcs))
-			for f := range fa.Funcs { funcs = append(funcs, f) }
-			sort.Strings(funcs)
-			fnStr := strings.Join(funcs, "; ")
-			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
-			s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
-				fmt.Sprint(len(funcs)), fnStr)
-		}
-	}
 
 	// ═══════════════════════════════════════════════════════════════
 	// Session Lifecycle Analysis
 	// ═══════════════════════════════════════════════════════════════
-	// Only applicable for sessionlifecycle mode (GC orchestration pattern).
-	if strings.Contains(strings.ToLower(data.Mode), "sessionlifecycle") {
-		// Analyze session 9001 (the orchestrated session).
-		la := analyzeLifecycle(gcs, 9001)
-		if la != nil {
-			s.addBlank()
-			s.addRow("=== Session Lifecycle Analysis (Session #9001) ===")
-			s.addRow("Methodology: GC orchestration — forced GC before session end (short-lived freed,")
-			s.addRow("session-lifetime alive), then GcDeadSessionEnd + drop refs + forced GC")
-			s.addRow("(session-lifetime freed). Session-lifetime = alive in GC #1, freed in GC #2.")
-			s.addBlank()
+	if la != nil {
+		s.addBlank()
+		s.addRow("=== Session Lifecycle Analysis (Session #9001) ===")
+		s.addRow("Methodology: GC orchestration — forced GC before session end (short-lived freed,")
+		s.addRow("session-lifetime alive), then GcDeadSessionEnd + drop refs + forced GC")
+		s.addRow("(session-lifetime freed). Session-lifetime = alive in GC #1, freed in GC #2.")
+		s.addBlank()
 
-			// ── Phase 1: GC Timeline with lifecycle markers ──
-			s.addRow("GC Timeline with Lifecycle Markers:")
-			s.addHeaderRow("GC", "Session 9001 State", "Allocs", "Short-Lived Freed", "Session-Lifetime Alive", "Session-Lifetime Freed", "Notes")
-			for _, gc := range gcs {
+		// ── Phase 1: GC Timeline with lifecycle markers ──
+		s.addRow("GC Timeline with Lifecycle Markers:")
+		s.addHeaderRow("GC", "Session 9001 State", "Allocs", "Short-Lived Freed", "Session-Lifetime Alive", "Session-Lifetime Freed", "Notes")
+		for _, gc := range gcs {
 				var se *SessionEntry
 				for i := range gc.Sessions {
 					if gc.Sessions[i].ID == la.SessionID {
@@ -949,122 +998,77 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 			}
 			s.addBlank()
 
-			// ── Phase 2: Short-lived freed per-site detail ──
-			s.addRow("=== Short-Lived Object Sites (Freed During Session, Before GcDeadSessionEnd) ===")
-			s.addRow(fmt.Sprintf("Freed at GC #%d — these objects were allocated and freed within the session,",
-				la.BeforeEndGC))
-			s.addRow("before the session ended. They are NOT session-lifetime objects.")
-			s.addBlank()
-			if len(la.ShortLivedFreed) > 0 {
-				s.addHeaderRow("Allocation Site", "File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
-				for _, site := range la.ShortLivedFreed {
-					loc := firstFileLine(site.Func, site.Loc)
-					s.addRow(site.Func, loc, fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes), site.Refs)
-				}
-			} else {
-				s.addRow("(no short-lived freed objects detected)")
-			}
-			s.addBlank()
-
-			// ── Phase 3: Session-lifetime freed per-site detail ──
-			s.addRow("=== Session-Lifetime Object Sites (Freed After GcDeadSessionEnd) ===")
-			s.addRow(fmt.Sprintf("Freed at GC #%d — these objects were allocated during the session,",
-				la.AfterEndGC))
-			s.addRow("stayed alive through the first forced GC, and were freed only after")
-			s.addRow("the session ended and references were dropped. These are the objects")
-			s.addRow("whose lifetime exactly matches the session duration.")
-			s.addBlank()
-			if len(la.SessionLifetimeFreed) > 0 {
-				s.addHeaderRow("Allocation Site", "File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
-				freedSiteTotal := 0
-				freedSiteBytes := 0
-				for _, site := range la.SessionLifetimeFreed {
-					loc := firstFileLine(site.Func, site.Loc)
-					s.addRow(site.Func, loc, fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes), site.Refs)
-					freedSiteTotal += site.Objs
-					freedSiteBytes += site.Bytes
-				}
-				s.addRow("Total", "", fmt.Sprint(freedSiteTotal), fmt.Sprint(freedSiteBytes), "")
-			} else {
-				s.addRow("(no session-lifetime freed objects detected)")
-			}
-			s.addBlank()
-
-			// ── Phase 4: Cross-reference: alive → freed ──
-			s.addRow("=== Cross-Reference: Session-Lifetime Alive (GC #1) → Freed (After End) ===")
-			s.addHeaderRow("Allocation Site", "File:Line",
-				"GC #1 Alive Objs", "GC #1 Alive Bytes",
-				"After-End Freed Objs", "After-End Freed Bytes",
-				"Matched?")
-			if len(la.MatchedSites) > 0 {
-				for _, m := range la.MatchedSites {
-					loc := firstFileLine(m.Site.Func, m.Site.Loc)
-					matched := "YES"
-					if m.AliveObjs != m.FreedObjs || m.AliveBytes != m.FreedBytes {
-						matched = fmt.Sprintf("PARTIAL (%d alive → %d freed)", m.AliveObjs, m.FreedObjs)
-					}
-					s.addRow(m.Site.Func, loc,
-						fmt.Sprint(m.AliveObjs), fmt.Sprint(m.AliveBytes),
-						fmt.Sprint(m.FreedObjs), fmt.Sprint(m.FreedBytes),
-						matched)
-				}
-			}
-			if len(la.NotFreedSites) > 0 {
-				for _, site := range la.NotFreedSites {
-					loc := firstFileLine(site.Func, site.Loc)
-					s.addRow(site.Func, loc,
-						fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes),
-						"0", "0",
-						"NOT FREED (runtime/persistent)")
-				}
-			}
-			if len(la.MatchedSites) == 0 && len(la.NotFreedSites) == 0 {
-				s.addRow("(no data for cross-reference)")
-			}
-
-			// ── Phase 5: Summary ──
-			s.addBlank()
+			// Phase 5: Lifecycle Summary on main sheet alongside GC Timeline markers.
 			shortLivedTotal := 0
 			shortLivedBytes := 0
-			for _, site := range la.ShortLivedFreed { shortLivedTotal += site.Objs; shortLivedBytes += site.Bytes }
-			sessLifeTotal := 0
-			sessLifeBytes := 0
-			for _, site := range la.SessionLifetimeFreed { sessLifeTotal += site.Objs; sessLifeBytes += site.Bytes }
+			for _, site := range la.ShortLivedFreed {
+				shortLivedTotal += site.Objs
+				shortLivedBytes += site.Bytes
+			}
+			sessLifeFreedTotal := 0
+			sessLifeFreedBytes := 0
+			for _, m := range la.MatchedSites {
+				sessLifeFreedTotal += m.FreedObjs
+				sessLifeFreedBytes += m.FreedBytes
+			}
 			notFreedTotal := 0
 			notFreedBytes := 0
-			for _, site := range la.NotFreedSites { notFreedTotal += site.Objs; notFreedBytes += site.Bytes }
-
+			for _, site := range la.NotFreedSites {
+				notFreedTotal += site.Objs
+				notFreedBytes += site.Bytes
+			}
 			s.addRow("=== Lifecycle Summary ===")
 			s.addRow("Short-lived (freed before session end)", fmt.Sprintf("%d objs", shortLivedTotal), fmt.Sprintf("%d bytes", shortLivedBytes))
-			s.addRow("Session-lifetime (freed after session end)", fmt.Sprintf("%d objs", sessLifeTotal), fmt.Sprintf("%d bytes", sessLifeBytes))
+			s.addRow("Session-lifetime (freed after session end, via cross-ref)", fmt.Sprintf("%d objs", sessLifeFreedTotal), fmt.Sprintf("%d bytes", sessLifeFreedBytes))
 			s.addRow("Runtime-persistent (never freed)", fmt.Sprintf("%d objs", notFreedTotal), fmt.Sprintf("%d bytes", notFreedBytes))
 			s.addBlank()
-			s.addRow("Session total allocs", fmt.Sprintf("%d objs", shortLivedTotal+sessLifeTotal+notFreedTotal),
-				fmt.Sprintf("%d bytes", shortLivedBytes+sessLifeBytes+notFreedBytes))
+			s.addRow("Session total allocs", fmt.Sprintf("%d objs", shortLivedTotal+sessLifeFreedTotal+notFreedTotal),
+				fmt.Sprintf("%d bytes", shortLivedBytes+sessLifeFreedBytes+notFreedBytes))
 			s.addRow("(matches GC #1 session output above: allocs − frees − alive = 0)")
-		}
-	}
+			s.addBlank()
 
-	// Reprint timeline (unchanged)
+			// Create separate sheets for 短周期/会话周期/Late-alloc/Runtime-Persistent data.
+			shortSheet := buildLifecycleShortLivedSheet(data, la)
+			sessSheet := buildLifecycleSessionLifetimeSheet(data, la)
+			lateSheet := buildLateAllocFreedSheet(data, la)
+			rpSheet := buildRuntimePersistentSheet(data, la)
+			extraSheets = append(extraSheets, shortSheet, sessSheet, lateSheet, rpSheet)
+		} else {
+			// Non-lifecycle: freed-only → 短周期, both-freed → 会话周期, all alive → Runtime.
+			shortOnly := make(map[string]*siteInfo)
+			sessBoth := make(map[string]*siteInfo)
+			for key, si := range freedMap {
+				if _, ok := aliveMap[key]; ok {
+					sessBoth[key] = si
+				} else {
+					shortOnly[key] = si
+				}
+			}
+			extraSheets = append(extraSheets,
+				buildSiteSheet(data.Mode+" - 短周期对象", "=== 短周期对象 (Freed Sites) ===", shortOnly),
+				buildSiteSheet(data.Mode+" - 会话周期对象", "=== 会话周期对象 (Freed Sites) ===", sessBoth),
+				buildSiteSheet(data.Mode+" - Runtime-Persistent", "=== Runtime-Persistent (Never Freed) ===", aliveMap))
+	}
 	if strings.Contains(strings.ToLower(data.Mode), "reprint") {
 		s.addBlank()
 		s.addRow("=== Session Timeline (Re-print Verification) ===")
-		for _, id := range sorted {
-			sa := sids[id]
+		for _, sk := range sorted {
+			sa := sids[sk]
 			s.addBlank()
-			s.addRow(fmt.Sprintf("Session #%d (GID=%d)", id, sa.GID))
+			s.addRow(fmt.Sprintf("Session %s (GID=%d)", sessionDisplay(sk), sa.GID))
 			s.addHeaderRow("GC", "Type", "Allocs", "Frees", "Alive", "end?")
 			var appGCs []int
 			for _, gc := range gcs {
 				for _, se := range gc.Sessions {
-					if se.ID == id {
-						typ := "first print"
-						if se.End != "" { typ = "re-print" }
-						hasEnd := "NO"
-						if se.End != "" { hasEnd = "YES" }
-						s.addRow(fmt.Sprint(gc.GC), typ, fmt.Sprint(se.Allocs), fmt.Sprint(se.Frees), fmt.Sprint(se.Alive), hasEnd)
-						appGCs = append(appGCs, gc.GC)
+					if sessionKey(se.ID, se.Generation) != sk {
+						continue
 					}
+					typ := "first print"
+					if se.End != "" { typ = "re-print" }
+					hasEnd := "NO"
+					if se.End != "" { hasEnd = "YES" }
+					s.addRow(fmt.Sprint(gc.GC), typ, fmt.Sprint(se.Allocs), fmt.Sprint(se.Frees), fmt.Sprint(se.Alive), hasEnd)
+					appGCs = append(appGCs, gc.GC)
 				}
 			}
 			if len(appGCs) >= 2 {
@@ -1079,7 +1083,205 @@ func buildModeSheet(data *ParsedData) *xlsxSheet {
 		}
 	}
 
+	// Always create independent sheets for Freed/Alive/Both/Only sections.
+	extraSheets = append(extraSheets,
+		buildSiteSheet(data.Mode+" - Freed Sites", "=== Freed Sites ===", freedMap),
+		buildSiteSheet(data.Mode+" - Alive Sites", "=== Alive Sites ===", aliveMap),
+		buildLineXRefBothSheet(data.Mode+" - Both Freed & Alive", freedByLine, aliveByLine, bothLines),
+		buildLineXRefOnlySheet(data.Mode+" - Only in Freed", freedByLine, onlyLines))
+
+	return append([]*xlsxSheet{s}, extraSheets...)
+}
+
+// buildLifecycleShortLivedSheet creates the "短周期对象" sheet with Phase 2 data:
+// short-lived objects freed before session end.
+func buildLifecycleShortLivedSheet(data *ParsedData, la *LifecycleAnalysis) *xlsxSheet {
+	s := &xlsxSheet{name: data.Mode + " - 短周期对象", colWidths: make([]float64, 20)}
+
+	s.addRow("=== Short-Lived Object Sites (Freed During Session, Before GcDeadSessionEnd) ===")
+	s.addRow(fmt.Sprintf("Freed at GC #%d — these objects were allocated and freed within the session,", la.BeforeEndGC))
+	s.addRow("before the session ended. They are NOT session-lifetime objects.")
+	s.addBlank()
+	if len(la.ShortLivedFreed) > 0 {
+		s.addHeaderRow("Allocation Site", "File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
+		for _, site := range la.ShortLivedFreed {
+			loc := firstFileLine(site.Func, site.Loc)
+			s.addRow(site.Func, loc, fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes), site.Refs)
+		}
+	} else {
+		s.addRow("(no short-lived freed objects detected)")
+	}
+	s.addBlank()
+	shortTotal := 0
+	shortBytes := 0
+	for _, site := range la.ShortLivedFreed {
+		shortTotal += site.Objs
+		shortBytes += site.Bytes
+	}
+	s.addRow("Total Short-Lived", "", fmt.Sprint(shortTotal), fmt.Sprint(shortBytes), "")
+
 	return s
+}
+
+// buildLifecycleSessionLifetimeSheet creates the "会话周期对象" sheet with the
+// cross-reference matched sites: objects alive at GC #1 and freed at GC #2.
+// These are the TRUE session-lifetime freed objects.
+func buildLifecycleSessionLifetimeSheet(data *ParsedData, la *LifecycleAnalysis) *xlsxSheet {
+	s := &xlsxSheet{name: data.Mode + " - 会话周期对象", colWidths: make([]float64, 20)}
+
+	s.addRow("=== 会话周期对象 (Session-Lifetime Freed Sites) ===")
+	s.addRow("These objects were alive at GC #1 (before GcDeadSessionEnd) and were freed")
+	s.addRow(fmt.Sprintf("at GC #%d (after session end + ref drop). Their lifetime matches the session duration.", la.AfterEndGC))
+	s.addBlank()
+	s.addHeaderRow("Allocation Site", "File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
+	if len(la.MatchedSites) > 0 {
+		freedTotal := 0
+		freedBytes := 0
+		for _, m := range la.MatchedSites {
+			loc := firstFileLine(m.Site.Func, m.Site.Loc)
+			s.addRow(m.Site.Func, loc,
+				fmt.Sprint(m.FreedObjs), fmt.Sprint(m.FreedBytes), m.Site.Refs)
+			freedTotal += m.FreedObjs
+			freedBytes += m.FreedBytes
+		}
+		s.addRow("Total", "", fmt.Sprint(freedTotal), fmt.Sprint(freedBytes), "")
+	} else {
+		s.addRow("(no session-lifetime freed objects detected)")
+	}
+
+	return s
+}
+
+// lineAgg aggregates freed/alive data per file:line for cross-reference sheets.
+type lineAgg struct {
+	FreedObjs, FreedBytes, AliveObjs, AliveBytes int
+	Funcs                                        map[string]bool
+	Types                                        map[string]bool
+}
+
+// buildRuntimePersistentSheet creates the "Runtime-Persistent" sheet showing
+// objects alive at GC #1 that were never freed (potentially leaked or runtime-owned).
+func buildRuntimePersistentSheet(data *ParsedData, la *LifecycleAnalysis) *xlsxSheet {
+	s := &xlsxSheet{name: data.Mode + " - Runtime-Persistent", colWidths: make([]float64, 20)}
+
+	s.addRow("=== Runtime-Persistent Object Sites (Never Freed) ===")
+	s.addRow("These objects were alive at GC #1 (before GcDeadSessionEnd) and never freed,")
+	s.addRow("even after session end and reference drop. They are runtime-owned or leaked.")
+	s.addBlank()
+	s.addHeaderRow("Allocation Site", "File:Line", "Alive Objs", "Alive Bytes", "Session Refs")
+	if len(la.NotFreedSites) > 0 {
+		aliveTotal := 0
+		aliveBytes := 0
+		for _, site := range la.NotFreedSites {
+			loc := firstFileLine(site.Func, site.Loc)
+			s.addRow(site.Func, loc, fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes), site.Refs)
+			aliveTotal += site.Objs
+			aliveBytes += site.Bytes
+		}
+		s.addRow("Total", "", fmt.Sprint(aliveTotal), fmt.Sprint(aliveBytes), "")
+	} else {
+		s.addRow("(no runtime-persistent objects detected)")
+	}
+	return s
+}
+
+// buildLateAllocFreedSheet creates the "Late-alloc Freed" sheet for lifecycle mode,
+// showing freed sites at GC #2 that were NOT matched to GC #1 alive sites.
+// These are objects allocated between GC #1 and GC #2 and freed at GC #2.
+func buildLateAllocFreedSheet(data *ParsedData, la *LifecycleAnalysis) *xlsxSheet {
+	s := &xlsxSheet{name: data.Mode + " - Late-alloc Freed", colWidths: make([]float64, 20)}
+
+	s.addRow("=== Late-alloc Freed Sites (Allocated Between GCs, Freed at GC #2) ===")
+	s.addRow("These objects were allocated after GC #1 (before GcDeadSessionEnd) but before GC #2,")
+	s.addRow("and were freed at GC #2. They are NOT session-lifetime objects.")
+	s.addBlank()
+
+	// Build set of matched site keys from MatchedSites.
+	matchedKey := make(map[string]bool)
+	for _, m := range la.MatchedSites { matchedKey[m.Site.Func+"|"+m.Site.Loc] = true }
+
+	// Collect SessionLifetimeFreed sites NOT in matched set → late-alloc.
+	var lateSites []SiteLine
+	for _, site := range la.SessionLifetimeFreed {
+		if !matchedKey[site.Func+"|"+site.Loc] {
+			lateSites = append(lateSites, site)
+		}
+	}
+	sort.Slice(lateSites, func(i, j int) bool { return lateSites[i].Bytes > lateSites[j].Bytes })
+
+	s.addHeaderRow("Allocation Site", "File:Line", "Freed Objs", "Freed Bytes", "Session Refs")
+	if len(lateSites) > 0 {
+		lateTotal := 0
+		lateBytes := 0
+		for _, site := range lateSites {
+			loc := firstFileLine(site.Func, site.Loc)
+			s.addRow(site.Func, loc, fmt.Sprint(site.Objs), fmt.Sprint(site.Bytes), site.Refs)
+			lateTotal += site.Objs
+			lateBytes += site.Bytes
+		}
+		s.addRow("Total", "", fmt.Sprint(lateTotal), fmt.Sprint(lateBytes), "")
+	} else {
+		s.addRow("(no late-alloc freed objects detected)")
+	}
+	return s
+}
+
+// buildLineXRefBothSheet creates the "Both Freed & Alive" cross-reference sheet.
+func buildLineXRefBothSheet(name string, freedByLine, aliveByLine map[string]*lineAgg, bothLines []string) *xlsxSheet {
+	s := &xlsxSheet{name: name, colWidths: make([]float64, 20)}
+	s.addRow("=== Alloc File:Line in Both Freed & Alive ===")
+	s.addHeaderRow("Alloc File:Line", "Freed Objs", "Freed Bytes", "Alive Objs", "Alive Bytes", "#Stacks", "Call Stacks")
+	if len(bothLines) == 0 {
+		s.addRow("(none)")
+	} else {
+		for _, loc := range bothLines {
+			fa := freedByLine[loc]
+			aa := aliveByLine[loc]
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			for f := range aa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
+			s.addRow(loc, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+				fmt.Sprint(aa.AliveObjs), fmt.Sprint(aa.AliveBytes),
+				fmt.Sprint(len(funcs)), fnStr)
+		}
+	}
+	return s
+}
+
+// buildLineXRefOnlySheet creates the "Only in Freed" cross-reference sheet.
+func buildLineXRefOnlySheet(name string, freedByLine map[string]*lineAgg, onlyLines []string) *xlsxSheet {
+	s := &xlsxSheet{name: name, colWidths: make([]float64, 20)}
+	s.addRow("=== Alloc File:Line Only in Freed (fully dead) ===")
+	s.addHeaderRow("Alloc File:Line", "Type", "Freed Objs", "Freed Bytes", "#Stacks", "Call Stacks")
+	if len(onlyLines) == 0 {
+		s.addRow("(none)")
+	} else {
+		for _, loc := range onlyLines {
+			fa := freedByLine[loc]
+			types := make([]string, 0, len(fa.Types))
+			for t := range fa.Types { types = append(types, t) }
+			sort.Strings(types)
+			typeStr := strings.Join(types, "; ")
+			funcs := make([]string, 0, len(fa.Funcs))
+			for f := range fa.Funcs { funcs = append(funcs, f) }
+			sort.Strings(funcs)
+			fnStr := strings.Join(funcs, "; ")
+			if len(fnStr) > 10000 { fnStr = fnStr[:9997] + "..." }
+			s.addRow(loc, typeStr, fmt.Sprint(fa.FreedObjs), fmt.Sprint(fa.FreedBytes),
+				fmt.Sprint(len(funcs)), fnStr)
+		}
+	}
+	return s
+}
+
+func checkMatch(a, b int) string {
+	if a == b {
+		return "✓"
+	}
+	return fmt.Sprintf("✗ diff=%d", a-b)
 }
 
 func shortLoc(loc string) string {
@@ -1194,7 +1396,9 @@ func main() {
 	builder := xlsxBuilder{}
 	builder.sheets = append(builder.sheets, *buildOverviewSheet(allData))
 	for _, d := range allData {
-		builder.sheets = append(builder.sheets, *buildModeSheet(d))
+		for _, s := range buildModeSheet(d) {
+			builder.sheets = append(builder.sheets, *s)
+		}
 	}
 
 	outPath := "gcdeadtrace_report_lifecycle.xlsx"
