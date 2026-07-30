@@ -1695,7 +1695,9 @@ func gcDeadTracePrint() {
 			if s.droppedAliveFrees > 0 {
 				appendStr(" [+")
 				appendUintptr(s.droppedAliveFrees)
-				appendStr(" objs from other sessions]")
+				appendStr(" objs, ")
+				appendUintptr(s.droppedAliveFreeBytes)
+				appendStr(" bytes from other sessions]")
 			}
 			appendStr("\n")
 		}
@@ -1803,7 +1805,9 @@ func gcDeadTracePrint() {
 				if s.droppedAllocFrees > 0 {
 					appendStr(" [+")
 					appendUintptr(s.droppedAllocFrees)
-					appendStr(" objs from other sessions]")
+					appendStr(" objs, ")
+					appendUintptr(s.droppedAllocFreeBytes)
+					appendStr(" bytes from other sessions]")
 				}
 				appendStr("\n")
 			}
@@ -1899,7 +1903,9 @@ func gcDeadTracePrint() {
 			if s.droppedFrees > 0 {
 				appendStr(" [+")
 				appendUintptr(s.droppedFrees)
-				appendStr(" objs from other sessions]")
+				appendStr(" objs, ")
+				appendUintptr(s.droppedFreeBytes)
+				appendStr(" bytes from other sessions]")
 			}
 			appendStr("\n")
 		}

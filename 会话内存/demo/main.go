@@ -30,6 +30,7 @@ var (
 
 	// Sink variables for session-lifecycle test.
 	sessionLifecycleSink [][]byte
+	lateAllocSink        [][]byte
 )
 
 // Custom type definitions for gcdeadtrace type tracking demo.
@@ -575,6 +576,7 @@ func (w *WorkerActor) patternLargeOutput() {
 //   GC #1 freed  = objects allocated and freed within the session (short-lived)
 //   GC #1 alive  = session-lifetime objects (still referenced)
 //   GC #2 freed  = session-lifetime objects (died when session ended)
+//                   + late-alloc objects (allocated after GC #1, freed after end)
 //   GC #2 alive  = should be 0 (all session objects resolved)
 //
 // Per-site output for GC #2 freed section identifies the exact allocation sites
@@ -601,14 +603,22 @@ func (w *WorkerActor) patternSessionLifecycle() {
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 
-	// End session — session-lifetime objects' endPC is now set.
+	// Late-alloc: allocated after GC #1, before session end.
+	// These sites are NOT in GC #1's alive list → classified as Late-alloc Freed.
+	lateAllocSink = make([][]byte, 2)
+	lateAllocSink[0] = make([]byte, 2048) // site D, 2KB
+	lateAllocSink[1] = make([]byte, 4096) // site E, 4KB
+	atomic.AddInt64(&w.stats.SessionAllocs, 2)
+	atomic.AddInt64(&w.stats.SessionBytes, 2048+4096)
+
+	// End session — session-lifetime + late-alloc objects' endPC is now set.
 	runtime.GcDeadSessionEnd(lifecycleID)
 
 	// Drop session-lifetime refs so GC #2 frees them.
 	sessionLifecycleSink = nil
+	lateAllocSink = nil
 
-	// GC #2: session-lifetime objects now freed.
-	//        Per-site freed in this cycle = exactly the session-lifetime objects.
+	// GC #2: session-lifetime objects freed + late-alloc objects freed.
 	runtime.GC()
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 }
