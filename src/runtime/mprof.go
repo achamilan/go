@@ -1074,59 +1074,100 @@ func gcDeadTracePrint() {
 
 					r := &raw[ri]
 
-					// Add freed session attribution.
+					// Add freed session attribution, deduping by (session,
+					// goroutine): a session allocating the same type at the same
+					// site from the same goroutine may span multiple buckets
+					// (size classes); each bucket would otherwise consume a
+					// separate ref slot.
 					if freedThisCycle > 0 {
-						if r.numSessionRefs < len(r.sessionRefs) {
-							ns := r.numSessionRefs
-							r.sessionRefs[ns].sessionID = se.id
-							r.sessionRefs[ns].originalID = se.originalID
-							r.sessionRefs[ns].generation = se.generation
-							r.sessionRefs[ns].goid = br.goid
-							r.sessionRefs[ns].objs = freedThisCycle
-							r.sessionRefs[ns].bytes = freedThisCycleBytes
-							r.sessionRefs[ns].typeName = br.typeName
-							r.numSessionRefs++
-						} else {
-							// Session refs overflow: accumulate into overflow counters.
-							r.droppedFrees += freedThisCycle
-							r.droppedFreeBytes += freedThisCycleBytes
+						merged := false
+						for ns := 0; ns < r.numSessionRefs; ns++ {
+							if r.sessionRefs[ns].sessionID == se.id && r.sessionRefs[ns].goid == br.goid {
+								r.sessionRefs[ns].objs += freedThisCycle
+								r.sessionRefs[ns].bytes += freedThisCycleBytes
+								merged = true
+								break
+							}
+						}
+						if !merged {
+							if r.numSessionRefs < len(r.sessionRefs) {
+								ns := r.numSessionRefs
+								r.sessionRefs[ns].sessionID = se.id
+								r.sessionRefs[ns].originalID = se.originalID
+								r.sessionRefs[ns].generation = se.generation
+								r.sessionRefs[ns].goid = br.goid
+								r.sessionRefs[ns].objs = freedThisCycle
+								r.sessionRefs[ns].bytes = freedThisCycleBytes
+								r.sessionRefs[ns].typeName = br.typeName
+								r.numSessionRefs++
+							} else {
+								// Session refs overflow: accumulate into overflow counters.
+								r.droppedFrees += freedThisCycle
+								r.droppedFreeBytes += freedThisCycleBytes
+							}
 						}
 					}
 
-					// Add alive session attribution.
+					// Add alive session attribution, deduping by (session,
+					// goroutine) as above.
 					if aliveObjs > 0 {
-						if r.numAliveSessionRefs < len(r.aliveSessionRefs) {
-							ns := r.numAliveSessionRefs
-							r.aliveSessionRefs[ns].sessionID = se.id
-							r.aliveSessionRefs[ns].originalID = se.originalID
-							r.aliveSessionRefs[ns].generation = se.generation
-							r.aliveSessionRefs[ns].goid = br.goid
-							r.aliveSessionRefs[ns].objs = aliveObjs
-							r.aliveSessionRefs[ns].bytes = aliveBytes
-							r.aliveSessionRefs[ns].typeName = br.typeName
-							r.numAliveSessionRefs++
-						} else {
-							// Session refs overflow: accumulate into overflow counters.
-							r.droppedAliveFrees += aliveObjs
-							r.droppedAliveFreeBytes += aliveBytes
+						merged := false
+						for ns := 0; ns < r.numAliveSessionRefs; ns++ {
+							if r.aliveSessionRefs[ns].sessionID == se.id && r.aliveSessionRefs[ns].goid == br.goid {
+								r.aliveSessionRefs[ns].objs += aliveObjs
+								r.aliveSessionRefs[ns].bytes += aliveBytes
+								merged = true
+								break
+							}
+						}
+						if !merged {
+							if r.numAliveSessionRefs < len(r.aliveSessionRefs) {
+								ns := r.numAliveSessionRefs
+								r.aliveSessionRefs[ns].sessionID = se.id
+								r.aliveSessionRefs[ns].originalID = se.originalID
+								r.aliveSessionRefs[ns].generation = se.generation
+								r.aliveSessionRefs[ns].goid = br.goid
+								r.aliveSessionRefs[ns].objs = aliveObjs
+								r.aliveSessionRefs[ns].bytes = aliveBytes
+								r.aliveSessionRefs[ns].typeName = br.typeName
+								r.numAliveSessionRefs++
+							} else {
+								// Session refs overflow: accumulate into overflow counters.
+								r.droppedAliveFrees += aliveObjs
+								r.droppedAliveFreeBytes += aliveBytes
+							}
 						}
 					}
 
-					// Add alloc session attribution (cumulative).
+					// Add alloc session attribution (cumulative), deduping by
+					// (session, goroutine) as above.
 					// br.frees is the total alloc count for this (session, bucket).
-					if r.numAllocSessionRefs < len(r.allocSessionRefs) {
-						ns := r.numAllocSessionRefs
-						r.allocSessionRefs[ns].sessionID = se.id
-						r.allocSessionRefs[ns].originalID = se.originalID
-						r.allocSessionRefs[ns].generation = se.generation
-						r.allocSessionRefs[ns].goid = br.goid
-						r.allocSessionRefs[ns].objs = br.frees
-						r.allocSessionRefs[ns].bytes = br.bytes
-						r.allocSessionRefs[ns].typeName = br.typeName
-						r.numAllocSessionRefs++
-					} else {
-						r.droppedAllocFrees += br.frees
-						r.droppedAllocFreeBytes += br.bytes
+					if br.frees > 0 {
+						merged := false
+						for ns := 0; ns < r.numAllocSessionRefs; ns++ {
+							if r.allocSessionRefs[ns].sessionID == se.id && r.allocSessionRefs[ns].goid == br.goid {
+								r.allocSessionRefs[ns].objs += br.frees
+								r.allocSessionRefs[ns].bytes += br.bytes
+								merged = true
+								break
+							}
+						}
+						if !merged {
+							if r.numAllocSessionRefs < len(r.allocSessionRefs) {
+								ns := r.numAllocSessionRefs
+								r.allocSessionRefs[ns].sessionID = se.id
+								r.allocSessionRefs[ns].originalID = se.originalID
+								r.allocSessionRefs[ns].generation = se.generation
+								r.allocSessionRefs[ns].goid = br.goid
+								r.allocSessionRefs[ns].objs = br.frees
+								r.allocSessionRefs[ns].bytes = br.bytes
+								r.allocSessionRefs[ns].typeName = br.typeName
+								r.numAllocSessionRefs++
+							} else {
+								r.droppedAllocFrees += br.frees
+								r.droppedAllocFreeBytes += br.bytes
+							}
+						}
 					}
 					found = true
 					break
@@ -1451,10 +1492,16 @@ func gcDeadTracePrint() {
 		if e.id == 0 {
 			continue
 		}
-		allocs := atomic.Loaduintptr(&e.allocs)
-		allocBytes := atomic.Loaduintptr(&e.allocBytes)
-		frees := atomic.Loaduintptr(&e.frees)
-		freeBytes := atomic.Loaduintptr(&e.freeBytes)
+		// Read-and-clear per-cycle counters atomically (Xchg). A plain
+		// Load here raced with the reset Store at the end of this pass:
+		// a concurrent gcDeadRecordFree/mProf_Malloc increment landing
+		// between the two was silently wiped from the per-cycle counters
+		// while the cumulative counters kept it, making the alive summary
+		// (cumAllocs-cumFrees) diverge from the per-session lines.
+		allocs := atomic.Xchguintptr(&e.allocs, 0)
+		allocBytes := atomic.Xchguintptr(&e.allocBytes, 0)
+		frees := atomic.Xchguintptr(&e.frees, 0)
+		freeBytes := atomic.Xchguintptr(&e.freeBytes, 0)
 		cumAllocs := atomic.Loaduintptr(&e.cumAllocs)
 		cumAllocBytes := atomic.Loaduintptr(&e.cumAllocBytes)
 		cumFrees := atomic.Loaduintptr(&e.cumFrees)
@@ -1543,10 +1590,10 @@ func gcDeadTracePrint() {
 				if gs.goid == 0 {
 					continue
 				}
-				ga := atomic.Loaduintptr(&gs.allocs)
-				gab := atomic.Loaduintptr(&gs.allocBytes)
-				gf := atomic.Loaduintptr(&gs.frees)
-				gfb := atomic.Loaduintptr(&gs.freeBytes)
+				ga := atomic.Xchguintptr(&gs.allocs, 0)
+				gab := atomic.Xchguintptr(&gs.allocBytes, 0)
+				gf := atomic.Xchguintptr(&gs.frees, 0)
+				gfb := atomic.Xchguintptr(&gs.freeBytes, 0)
 				if ga == 0 && gf == 0 {
 					continue
 				}
@@ -1568,22 +1615,18 @@ func gcDeadTracePrint() {
 			appendStr("\n")
 		}
 
-		// Reset per-cycle counters; keep cumulative counters.
+		// Session-level per-cycle counters were already read-and-cleared
+		// via Xchg above. Clear per-goroutine per-cycle counters that the
+		// print path did not cover (session not printed, or gs entries
+		// skipped). Use Xchg so concurrent increments are never wiped.
 		if allocs > 0 || frees > 0 {
-			atomic.Storeuintptr(&e.allocs, 0)
-			atomic.Storeuintptr(&e.allocBytes, 0)
-			atomic.Storeuintptr(&e.frees, 0)
-			atomic.Storeuintptr(&e.freeBytes, 0)
-			// Also reset per-cycle per-goroutine counters so that the
-			// goroutine-level allocs/frees match the session-level
-			// allocs/frees (both are per-cycle, not cumulative).
 			for j := range e.goroutineStats {
 				gs := &e.goroutineStats[j]
 				if gs.goid != 0 {
-					atomic.Storeuintptr(&gs.allocs, 0)
-					atomic.Storeuintptr(&gs.allocBytes, 0)
-					atomic.Storeuintptr(&gs.frees, 0)
-					atomic.Storeuintptr(&gs.freeBytes, 0)
+					atomic.Xchguintptr(&gs.allocs, 0)
+					atomic.Xchguintptr(&gs.allocBytes, 0)
+					atomic.Xchguintptr(&gs.frees, 0)
+					atomic.Xchguintptr(&gs.freeBytes, 0)
 				}
 			}
 		}

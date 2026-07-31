@@ -45,6 +45,13 @@ type SessionEntry struct {
 	Frees, FreeBytes                int
 	Alive, AliveBytes               int
 	Start, End                      string
+	GidBreakdown                    []GidEntry
+}
+
+type GidEntry struct {
+	GID                int
+	Allocs, AllocBytes int
+	Frees, FreeBytes   int
 }
 
 type FreedAlive struct {
@@ -68,6 +75,10 @@ type GCBlock struct {
 type ParsedData struct {
 	Mode    string
 	GCCycles []GCBlock
+	// RunStart holds GCCycles indices where a new run begins, detected when
+	// the GC number resets (e.g. process restarted with output appended to
+	// the same file). Empty means the file contains a single run.
+	RunStart []int
 }
 
 // ── parsing ────────────────────────────────────────────────────────
@@ -83,6 +94,7 @@ var (
 	aliveSumRe = regexp.MustCompile(`gcdeadsession:alive:\s*(\d+) session objs \((\d+) bytes\) still alive from (\d+) sites`)
 	gcHeaderRe = regexp.MustCompile(`=== GC #(\d+) ===`)
 	siteLineRe = regexp.MustCompile(`\s+(.+) \((\S+:\d+)\).*:\s*(\d+) session objs, (\d+) session bytes\s+(.*)`)
+	gidBreakRe = regexp.MustCompile(`\s+gid=(\d+):\s*(\d+) allocs \((\d+) bytes\),\s*(\d+) freed \((\d+) bytes\)`)
 )
 
 func parseInt(s string) int {
@@ -120,10 +132,16 @@ func parseFile(path string) *ParsedData {
 	for i < len(lines) && !gcHeaderRe.MatchString(lines[i]) {
 		i++
 	}
+	prevGC := -1
 	for i < len(lines) {
 		m := gcHeaderRe.FindStringSubmatch(lines[i])
 		if m == nil { i++; continue }
 		gcNum := parseInt(m[1])
+		// GC number going backwards means a new run was appended to the file.
+		if prevGC >= 0 && gcNum < prevGC {
+			data.RunStart = append(data.RunStart, len(data.GCCycles))
+		}
+		prevGC = gcNum
 		i++
 		block := GCBlock{GC: gcNum}
 		for i < len(lines) && !gcHeaderRe.MatchString(lines[i]) {
@@ -150,7 +168,21 @@ func parseFile(path string) *ParsedData {
 					}
 				}
 				block.Sessions = append(block.Sessions, se)
-				i++; continue
+				i++
+				// Parse subsequent gid breakdown lines
+				for i < len(lines) {
+					if gm := gidBreakRe.FindStringSubmatch(lines[i]); gm != nil {
+						se.GidBreakdown = append(se.GidBreakdown, GidEntry{
+							GID: parseInt(gm[1]), Allocs: parseInt(gm[2]),
+							AllocBytes: parseInt(gm[3]), Frees: parseInt(gm[4]),
+							FreeBytes: parseInt(gm[5]),
+						})
+						i++
+						continue
+					}
+					break
+				}
+				continue
 			}
 			if fm := freedSumRe.FindStringSubmatch(line); fm != nil {
 				block.Freed = &FreedAlive{Objs: parseInt(fm[1]), Bytes: parseInt(fm[2]), Sites: parseInt(fm[3])}
@@ -467,15 +499,18 @@ type LifecycleAnalysis struct {
 	SessionID int
 	EndLoc    string
 
-	// Before-end GC: short-lived freed + session-lifetime alive.
+	// End-triggered GC (first end-marked appearance): the session's final
+	// in-session snapshot. Short-lived = all frees up to and including it;
+	// session-lifetime candidates = its alive set.
 	BeforeEndGC      int
-	ShortLivedFreed  []SiteLine // freed in before-end GC
-	SessionLifetimeAlive []SiteLine // alive in before-end GC
+	ShortLivedFreed  []SiteLine // all frees ≤ end-triggered GC (aggregated)
+	SessionLifetimeAlive []SiteLine // alive at the end-triggered GC
 
-	// After-end GC: session-lifetime objects freed.
+	// Post-session: all frees after the end-triggered GC (aggregated);
+	// Runtime-Persistent baseline = alive at the final GC.
 	AfterEndGC           int
-	SessionLifetimeFreed []SiteLine // freed in after-end GC
-	FinalAlive           []SiteLine // alive in after-end GC (Runtime-Persistent baseline)
+	SessionLifetimeFreed []SiteLine // all frees > end-triggered GC (aggregated)
+	FinalAlive           []SiteLine // alive at the final GC (Runtime-Persistent baseline)
 
 	// Cross-reference: alive sites that were also freed after end = session-lifetime objects.
 	MatchedSites  []SiteMatch
@@ -578,43 +613,65 @@ func filterSitesBySession(sites []SiteLine, sessionID int) []SiteLine {
 
 // analyzeLifecycle performs the GC orchestration analysis for a given session ID.
 // Returns nil if no lifecycle pattern is detected for the session.
-func analyzeLifecycle(gcs []GCBlock, sessionID int) *LifecycleAnalysis {
+//
+// GC semantics: the FIRST GC where the session appears WITH an end marker is
+// the end-triggered GC (GcDeadSessionEnd forces a runtime.GC) — its state is
+// the session's final in-session snapshot (会话中/结束点). The SECOND
+// end-marked appearance is the first post-session GC (会话结束), where
+// session-lifetime objects start decaying.
+func analyzeLifecycle(gcs []GCBlock, sessionID int, runStart []int) *LifecycleAnalysis {
 	var la LifecycleAnalysis
 	la.SessionID = sessionID
 
-	// Phase 1: Locate the "before end" GC (first GC where session appears without end marker).
-	var beforeEndIdx int = -1
-	var afterEndIdx int = -1
-
+	// Locate the end-triggered GC (first appearance with end marker).
+	endIdx := -1
 	for gi, gc := range gcs {
 		for _, se := range gc.Sessions {
-			if se.ID == sessionID {
-				if se.End == "" && beforeEndIdx < 0 {
-					beforeEndIdx = gi
-				}
-				if se.End != "" {
+			if se.ID == sessionID && se.End != "" {
+				if endIdx < 0 {
+					endIdx = gi
 					la.EndLoc = se.End
-					// After end: first GC with session end AND freed > 0.
-					if afterEndIdx < 0 && se.Frees > 0 && gi != beforeEndIdx {
-						afterEndIdx = gi
-					}
 				}
 			}
 		}
 	}
-
-	if beforeEndIdx < 0 {
-		return nil // no lifecycle pattern detected
+	if endIdx < 0 {
+		return nil // no end marker — session still running or no lifecycle pattern
 	}
 
-	la.BeforeEndGC = gcs[beforeEndIdx].GC
-	la.ShortLivedFreed = filterSitesBySession(gcs[beforeEndIdx].FreedSites, sessionID)
-	la.SessionLifetimeAlive = filterSitesBySession(gcs[beforeEndIdx].AliveSites, sessionID)
+	// Bound analysis to the session's own run (a file may hold multiple
+	// concatenated runs; other runs contain no data for this session).
+	runBegin, runEnd := 0, len(gcs)
+	for _, rs := range runStart {
+		if rs <= endIdx {
+			runBegin = rs
+		} else {
+			runEnd = rs
+			break
+		}
+	}
 
-	if afterEndIdx >= 0 {
-		la.AfterEndGC = gcs[afterEndIdx].GC
-		la.SessionLifetimeFreed = filterSitesBySession(gcs[afterEndIdx].FreedSites, sessionID)
-		la.FinalAlive = filterSitesBySession(gcs[afterEndIdx].AliveSites, sessionID)
+	la.BeforeEndGC = gcs[endIdx].GC
+	// Short-lived: all frees up to and including the end GC (aggregated per site).
+	for gi := runBegin; gi <= endIdx; gi++ {
+		la.ShortLivedFreed = append(la.ShortLivedFreed, filterSitesBySession(gcs[gi].FreedSites, sessionID)...)
+	}
+	// Session-lifetime candidates: alive at the end GC.
+	la.SessionLifetimeAlive = filterSitesBySession(gcs[endIdx].AliveSites, sessionID)
+	// Post-session frees: all frees after the end GC within this run (aggregated per site).
+	for gi := endIdx + 1; gi < runEnd; gi++ {
+		la.SessionLifetimeFreed = append(la.SessionLifetimeFreed, filterSitesBySession(gcs[gi].FreedSites, sessionID)...)
+	}
+	// After-end GC (display): the next GC after the end-triggered one.
+	if endIdx+1 < runEnd {
+		la.AfterEndGC = gcs[endIdx+1].GC
+	}
+	// Runtime-Persistent baseline: alive at this run's final GC with alive data.
+	for gi := runEnd - 1; gi >= runBegin; gi-- {
+		if len(gcs[gi].AliveSites) > 0 {
+			la.FinalAlive = filterSitesBySession(gcs[gi].AliveSites, sessionID)
+			break
+		}
 	}
 
 	// Cross-reference: session-lifetime alive sites (from before-end GC) vs freed after end.
@@ -672,34 +729,35 @@ func analyzeLifecycle(gcs []GCBlock, sessionID int) *LifecycleAnalysis {
 	return &la
 }
 
-// sessGCInfo tracks before-end and after-end GC indices for a session.
+// sessGCInfo tracks end-marker appearances for lifecycle detection.
 type sessGCInfo struct {
-	beforeEnd int
-	afterEnd  int
+	sawNoEnd bool // session seen without end marker (in-session phase visible)
+	endCount int  // appearances with end marker
 }
 
-// findLifecycleSessions finds all session IDs that have the lifecycle pattern
-// (appear in >=2 GC cycles with before-end + after-end GCs).
+// findLifecycleSessions finds session IDs with the lifecycle pattern:
+// a visible in-session phase (>=1 appearance without end) and >=2
+// end-marked appearances (first = end-triggered GC snapshot, second =
+// first post-session GC).
 func findLifecycleSessions(gcs []GCBlock) []int {
 	info := make(map[int]*sessGCInfo)
-	for gi, gc := range gcs {
+	for _, gc := range gcs {
 		for _, se := range gc.Sessions {
 			si := info[se.ID]
 			if si == nil {
-				si = &sessGCInfo{beforeEnd: -1, afterEnd: -1}
+				si = &sessGCInfo{}
 				info[se.ID] = si
 			}
-			if se.End == "" && si.beforeEnd < 0 {
-				si.beforeEnd = gi
-			}
-			if se.End != "" && si.afterEnd < 0 && se.Frees > 0 && gi != si.beforeEnd {
-				si.afterEnd = gi
+			if se.End == "" {
+				si.sawNoEnd = true
+			} else {
+				si.endCount++
 			}
 		}
 	}
 	var result []int
 	for id, si := range info {
-		if si.beforeEnd >= 0 && si.afterEnd >= 0 {
+		if si.sawNoEnd && si.endCount >= 2 {
 			result = append(result, id)
 		}
 	}
@@ -710,7 +768,7 @@ func findLifecycleSessions(gcs []GCBlock) []int {
 // aggregateLifecycles detects all lifecycle sessions and aggregates their
 // per-site data into a single AggLifecycle. Returns nil if no lifecycle
 // sessions are found.
-func aggregateLifecycles(gcs []GCBlock) *AggLifecycle {
+func aggregateLifecycles(gcs []GCBlock, runStart []int) *AggLifecycle {
 	sessions := findLifecycleSessions(gcs)
 	if len(sessions) == 0 {
 		return nil
@@ -726,7 +784,7 @@ func aggregateLifecycles(gcs []GCBlock) *AggLifecycle {
 	}
 
 	for _, sid := range sessions {
-		la := analyzeLifecycle(gcs, sid)
+		la := analyzeLifecycle(gcs, sid, runStart)
 		if la == nil {
 			continue
 		}
@@ -825,6 +883,12 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 	var extraSheets []*xlsxSheet
 	gcs := data.GCCycles
 
+	// Run boundaries: a GC-number reset (e.g. process restart appended to the
+	// same file) starts a new run. Alive is per-run final state, summed across
+	// runs; freed/alloc are additive across everything.
+	rb := append([]int{0}, data.RunStart...)
+	rb = append(rb, len(gcs))
+
 	tf := 0
 	tfBytes := 0
 	for _, gc := range gcs {
@@ -832,11 +896,13 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 	}
 	ta := 0
 	taBytes := 0
-	for i := len(gcs) - 1; i >= 0; i-- {
-		if gcs[i].Alive != nil {
-			ta = gcs[i].Alive.Objs
-			taBytes = gcs[i].Alive.Bytes
-			break
+	for r := 0; r+1 < len(rb); r++ {
+		for i := rb[r+1] - 1; i >= rb[r]; i-- {
+			if gcs[i].Alive != nil {
+				ta += gcs[i].Alive.Objs
+				taBytes += gcs[i].Alive.Bytes
+				break
+			}
 		}
 	}
 	sessSet := make(map[string]bool)
@@ -865,20 +931,24 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 	}
 	for _, si := range fSumMap { fSumObjs += si.TotalObjs; fSumBytes += si.TotalBytes }
 
-	// Alive site totals — use LAST GC cycle's snapshot (alive is NOT additive across cycles).
+	// Alive site totals — per-run final GC snapshot, summed across runs
+	// (alive is NOT additive across cycles within a run, but each run's
+	// final alive is an independent survivor set).
 	aSumObjs, aSumBytes := 0, 0
 	aSumMap := make(map[string]*sInfo)
-	for i := len(gcs) - 1; i >= 0; i-- {
-		if len(gcs[i].AliveSites) > 0 {
-			for _, site := range gcs[i].AliveSites {
-				key := site.Func + "|" + site.Loc
-				if _, ok := aSumMap[key]; !ok {
-					aSumMap[key] = &sInfo{Func: site.Func, Loc: site.Loc, TotalObjs: site.Objs, TotalBytes: site.Bytes, Refs: make(map[string]bool)}
+	for r := 0; r+1 < len(rb); r++ {
+		for i := rb[r+1] - 1; i >= rb[r]; i-- {
+			if len(gcs[i].AliveSites) > 0 {
+				for _, site := range gcs[i].AliveSites {
+					key := site.Func + "|" + site.Loc
+					si, ok := aSumMap[key]
+					if !ok { si = &sInfo{Func: site.Func, Loc: site.Loc, Refs: make(map[string]bool)}; aSumMap[key] = si }
+					si.TotalObjs += site.Objs; si.TotalBytes += site.Bytes
 					aSumObjs += site.Objs
 					aSumBytes += site.Bytes
 				}
+				break
 			}
-			break
 		}
 	}
 
@@ -967,13 +1037,41 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 			beFrees += sa.CumFrees; beFreeBytes += sa.CumFreeBytes
 		}
 	}
-	// sLastAlive: last GC's total alive (all sessions).
-	// beAlive: last GC's alive for before-end sessions only.
+	// Per-run stats: session allocs/frees are additive within a run; alive is
+	// the run's final GC summary. Unified alive = sum of per-run final alive.
+	type runStat struct {
+		firstGC, lastGC    int
+		allocs, allocBytes int
+		frees, freeBytes   int
+		alive, aliveBytes  int
+	}
+	var runs []runStat
+	for r := 0; r+1 < len(rb); r++ {
+		seg := gcs[rb[r]:rb[r+1]]
+		if len(seg) == 0 { continue }
+		rs := runStat{firstGC: seg[0].GC, lastGC: seg[len(seg)-1].GC}
+		for _, gc := range seg {
+			for _, se := range gc.Sessions {
+				rs.allocs += se.Allocs; rs.allocBytes += se.AllocBytes
+				rs.frees += se.Frees; rs.freeBytes += se.FreeBytes
+			}
+		}
+		for i := len(seg) - 1; i >= 0; i-- {
+			if seg[i].Alive != nil {
+				rs.alive = seg[i].Alive.Objs
+				rs.aliveBytes = seg[i].Alive.Bytes
+				break
+			}
+		}
+		runs = append(runs, rs)
+	}
+
+	// sLastAlive: unified alive = sum of each run's final-GC alive.
+	// beAlive: last GC's alive for before-end sessions only (final run).
 	sLastAlive, sLastAliveBytes := 0, 0
+	for _, rs := range runs { sLastAlive += rs.alive; sLastAliveBytes += rs.aliveBytes }
 	for i := len(gcs) - 1; i >= 0; i-- {
 		if gcs[i].Alive != nil {
-			sLastAlive = gcs[i].Alive.Objs
-			sLastAliveBytes = gcs[i].Alive.Bytes
 			for _, se := range gcs[i].Sessions {
 				sk := sessionKey(se.ID, se.Generation)
 				if beforeEndSessions[sk] {
@@ -986,7 +1084,7 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 	}
 
 	// Run lifecycle analysis early so Summary section can reference its data.
-	agg := aggregateLifecycles(gcs)
+	agg := aggregateLifecycles(gcs, data.RunStart)
 
 	// ── Write rows ──
 	s.addRow("Mode:", data.Mode)
@@ -1007,12 +1105,28 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 			fmt.Sprintf("%d (%.2f MB)", sFreeBytes, float64(sFreeBytes)/1024/1024),
 			fmt.Sprintf("%d (%.2f MB)", sLastAliveBytes, float64(sLastAliveBytes)/1024/1024)),
 		"", "")
+	// Per-run verification when the file holds multiple runs (GC reset).
+	if len(runs) > 1 {
+		s.addRow(fmt.Sprintf("检测到 %d 次运行 (GC 编号重置), 分运行验证:", len(runs)), "", "", "", "")
+		for i, rs := range runs {
+			rMark := "✓"
+			if rs.allocs != rs.frees+rs.alive || rs.allocBytes != rs.freeBytes+rs.aliveBytes {
+				rMark = fmt.Sprintf("✗ (diff: %d objs, %d bytes)", rs.allocs-rs.frees-rs.alive, rs.allocBytes-rs.freeBytes-rs.aliveBytes)
+			}
+			s.addRow(fmt.Sprintf("  Run %d (GC #%d-#%d): alloc==freed+alive", i+1, rs.firstGC, rs.lastGC),
+				fmt.Sprintf("%d == %d + %d  %s", rs.allocs, rs.frees, rs.alive, rMark),
+				fmt.Sprintf("%d == %d + %d  %s", rs.allocBytes, rs.freeBytes, rs.aliveBytes, rMark),
+				"", "")
+		}
+	}
 	// Session-level verification: allocs == frees + alive (session invariant).
 	sfMatch := "✓"
 	if sAllocs != sFrees+sLastAlive || sAllocBytes != sFreeBytes+sLastAliveBytes {
 		sfMatch = fmt.Sprintf("✗ (diff: %d objs, %d bytes)", sAllocs-sFrees-sLastAlive, sAllocBytes-sFreeBytes-sLastAliveBytes)
 	}
-	s.addRow("  └ 验证: alloc==freed+alive",
+	unifiedNote := ""
+	if len(runs) > 1 { unifiedNote = fmt.Sprintf(" (%d 次运行汇总)", len(runs)) }
+	s.addRow("  └ 验证: alloc==freed+alive"+unifiedNote,
 		fmt.Sprintf("%d == %d + %d  %s", sAllocs, sFrees, sLastAlive, sfMatch),
 		fmt.Sprintf("%d == %d + %d  %s", sAllocBytes, sFreeBytes, sLastAliveBytes, sfMatch),
 		"", "")
@@ -1082,19 +1196,19 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 		rpBytes = aSumBytes
 		rpLines = len(aSumMap)
 	}
-	s.addRow("短周期对象 (Freed Sites) → 独立 Sheet",
+	s.addRow("短周期对象 (Freed Sites, ≤结束GC) → 独立 Sheet",
 		fmt.Sprintf("%d lines, %d objs", shortLines, shortObjs),
 		fmt.Sprintf("%d (%.2f MB)", shortBytes, float64(shortBytes)/1024/1024),
 		"", "")
-	s.addRow("会话周期对象 (Freed Sites) → 独立 Sheet",
+	s.addRow("会话周期对象 (结束GC存活, 结束后释放) → 独立 Sheet",
 		fmt.Sprintf("%d lines, %d objs", sessLines, sessObjs),
 		fmt.Sprintf("%d (%.2f MB)", sessBytes, float64(sessBytes)/1024/1024),
 		"", "")
-	s.addRow("Late-alloc Freed (GC #1之后分配) → 独立 Sheet",
+	s.addRow("Late-alloc Freed (结束后释放但未匹配到结束点存活) → 独立 Sheet",
 		fmt.Sprintf("%d lines, %d objs", lateLines, lateObjs),
 		fmt.Sprintf("%d (%.2f MB)", lateBytes, float64(lateBytes)/1024/1024),
 		"", "")
-	s.addRow("Runtime-Persistent (Never Freed) → 独立 Sheet",
+	s.addRow("Runtime-Persistent (最终GC仍存活) → 独立 Sheet",
 		fmt.Sprintf("%d lines, %d objs", rpLines, rpObjs),
 		fmt.Sprintf("%d (%.2f MB)", rpBytes, float64(rpBytes)/1024/1024),
 		"", "")
@@ -1122,13 +1236,25 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 			}
 		}
 	}
+	// 未归属溢出: objects hidden in "[+N objs from other sessions]" overflow
+	// markers at multi-session hot sites (16 ref slots per site, filled by
+	// other sessions). filterSitesBySession cannot attribute these to the
+	// lifecycle session, so they fall out of all four categories.
+	unattr := checkAllocs - total
+	unattrBytes := checkAllocBytes - totalBytes
 	match := "✓"
-	if total != checkAllocs || totalBytes != checkAllocBytes {
-		match = fmt.Sprintf("✗ (diff: %d objs, %d bytes)", checkAllocs-total, checkAllocBytes-totalBytes)
+	if unattr != 0 || unattrBytes != 0 {
+		match = fmt.Sprintf("✗ (未归属: %d objs, %d bytes)", unattr, unattrBytes)
 	}
-	s.addRow("数据验证: 总分配==短周期+会话周期+LateAlloc+Runtime",
-		fmt.Sprintf("%d == %d + %d + %d + %d = %d  %s", checkAllocs, shortObjs, sessObjs, lateObjs, rpObjs, total, match),
-		fmt.Sprintf("%d == %d + %d + %d + %d = %d  %s", checkAllocBytes, shortBytes, sessBytes, lateBytes, rpBytes, totalBytes, match),
+	if unattr != 0 || unattrBytes != 0 {
+		s.addRow("  未归属溢出 (多session热点site的16槽ref溢出,无法按session归因)",
+			fmt.Sprintf("%d objs", unattr),
+			fmt.Sprintf("%d (%.2f MB)", unattrBytes, float64(unattrBytes)/1024/1024),
+			"", "")
+	}
+	s.addRow("数据验证: 总分配==短周期+会话周期+LateAlloc+Runtime+未归属溢出",
+		fmt.Sprintf("%d == %d + %d + %d + %d + %d = %d  %s", checkAllocs, shortObjs, sessObjs, lateObjs, rpObjs, unattr, total+unattr, match),
+		fmt.Sprintf("%d == %d + %d + %d + %d + %d = %d  %s", checkAllocBytes, shortBytes, sessBytes, lateBytes, rpBytes, unattrBytes, totalBytes+unattrBytes, match),
 		"", "")
 	s.addBlank()
 
@@ -1157,6 +1283,23 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 			fmt.Sprint(sa.CumAllocs), fmt.Sprint(sa.CumAllocBytes),
 			fmt.Sprint(sa.CumFrees), fmt.Sprint(sa.CumFreeBytes),
 			fmt.Sprint(sa.MaxAlive), fmt.Sprint(sa.MaxAliveBytes))
+	}
+
+	// Session GID Breakdown
+	s.addBlank()
+	s.addRow("=== Session GID Breakdown ===")
+	s.addHeaderRow("Session", "GC", "GID", "Allocs", "Alloc Bytes", "Frees", "Free Bytes")
+	for _, gc := range gcs {
+		for _, se := range gc.Sessions {
+			if len(se.GidBreakdown) > 0 {
+				sk := sessionKey(se.ID, se.Generation)
+				for _, ge := range se.GidBreakdown {
+					s.addRow(sessionDisplay(sk), fmt.Sprintf("GC#%d", gc.GC),
+						fmt.Sprint(ge.GID), fmt.Sprint(ge.Allocs), fmt.Sprint(ge.AllocBytes),
+						fmt.Sprint(ge.Frees), fmt.Sprint(ge.FreeBytes))
+				}
+			}
+		}
 	}
 
 	// Build freedMap and aliveMap site-attribution data (exported to independent sheets).
@@ -1241,7 +1384,8 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 			sidSummary += fmt.Sprintf(", ... (+%d more)", len(agg.Sessions)-10)
 		}
 		s.addRow("Lifecycle Sessions:", sidSummary)
-		s.addRow("Methodology: auto-detected sessions with before-end + after-end GC pattern.")
+		s.addRow("Methodology: auto-detected sessions with a visible in-session phase and >=2 end-marked GCs.")
+	s.addRow("  First end-marked GC = end-triggered GC (in-session snapshot); second = first post-session GC.")
 		s.addBlank()
 
 		// Aggregated lifecycle totals.
@@ -1259,16 +1403,16 @@ func buildModeSheet(data *ParsedData) []*xlsxSheet {
 		for _, si := range agg.NotFreed { nfTotal += si.TotalObjs; nfTotalBytes += si.TotalBytes }
 
 		s.addRow("=== Aggregated Lifecycle Summary ===")
-		s.addRow("Short-lived (freed before session end)",
+		s.addRow("Short-lived (freed ≤ end-triggered GC)",
 			fmt.Sprintf("%d objs, %d sites", shortTotal, len(agg.ShortLived)),
 			fmt.Sprintf("%d bytes", shortTotalBytes))
-		s.addRow("Session-lifetime (freed after session end)",
+		s.addRow("Session-lifetime (alive at end GC, freed after end)",
 			fmt.Sprintf("%d objs, %d sites", sessTotal, len(agg.SessLifetime)),
 			fmt.Sprintf("%d bytes", sessTotalBytes))
-		s.addRow("Late-alloc (allocated between GCs, freed after end)",
+		s.addRow("Late-alloc (freed after end, not in end-GC alive set)",
 			fmt.Sprintf("%d objs, %d sites", lateTotal, len(agg.LateAlloc)),
 			fmt.Sprintf("%d bytes", lateTotalBytes))
-		s.addRow("Runtime-persistent (never freed)",
+		s.addRow("Runtime-persistent (still alive at final GC)",
 			fmt.Sprintf("%d objs, %d sites", nfTotal, len(agg.NotFreed)),
 			fmt.Sprintf("%d bytes", nfTotalBytes))
 		s.addBlank()
@@ -1506,7 +1650,9 @@ func main() {
 			for _, gc := range data.GCCycles {
 				if len(gc.Sessions) > maxSess { maxSess = len(gc.Sessions) }
 			}
-			fmt.Printf("%d GC cycles, up to %d sessions/cycle\n", len(data.GCCycles), maxSess)
+			runNote := ""
+			if len(data.RunStart) > 0 { runNote = fmt.Sprintf(", %d runs (GC reset detected)", len(data.RunStart)+1) }
+			fmt.Printf("%d GC cycles%s, up to %d sessions/cycle\n", len(data.GCCycles), runNote, maxSess)
 		} else {
 			fmt.Println("0 GC cycles")
 		}
