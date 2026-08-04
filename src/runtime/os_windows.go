@@ -22,6 +22,7 @@ const (
 //go:cgo_import_dynamic runtime._CloseHandle CloseHandle%1 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateEventA CreateEventA%4 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateFileA CreateFileA%7 "kernel32.dll"
+//go:cgo_import_dynamic runtime._CreateFileW CreateFileW%7 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateIoCompletionPort CreateIoCompletionPort%4 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateThread CreateThread%6 "kernel32.dll"
 //go:cgo_import_dynamic runtime._CreateWaitableTimerA CreateWaitableTimerA%3 "kernel32.dll"
@@ -81,6 +82,7 @@ var (
 	_CloseHandle,
 	_CreateEventA,
 	_CreateFileA,
+	_CreateFileW,
 	_CreateIoCompletionPort,
 	_CreateThread,
 	_CreateWaitableTimerA,

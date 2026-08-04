@@ -36,24 +36,38 @@ const (
 // writeDeadTraceToFile appends the gcdeadtrace output to a file using Windows API.
 // Used for GODEBUG=gcdeadtracefile=<path>. Opens the file with FILE_APPEND_DATA
 // access and OPEN_ALWAYS disposition, so multiple GC cycles accumulate.
+//
+// Uses CreateFileW with a UTF-16 converted path so non-ASCII (e.g. Chinese)
+// directory names work; CreateFileA would mangle UTF-8 bytes as ANSI.
 func writeDeadTraceToFile(path string, buf []byte) {
 	if len(buf) == 0 {
 		return
 	}
 
-	// Convert Go string to null-terminated ANSI byte slice.
-	var nameBytes [_MAX_PATH]byte
-	plen := len(path)
-	if plen > _MAX_PATH-1 {
-		plen = _MAX_PATH - 1
+	// Convert Go string (UTF-8) to null-terminated UTF-16.
+	const surrLow = (surrogateMin + surrogateMax + 1) / 2 // 0xDC00
+	var nameUTF16 [_MAX_PATH]uint16
+	w := 0
+	for _, r := range path {
+		if w >= len(nameUTF16)-2 {
+			break // leave room for a surrogate pair + NUL
+		}
+		if r < 0x10000 {
+			nameUTF16[w] = uint16(r)
+			w++
+		} else {
+			r -= 0x10000
+			nameUTF16[w] = surrogateMin + uint16(r>>10)&0x3ff
+			nameUTF16[w+1] = surrLow + uint16(r)&0x3ff
+			w += 2
+		}
 	}
-	copy(nameBytes[:plen], path)
-	nameBytes[plen] = 0
+	nameUTF16[w] = 0
 
-	// CreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+	// CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
 	//             dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile)
-	handle := stdcall(_CreateFileA,
-		uintptr(unsafe.Pointer(&nameBytes[0])),
+	handle := stdcall(_CreateFileW,
+		uintptr(unsafe.Pointer(&nameUTF16[0])),
 		_FILE_APPEND_DATA,
 		_FILE_SHARE_READ|_FILE_SHARE_WRITE,
 		0, // lpSecurityAttributes (NULL)

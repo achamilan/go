@@ -6,7 +6,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +33,11 @@ var (
 	// Sink variables for session-lifecycle test.
 	sessionLifecycleSink [][]byte
 	lateAllocSink        [][]byte
+
+	// Sink variables for gcdeadwindow demo.
+	winChurnSink []byte
+	winLiveSink  [][]byte
+	winBurstSink [][]byte
 )
 
 // Custom type definitions for gcdeadtrace type tracking demo.
@@ -623,6 +630,141 @@ func (w *WorkerActor) patternSessionLifecycle() {
 	atomic.AddInt64(&w.stats.GCCycles, 1)
 }
 
+// ============================================================
+// gcdeadwindow Demo
+// ============================================================
+//
+// gcdeadwindow is interval-based capture: no sessions, no goroutine
+// attribution. GcDeadWindowStart(seconds, path) records every allocation
+// until the window ends; each GC prints a per-site report with the cycle's
+// alloc/freed deltas and the window's cumulative alive (the internal
+// per-GC "stop + start").
+
+// Distinct allocation sites for the gcdeadwindow demo.
+//
+//go:noinline
+func winSiteChurn() []byte { return make([]byte, 256) }
+
+//go:noinline
+func winSiteLive() []byte { return make([]byte, 512) }
+
+//go:noinline
+func winSiteBurst() []byte { return make([]byte, 1024) }
+
+// runGcDeadWindowDemo runs two capture windows back to back:
+//
+//	Window gen=1 (explicit stop): phased workload with three runtime.GC()
+//	calls — dead churn, a growing live set, and a dropped burst — showing
+//	per-cycle alloc/freed deltas and cumulative alive per site.
+//
+//	Window gen=2 (auto-stop): started with a 2-second limit while the
+//	workload runs for ~3s, showing the window ending by itself.
+//
+// Reports are appended to outputPath (no GODEBUG required).
+func runGcDeadWindowDemo(outputPath string) {
+	if dir := filepath.Dir(outputPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("gcdeadwindow: cannot create output dir: %v", err)
+		}
+	}
+	// Start each run with a fresh log file.
+	os.Remove(outputPath)
+
+	fmt.Printf("[gcdeadwindow] writing reports to %s\n\n", outputPath)
+
+	// ---- Window gen=1: explicit stop, phased workload ----
+	fmt.Println("[gen=1] GcDeadWindowStart(0, path) — explicit stop")
+	runtime.GcDeadWindowStart(0, outputPath)
+
+	// Phase 1: 500 dead churn allocs + 200 live allocs, then GC.
+	for i := 0; i < 500; i++ {
+		winChurnSink = winSiteChurn()
+	}
+	winLiveSink = make([][]byte, 200)
+	for i := range winLiveSink {
+		winLiveSink[i] = winSiteLive()
+	}
+	winChurnSink = nil
+	runtime.GC()
+	fmt.Println("[gen=1] phase 1: 500 churn (die) + 200 live (kept) -> GC")
+
+	// Phase 2: 300 churn + 100 burst (kept), then GC.
+	for i := 0; i < 300; i++ {
+		winChurnSink = winSiteChurn()
+	}
+	winBurstSink = make([][]byte, 100)
+	for i := range winBurstSink {
+		winBurstSink[i] = winSiteBurst()
+	}
+	winChurnSink = nil
+	runtime.GC()
+	fmt.Println("[gen=1] phase 2: 300 churn (die) + 100 burst (kept) -> GC")
+
+	// Phase 3: drop the burst, more churn, then GC.
+	winBurstSink = nil
+	for i := 0; i < 200; i++ {
+		winChurnSink = winSiteChurn()
+	}
+	winChurnSink = nil
+	runtime.GC()
+	fmt.Println("[gen=1] phase 3: burst dropped + 200 churn -> GC")
+
+	runtime.GcDeadWindowStop()
+	fmt.Println("[gen=1] GcDeadWindowStop — final report (alive = the 200 live allocs only)")
+	fmt.Println()
+
+	// ---- Window gen=2: auto-stop after 2 seconds ----
+	fmt.Println("[gen=2] GcDeadWindowStart(2, path) — auto-stop after 2s")
+	runtime.GcDeadWindowStart(2, outputPath)
+	start := time.Now()
+	for time.Since(start) < 3*time.Second {
+		for i := 0; i < 100; i++ {
+			winChurnSink = winSiteChurn()
+		}
+		winChurnSink = nil
+		runtime.GC() // one report per iteration, before the 2s deadline
+		time.Sleep(200 * time.Millisecond)
+	}
+	runtime.GcDeadWindowStop() // no-op if the timer already fired
+	fmt.Println("[gen=2] workload ran 3s — window auto-stopped at ~2s")
+	fmt.Println()
+
+	// Keep live refs reachable until all windows are done.
+	runtime.KeepAlive(winLiveSink)
+
+	// ---- Verification summary ----
+	data, err := os.ReadFile(outputPath)
+	if err != nil {
+		log.Fatalf("gcdeadwindow: cannot read output file: %v", err)
+	}
+	content := string(data)
+	checks := []struct {
+		name string
+		pass bool
+	}{
+		{"gen=1 started", strings.Contains(content, "gcdeadwindow gen=1")},
+		{"gen=2 started", strings.Contains(content, "gcdeadwindow gen=2")},
+		{"alive sections", strings.Contains(content, "gcdeadwindow:alive:")},
+		{"alloc sections", strings.Contains(content, "gcdeadwindow:alloc:")},
+		{"freed sections", strings.Contains(content, "gcdeadwindow:freed:")},
+		{"churn site reported", strings.Contains(content, "winSiteChurn")},
+		{"live site reported", strings.Contains(content, "winSiteLive")},
+		{"burst site reported", strings.Contains(content, "winSiteBurst")},
+	}
+	fmt.Println("==============================================")
+	fmt.Println("  gcdeadwindow Verification Summary")
+	fmt.Println("==============================================")
+	for _, c := range checks {
+		mark := "PASS"
+		if !c.pass {
+			mark = "FAIL"
+		}
+		fmt.Printf("  [%s] %s\n", mark, c.name)
+	}
+	fmt.Printf("  Output: %s (%d bytes)\n", outputPath, len(data))
+	fmt.Println("==============================================")
+}
+
 // patternFullyDead: TestGcDeadTraceFullyDead-like — per-site fully dead detection.
 // Uses a unique session ID per burst so each burst is independently tracked.
 func (w *WorkerActor) patternFullyDead() {
@@ -1030,7 +1172,8 @@ func checksum(blocks [][]byte) uint64 {
 
 func main() {
 	duration := flag.Duration("duration", 10*time.Second, "total run duration")
-	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse, concurrentgrowth, sessionrefoverflow, largeoutput")
+	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle, gcdeadwindow")
+	windowFile := flag.String("windowfile", "output/gcdeadwindow_demo.log", "gcdeadwindow report file (mode=gcdeadwindow)")
 	flag.Parse()
 
 	fmt.Println("========================================")
@@ -1057,6 +1200,13 @@ func main() {
 		fmt.Println("    worker-sessionlifecycle   — GC orchestration: isolate session-lifetime objects")
 		fmt.Println("  (gcdeadtrace session output appears on stderr via GODEBUG=gcdeadtrace=1)")
 		fmt.Println()
+	}
+
+	// gcdeadwindow mode is self-contained (global capture, no actors).
+	if *mode == "gcdeadwindow" {
+		runGcDeadWindowDemo(*windowFile)
+		fmt.Println("Demo finished.")
+		return
 	}
 
 	// Build the actor system.
@@ -1101,7 +1251,7 @@ func main() {
 	case "sessionlifecycle":
 		_ = system.AddWorker("worker-sessionlifecycle", PatternSessionLifecycle)
 	default:
-		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle)", *mode)
+		log.Fatalf("unknown mode: %s (valid: all, loop, mixed, session, fullydead, concurrent, customtypes, reprint, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle, gcdeadwindow)", *mode)
 	}
 
 	// Start all actors.

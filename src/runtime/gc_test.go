@@ -290,6 +290,57 @@ func TestGcDeadTraceComplex(t *testing.T) {
 	t.Logf("found %d allocation sites", siteCount)
 }
 
+func TestGcDeadWindowBasic(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadWindowBasic")
+
+	if !strings.Contains(got, "gcdeadwindow gen=1") {
+		t.Fatalf("expected gcdeadwindow gen=1 output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadwindow:alive:") {
+		t.Fatalf("expected gcdeadwindow:alive output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadwindow:alloc:") {
+		t.Fatalf("expected gcdeadwindow:alloc output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadwindow:freed:") {
+		t.Fatalf("expected gcdeadwindow:freed output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "window gen=1 ended") {
+		t.Fatalf("expected window end message, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+}
+
+func TestGcDeadWindowDuration(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadWindowDuration")
+
+	if !strings.Contains(got, "window gen=1 started") {
+		t.Fatalf("expected window start message, got:\n%s", got)
+	}
+	if !strings.Contains(got, "window gen=1 ended") {
+		t.Fatalf("expected automatic window end message, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+}
+
+func TestGcDeadWindowSessionMutex(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadWindowSessionMutex", "GODEBUG=gcdeadtrace=1")
+
+	if !strings.Contains(got, "GcDeadWindowStart skipped: gcdeadtrace session active") {
+		t.Fatalf("expected window start refusal while session active, got:\n%s", got)
+	}
+	if !strings.Contains(got, "GcDeadSessionStart(901) skipped: gcdeadwindow active") {
+		t.Fatalf("expected session start refusal while window active, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+}
+
 func TestGcDeadTraceSession(t *testing.T) {
 	got := runTestProg(t, "testprog", "GCDeadTraceSession", "GODEBUG=gcdeadtrace=1")
 

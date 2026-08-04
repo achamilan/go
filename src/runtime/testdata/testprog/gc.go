@@ -42,6 +42,9 @@ func init() {
 	register("GCDeadTraceSessionRefOverflow", GCDeadTraceSessionRefOverflow)
 	register("GCDeadTraceLargeOutput", GCDeadTraceLargeOutput)
 	register("GCDeadTraceHashCollision", GCDeadTraceHashCollision)
+	register("GCDeadWindowBasic", GCDeadWindowBasic)
+	register("GCDeadWindowDuration", GCDeadWindowDuration)
+	register("GCDeadWindowSessionMutex", GCDeadWindowSessionMutex)
 }
 
 func GCSys() {
@@ -1267,3 +1270,80 @@ func gcMemoryLimit(gcPercent int) {
 const memLimitUnit = 8000
 
 var memLimitSink []*[memLimitUnit]byte
+
+// Distinct allocation call sites for gcdeadwindow tests.
+//
+//go:noinline
+func windowAllocDead() []byte {
+	return make([]byte, 128)
+}
+
+//go:noinline
+func windowAllocLive() []byte {
+	return make([]byte, 512)
+}
+
+var windowDeadSink []byte
+var windowLive [][]byte
+
+// GCDeadWindowBasic exercises the gcdeadwindow API: start a capture window
+// with no time limit, allocate dead and live objects, and stop explicitly.
+// Expected output: per-GC "gcdeadwindow:alive/alloc/freed" sections tagged
+// with "gcdeadwindow gen=1", and a "window gen=1 ended" message at stop.
+func GCDeadWindowBasic() {
+	runtime.GcDeadWindowStart(0, "")
+
+	// 4 × 128B that all die (overwritten + nil'd before the final GC).
+	for i := 0; i < 4; i++ {
+		windowDeadSink = windowAllocDead()
+	}
+
+	// 2 × 512B kept alive via a global.
+	windowLive = append(windowLive, windowAllocLive(), windowAllocLive())
+
+	runtime.GC()
+
+	// Drop the last dead reference so the remaining 128B object dies.
+	windowDeadSink = nil
+	runtime.GC()
+
+	runtime.GcDeadWindowStop()
+	fmt.Println("OK")
+}
+
+// GCDeadWindowDuration exercises automatic stop: the window is started with
+// a 1-second limit and must end by itself while the main goroutine keeps
+// allocating. Expected output: "window gen=1 ended" without an explicit
+// GcDeadWindowStop call.
+func GCDeadWindowDuration() {
+	runtime.GcDeadWindowStart(1, "")
+
+	start := time.Now()
+	for time.Since(start) < 1500*time.Millisecond {
+		windowDeadSink = windowAllocDead()
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// The window should have ended automatically by now; flush any final
+	// report. GcDeadWindowStop is a no-op if the timer already fired.
+	runtime.GcDeadWindowStop()
+	runtime.GC()
+	fmt.Println("OK")
+}
+
+// GCDeadWindowSessionMutex verifies that window mode and gcdeadtrace
+// sessions are mutually exclusive in both directions. Requires
+// GODEBUG=gcdeadtrace=1 so the session actually starts.
+func GCDeadWindowSessionMutex() {
+	// Direction 1: active session blocks GcDeadWindowStart.
+	runtime.GcDeadSessionStart(900)
+	runtime.GcDeadWindowStart(0, "") // expect: skipped, session active
+	runtime.GcDeadSessionEnd(900)
+
+	// Direction 2: active window blocks GcDeadSessionStart.
+	runtime.GcDeadWindowStart(0, "") // expect: started
+	runtime.GcDeadSessionStart(901)  // expect: skipped, window active
+	runtime.GcDeadWindowStop()
+
+	fmt.Println("OK")
+}

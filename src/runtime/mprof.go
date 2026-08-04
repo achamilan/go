@@ -152,6 +152,19 @@ type memRecord struct {
 	// table (gcDeadSessionTable) and per-object specials. Bucket-level
 	// heuristic counters have been removed to avoid false positives
 	// when non-session allocations share the same bucket.
+
+	// gcdeadwindow per-bucket counters. The per-cycle fields are
+	// read-and-reset (Xchg) by gcDeadWindowPrint at each GC, which is
+	// the internal "stop + start" of the per-GC window. The cumulative
+	// fields span the whole capture window; alive = cumAllocs - cumFrees.
+	gcDeadWinAllocs       uintptr
+	gcDeadWinAllocBytes   uintptr
+	gcDeadWinFrees        uintptr
+	gcDeadWinFreeBytes    uintptr
+	gcDeadWinCumAllocs    uintptr
+	gcDeadWinCumAllocBytes uintptr
+	gcDeadWinCumFrees     uintptr
+	gcDeadWinCumFreeBytes uintptr
 }
 
 // memRecordCycle
@@ -561,6 +574,17 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 		}
 	}
 
+	// gcdeadwindow counting: attribute this allocation to the capture
+	// window's per-bucket counters. The session branch above takes
+	// precedence per goroutine (window and session modes are mutually
+	// exclusive, but a per-goroutine check is kept as a safety net).
+	if gcDeadWindowActive.Load() != 0 && (debug.gcdeadtrace == 0 || mp.curg == nil || !mp.curg.gcDeadSessionActive) {
+		atomic.Xadduintptr(&mr.gcDeadWinAllocs, 1)
+		atomic.Xadduintptr(&mr.gcDeadWinAllocBytes, size)
+		atomic.Xadduintptr(&mr.gcDeadWinCumAllocs, 1)
+		atomic.Xadduintptr(&mr.gcDeadWinCumAllocBytes, size)
+	}
+
 	// Setprofilebucket locks a bunch of other mutexes, so we call it outside of
 	// the profiler locks. This reduces potential contention and chances of
 	// deadlocks. Since the object must be alive during the call to
@@ -593,6 +617,28 @@ func mProf_Malloc(mp *m, p unsafe.Pointer, size uintptr, typ *_type) {
 					unlock(&mheap_.speciallock)
 				}
 			}
+		}
+	}
+
+	// Add a gcdeadwindow special so this object's free is attributed to
+	// the capture window in gcDeadRecordFree. The goid slot is reused to
+	// carry the window generation (window mode has no goroutine
+	// attribution), so frees of previous windows' leftover objects are
+	// ignored. The session branch above takes precedence per goroutine.
+	if gcDeadWindowActive.Load() != 0 && (debug.gcdeadtrace == 0 || mp.curg == nil || !mp.curg.gcDeadSessionActive) {
+		lock(&mheap_.speciallock)
+		ss := (*specialGcDeadSession)(mheap_.specialGcDeadSessionAlloc.alloc())
+		unlock(&mheap_.speciallock)
+		ss.special.kind = _KindSpecialGcDeadSession
+		ss.sessionID = gcDeadWindowSentinel
+		ss.goid = uint64(atomic.Load(&gcDeadWindowGen)) // window generation, not a goroutine ID
+		ss.b = b   // allocation site bucket for per-site attribution
+		ss.typ = typ
+		if !addspecial(p, &ss.special, false) {
+			// Already has this special — free the unused allocation.
+			lock(&mheap_.speciallock)
+			mheap_.specialGcDeadSessionAlloc.free(unsafe.Pointer(ss))
+			unlock(&mheap_.speciallock)
 		}
 	}
 }
@@ -824,6 +870,20 @@ func gcDeadFindSession(id uint64) *gcDeadSessionInfo {
 // to its allocation site via bucket pointer.
 // Called from freeSpecial when a _KindSpecialGcDeadSession special is freed.
 func gcDeadRecordFree(sessionID uint64, goid uint64, size uintptr, b *bucket, typ *_type) {
+	if sessionID == gcDeadWindowSentinel {
+		// gcdeadwindow object. The goid slot carries the window
+		// generation: only count frees of the current window's objects.
+		// Leftover objects from previous windows are ignored, so the
+		// cumulative counters never go negative after a window restart.
+		if uint32(goid) == atomic.Load(&gcDeadWindowGen) {
+			mr := b.mp()
+			atomic.Xadduintptr(&mr.gcDeadWinFrees, 1)
+			atomic.Xadduintptr(&mr.gcDeadWinFreeBytes, size)
+			atomic.Xadduintptr(&mr.gcDeadWinCumFrees, 1)
+			atomic.Xadduintptr(&mr.gcDeadWinCumFreeBytes, size)
+		}
+		return
+	}
 	e := gcDeadFindSession(sessionID)
 	if e == nil {
 		return
@@ -2022,6 +2082,11 @@ func GcDeadSessionStart(id uint64) {
 		return
 	}
 
+	if gcDeadWindowActive.Load() != 0 {
+		print("runtime: gcdeadsession: GcDeadSessionStart(", id, ") skipped: gcdeadwindow active (mutually exclusive)\n")
+		return
+	}
+
 	gp := getg().m.curg
 	if gp == nil {
 		if debug.gcdeadsession > 0 || debug.gcdeadtrace > 0 {
@@ -2440,6 +2505,556 @@ var gcDeadSavedRate int
 // gcDeadTraceFileCreated tracks whether the gcdeadtracefile creation success
 // message has been printed, so we don't spam stderr on every GC cycle.
 var gcDeadTraceFileCreated bool
+
+// gcDeadWindowSentinel is the sessionID value carried by specials attached
+// to gcdeadwindow allocations, distinguishing them from real session objects
+// in gcDeadRecordFree.
+const gcDeadWindowSentinel = ^uint64(0)
+
+// gcdeadwindow state. Window mode is controlled purely by the
+// GcDeadWindowStart/GcDeadWindowStop API (no GODEBUG required) and is
+// mutually exclusive with gcdeadtrace sessions.
+var (
+	gcDeadWindowActive    atomic.Uint32 // 1 = window capturing
+	gcDeadWindowGen       uint32 // incremented on each Start; specials carry it in the goid slot
+	gcDeadWindowPath      string // output file ("" = stderr)
+	gcDeadWindowDeadline  int64  // nanotime deadline; 0 = no auto-stop
+	gcDeadWindowStartTime int64
+	gcDeadWindowLock      mutex
+	gcDeadWindowNote      note // timer goroutine sleep/wakeup
+
+	// gcDeadWindowFinalPending requests one final report from the GC hook
+	// after GcDeadWindowStop clears the active flag.
+	gcDeadWindowFinalPending bool
+
+	// Last printed alive totals, for suppressing duplicate reports from
+	// the two GC hook points when nothing changed.
+	gcDeadWindowLastAlive      uintptr
+	gcDeadWindowLastAliveBytes uintptr
+
+	// gcDeadWindowPrintLock serializes gcDeadWindowPrint. It can be
+	// invoked concurrently from the two GC hook points (the gcMarkDone
+	// hook on a background mark worker and the post-sweep hook on the
+	// runtime.GC() caller), which share the aggregation tables and
+	// output buffer.
+	gcDeadWindowPrintLock mutex
+)
+
+// GcDeadWindowStart begins a gcdeadwindow capture: every allocation made
+// until the window ends is tracked (MemProfileRate is set to 1) and a
+// per-site report is appended at the end of every GC cycle. The internal
+// per-GC "stop + start" is implicit: each GC prints the cycle's alloc/freed
+// deltas plus the window's cumulative alive, then the per-cycle counters
+// restart from zero.
+//
+// seconds > 0 stops the window automatically after that many seconds;
+// seconds <= 0 means the window runs until GcDeadWindowStop is called.
+// If path is non-empty, reports are appended to that file; otherwise they
+// are written to stderr.
+//
+// Only one window may be active at a time, and window mode is mutually
+// exclusive with gcdeadtrace sessions: the call is refused (with a message)
+// if a window or session is already active.
+func GcDeadWindowStart(seconds int, path string) {
+	lock(&gcDeadWindowLock)
+	if gcDeadWindowActive.Load() != 0 {
+		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: window already active\n")
+		unlock(&gcDeadWindowLock)
+		return
+	}
+	if gcDeadSessionCount.Load() > 0 {
+		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: gcdeadtrace session active (mutually exclusive)\n")
+		unlock(&gcDeadWindowLock)
+		return
+	}
+
+	// Bump the generation first so frees of previous windows' leftover
+	// objects stop matching the gen check before counters are reset.
+	atomic.Store(&gcDeadWindowGen, gcDeadWindowGen+1)
+	gen := gcDeadWindowGen
+
+	// Reset all per-bucket window counters so leftovers from a previous
+	// window don't pollute this one.
+	lock(&profMemActiveLock)
+	for b := (*bucket)(mbuckets.Load()); b != nil; b = b.allnext {
+		mr := b.mp()
+		atomic.Storeuintptr(&mr.gcDeadWinAllocs, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinAllocBytes, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinFrees, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinFreeBytes, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinCumAllocs, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinCumAllocBytes, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinCumFrees, 0)
+		atomic.Storeuintptr(&mr.gcDeadWinCumFreeBytes, 0)
+	}
+	unlock(&profMemActiveLock)
+
+	gcDeadWindowPath = path
+	gcDeadWindowStartTime = nanotime()
+	if seconds > 0 {
+		gcDeadWindowDeadline = gcDeadWindowStartTime + int64(seconds)*1e9
+	} else {
+		gcDeadWindowDeadline = 0
+	}
+	gcDeadWindowFinalPending = false
+	gcDeadWindowLastAlive = 0
+	gcDeadWindowLastAliveBytes = 0
+
+	gcDeadSavedRate = MemProfileRate
+	MemProfileRate = 1
+
+	gcDeadWindowActive.Store(1)
+	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ")\n")
+	unlock(&gcDeadWindowLock)
+
+	if seconds > 0 {
+		go gcDeadWindowTimer(gen, int64(seconds)*1e9)
+	}
+}
+
+// gcDeadWindowTimer stops the window when its deadline expires. Stop wakes
+// the note early to cancel the timer; the generation check guards against
+// acting on a stale window.
+func gcDeadWindowTimer(gen uint32, ns int64) {
+	noteclear(&gcDeadWindowNote)
+	notetsleepg(&gcDeadWindowNote, ns)
+	if gcDeadWindowActive.Load() != 0 && atomic.Load(&gcDeadWindowGen) == gen {
+		GcDeadWindowStop()
+	}
+}
+
+// GcDeadWindowStop ends the active capture window early: it restores
+// MemProfileRate and forces a full GC so the final report is printed
+// before returning. It is a no-op if no window is active.
+func GcDeadWindowStop() {
+	lock(&gcDeadWindowLock)
+	if gcDeadWindowActive.Load() == 0 {
+		unlock(&gcDeadWindowLock)
+		return
+	}
+	gcDeadWindowActive.Store(0)
+	notewakeup(&gcDeadWindowNote)
+	MemProfileRate = gcDeadSavedRate
+	print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (elapsed ",
+		uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")
+	gcDeadWindowFinalPending = true
+	unlock(&gcDeadWindowLock)
+
+	// Force a full GC to immediately collect and report window data.
+	GC()
+}
+
+// gcdeadwindow aggregation types for gcDeadWindowPrint. Unlike the session
+// mode equivalents there is no per-session/per-goroutine attribution, so
+// each entry only carries the PC tuple plus the six counters.
+type gcDeadWinRawEntry struct {
+	pcs        [gcDeadTraceMaxFrames]uintptr
+	nframes    int
+	allocs     uintptr // allocated this GC cycle
+	allocBytes uintptr
+	frees      uintptr // freed this GC cycle
+	freeBytes  uintptr
+	alive      uintptr // cumulative window allocs - frees
+	aliveBytes uintptr
+}
+
+type gcDeadWinSite struct {
+	funcs [gcDeadTraceMaxFrames]struct {
+		name string
+		file string
+		line int32
+	}
+	nframes    int
+	allocs     uintptr
+	allocBytes uintptr
+	frees      uintptr
+	freeBytes  uintptr
+	alive      uintptr
+	aliveBytes uintptr
+}
+
+// Persistent storage for gcDeadWindowPrint, allocated once on first use.
+// The output buffer is shared with gcDeadTracePrint (gcDeadBufData).
+var (
+	gcDeadWinRawData   *[gcDeadTraceMaxSites]gcDeadWinRawEntry
+	gcDeadWinSitesData *[gcDeadTraceMaxSites]gcDeadWinSite
+)
+
+// gcDeadWindowPrint prints the per-GC-cycle gcdeadwindow report: objects
+// allocated and freed during the last cycle, plus everything allocated
+// since window start that is still alive, grouped by allocation site.
+// Called at the end of each GC cycle (both background and explicit GC)
+// while a window is active, and once more after GcDeadWindowStop.
+//
+//	gcdeadwindow:alive: N objs (M bytes) still alive from K sites
+//	  funcName (file:line): N objs, M bytes
+//	gcdeadwindow:alloc: N objs (M bytes) allocated this cycle from K sites
+//	gcdeadwindow:freed: N objs (M bytes) freed this cycle from K sites
+func gcDeadWindowPrint() {
+	// Serialize against concurrent invocations from the two GC hook
+	// points: the aggregation tables and output buffer are shared.
+	lock(&gcDeadWindowPrintLock)
+	defer unlock(&gcDeadWindowPrintLock)
+
+	// Allocate persistent storage on first call.
+	if gcDeadWinRawData == nil {
+		p := persistentalloc(unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadWinRawEntry{}), 0, &memstats.other_sys)
+		gcDeadWinRawData = (*[gcDeadTraceMaxSites]gcDeadWinRawEntry)(p)
+		p2 := persistentalloc(unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadWinSite{}), 0, &memstats.other_sys)
+		gcDeadWinSitesData = (*[gcDeadTraceMaxSites]gcDeadWinSite)(p2)
+		if gcDeadBufData == nil {
+			p3 := persistentalloc(gcDeadTraceBufSize, 0, &memstats.other_sys)
+			gcDeadBufData = (*[gcDeadTraceBufSize]byte)(p3)
+		}
+	}
+	raw := gcDeadWinRawData[:]
+	sites := gcDeadWinSitesData[:]
+	buf := gcDeadBufData[:]
+
+	// Phase 1: collect per-bucket counters under lock (no symbol lookup).
+	// Per-cycle counters are read-and-cleared (Xchg): this is the internal
+	// per-GC "stop + start" of the window.
+	rawCount := 0
+	droppedSiteCount := 0
+	totalAllocs := uintptr(0)
+	totalAllocBytes := uintptr(0)
+	totalFrees := uintptr(0)
+	totalFreeBytes := uintptr(0)
+	totalAlive := uintptr(0)
+	totalAliveBytes := uintptr(0)
+
+	lock(&profMemActiveLock)
+	for b := (*bucket)(mbuckets.Load()); b != nil; b = b.allnext {
+		mr := b.mp()
+		a := atomic.Xchguintptr(&mr.gcDeadWinAllocs, 0)
+		ab := atomic.Xchguintptr(&mr.gcDeadWinAllocBytes, 0)
+		f := atomic.Xchguintptr(&mr.gcDeadWinFrees, 0)
+		fb := atomic.Xchguintptr(&mr.gcDeadWinFreeBytes, 0)
+		ca := atomic.Loaduintptr(&mr.gcDeadWinCumAllocs)
+		cab := atomic.Loaduintptr(&mr.gcDeadWinCumAllocBytes)
+		cf := atomic.Loaduintptr(&mr.gcDeadWinCumFrees)
+		cfb := atomic.Loaduintptr(&mr.gcDeadWinCumFreeBytes)
+
+		alive := uintptr(0)
+		aliveBytes := uintptr(0)
+		if ca > cf {
+			alive = ca - cf
+			aliveBytes = cab - cfb
+		}
+		if a == 0 && f == 0 && alive == 0 {
+			continue
+		}
+
+		// Walk the stack to find up to gcDeadTraceMaxFrames non-runtime frames.
+		stk := b.stk()
+		var pcs [gcDeadTraceMaxFrames]uintptr
+		nframes := 0
+		for _, p := range stk {
+			callPC := p
+			if callPC > 1 {
+				callPC--
+			}
+			fi := findfunc(callPC)
+			if fi.valid() {
+				name := funcname(fi)
+				if len(name) >= 8 && name[:8] == "runtime." {
+					continue
+				}
+				pcs[nframes] = callPC
+				nframes++
+				if nframes >= gcDeadTraceMaxFrames {
+					break
+				}
+			}
+		}
+		if nframes == 0 && len(stk) > 0 {
+			pcs[0] = stk[len(stk)-1]
+			nframes = 1
+		}
+
+		// Merge with existing entry by the PC tuple.
+		idx := -1
+		for i := 0; i < rawCount; i++ {
+			if raw[i].nframes != nframes {
+				continue
+			}
+			match := true
+			for j := 0; j < nframes; j++ {
+				if raw[i].pcs[j] != pcs[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				idx = i
+				break
+			}
+		}
+		if idx >= 0 {
+			raw[idx].allocs += a
+			raw[idx].allocBytes += ab
+			raw[idx].frees += f
+			raw[idx].freeBytes += fb
+			raw[idx].alive += alive
+			raw[idx].aliveBytes += aliveBytes
+		} else if rawCount < gcDeadTraceMaxSites {
+			raw[rawCount] = gcDeadWinRawEntry{
+				pcs: pcs, nframes: nframes,
+				allocs: a, allocBytes: ab,
+				frees: f, freeBytes: fb,
+				alive: alive, aliveBytes: aliveBytes,
+			}
+			rawCount++
+		} else {
+			droppedSiteCount++
+		}
+
+		totalAllocs += a
+		totalAllocBytes += ab
+		totalFrees += f
+		totalFreeBytes += fb
+		totalAlive += alive
+		totalAliveBytes += aliveBytes
+	}
+	unlock(&profMemActiveLock)
+
+	// Suppress duplicate reports from the two GC hook points when nothing
+	// changed (e.g. a synchronous GC where the first hook already saw the
+	// completed sweep). The deadline check still runs below.
+	if totalAllocs == 0 && totalFrees == 0 &&
+		totalAlive == gcDeadWindowLastAlive && totalAliveBytes == gcDeadWindowLastAliveBytes {
+		gcDeadWindowCheckDeadline()
+		return
+	}
+	gcDeadWindowLastAlive = totalAlive
+	gcDeadWindowLastAliveBytes = totalAliveBytes
+
+	// Phase 2: resolve PCs and merge by the full site key.
+	siteCount := 0
+	for i := 0; i < rawCount; i++ {
+		r := &raw[i]
+		key := [gcDeadTraceMaxFrames]struct {
+			name string
+			file string
+			line int32
+		}{}
+		for j := 0; j < r.nframes; j++ {
+			key[j].name = "?"
+			key[j].file = "?"
+			if r.pcs[j] != 0 {
+				fi := findfunc(r.pcs[j])
+				if fi.valid() {
+					key[j].name = funcname(fi)
+					key[j].file, key[j].line = funcline(fi, r.pcs[j])
+				}
+			}
+		}
+
+		idx := -1
+		for j := 0; j < siteCount; j++ {
+			if sites[j].nframes != r.nframes {
+				continue
+			}
+			match := true
+			for k := 0; k < r.nframes; k++ {
+				if sites[j].funcs[k].name != key[k].name ||
+					sites[j].funcs[k].file != key[k].file ||
+					sites[j].funcs[k].line != key[k].line {
+					match = false
+					break
+				}
+			}
+			if match {
+				idx = j
+				break
+			}
+		}
+		if idx >= 0 {
+			sites[idx].allocs += r.allocs
+			sites[idx].allocBytes += r.allocBytes
+			sites[idx].frees += r.frees
+			sites[idx].freeBytes += r.freeBytes
+			sites[idx].alive += r.alive
+			sites[idx].aliveBytes += r.aliveBytes
+		} else if siteCount < gcDeadTraceMaxSites {
+			sites[siteCount] = gcDeadWinSite{
+				funcs: key, nframes: r.nframes,
+				allocs: r.allocs, allocBytes: r.allocBytes,
+				frees: r.frees, freeBytes: r.freeBytes,
+				alive: r.alive, aliveBytes: r.aliveBytes,
+			}
+			siteCount++
+		} else {
+			droppedSiteCount++
+		}
+	}
+
+	// Phase 3: sort by alive bytes, descending (insertion sort).
+	for i := 1; i < siteCount; i++ {
+		tmp := sites[i]
+		j := i
+		for j > 0 && sites[j-1].aliveBytes < tmp.aliveBytes {
+			sites[j] = sites[j-1]
+			j--
+		}
+		sites[j] = tmp
+	}
+
+	// Phase 4: build output into the buffer.
+	n := 0
+
+	appendStr := func(s string) {
+		m := copy(buf[n:], s)
+		n += m
+	}
+
+	appendUintptr := func(v uintptr) {
+		if n >= gcDeadTraceBufSize {
+			return
+		}
+		if v == 0 {
+			buf[n] = '0'
+			n++
+			return
+		}
+		var tmp [20]byte
+		b := itoa(tmp[:], uint64(v))
+		m := copy(buf[n:], b)
+		n += m
+	}
+
+	appendSiteLine := func(s *gcDeadWinSite, objs, bytes uintptr) {
+		appendStr("  ")
+		var linetmp [20]byte
+		for j := 0; j < s.nframes; j++ {
+			if j > 0 {
+				appendStr(" < ")
+			}
+			lb := itoa(linetmp[:], uint64(s.funcs[j].line))
+			appendStr(s.funcs[j].name)
+			appendStr(" (")
+			appendStr(s.funcs[j].file)
+			appendStr(":")
+			appendStr(string(lb))
+			appendStr(")")
+		}
+		appendStr(": ")
+		appendUintptr(objs)
+		appendStr(" objs, ")
+		appendUintptr(bytes)
+		appendStr(" bytes\n")
+	}
+
+	appendStr("=== GC #")
+	appendUintptr(uintptr(memstats.numgc))
+	appendStr(" gcdeadwindow gen=")
+	appendUintptr(uintptr(atomic.Load(&gcDeadWindowGen)))
+	appendStr(" elapsed=")
+	appendUintptr(uintptr((nanotime() - gcDeadWindowStartTime) / 1e9))
+	appendStr("s ===\n")
+
+	if droppedSiteCount > 0 {
+		appendStr("gcdeadwindow: warning: ")
+		appendUintptr(uintptr(droppedSiteCount))
+		appendStr(" allocation sites dropped (limit ")
+		appendUintptr(gcDeadTraceMaxSites)
+		appendStr(")\n")
+	}
+
+	// Alive report first: most critical, least likely to be truncated.
+	if totalAlive > 0 {
+		aliveSites := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].alive > 0 {
+				aliveSites++
+			}
+		}
+		appendStr("gcdeadwindow:alive: ")
+		appendUintptr(totalAlive)
+		appendStr(" objs (")
+		appendUintptr(totalAliveBytes)
+		appendStr(" bytes) still alive from ")
+		appendUintptr(aliveSites)
+		appendStr(" sites\n")
+		for i := 0; i < siteCount; i++ {
+			if sites[i].alive > 0 {
+				appendSiteLine(&sites[i], sites[i].alive, sites[i].aliveBytes)
+			}
+		}
+	}
+
+	if totalAllocs > 0 {
+		allocSites := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].allocs > 0 {
+				allocSites++
+			}
+		}
+		appendStr("gcdeadwindow:alloc: ")
+		appendUintptr(totalAllocs)
+		appendStr(" objs (")
+		appendUintptr(totalAllocBytes)
+		appendStr(" bytes) allocated this cycle from ")
+		appendUintptr(allocSites)
+		appendStr(" sites\n")
+		for i := 0; i < siteCount; i++ {
+			if sites[i].allocs > 0 {
+				appendSiteLine(&sites[i], sites[i].allocs, sites[i].allocBytes)
+			}
+		}
+	}
+
+	if totalFrees > 0 {
+		freedSites := uintptr(0)
+		for i := 0; i < siteCount; i++ {
+			if sites[i].frees > 0 {
+				freedSites++
+			}
+		}
+		appendStr("gcdeadwindow:freed: ")
+		appendUintptr(totalFrees)
+		appendStr(" objs (")
+		appendUintptr(totalFreeBytes)
+		appendStr(" bytes) freed this cycle from ")
+		appendUintptr(freedSites)
+		appendStr(" sites\n")
+		for i := 0; i < siteCount; i++ {
+			if sites[i].frees > 0 {
+				appendSiteLine(&sites[i], sites[i].frees, sites[i].freeBytes)
+			}
+		}
+	}
+
+	// Phase 5: write output.
+	if n >= gcDeadTraceBufSize {
+		marker := "..TRUNCATED"
+		if n >= len(marker) {
+			copy(buf[n-len(marker):], marker)
+		}
+		n = gcDeadTraceBufSize
+	}
+	if gcDeadWindowPath != "" {
+		writeDeadTraceToFile(gcDeadWindowPath, buf[:n])
+	} else {
+		printlock()
+		write(2, unsafe.Pointer(&buf[0]), int32(n))
+		printunlock()
+	}
+
+	gcDeadWindowFinalPending = false
+	gcDeadWindowCheckDeadline()
+}
+
+// gcDeadWindowCheckDeadline auto-stops the window once its deadline has
+// passed. Called from gcDeadWindowPrint (already at a GC boundary, so no
+// extra GC is needed); the timer goroutine covers the idle case.
+func gcDeadWindowCheckDeadline() {
+	if gcDeadWindowDeadline > 0 && nanotime() >= gcDeadWindowDeadline && gcDeadWindowActive.CompareAndSwap(1, 0) {
+		MemProfileRate = gcDeadSavedRate
+		print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (deadline reached, elapsed ",
+			uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")
+	}
+}
 
 var blockprofilerate uint64 // in CPU ticks
 

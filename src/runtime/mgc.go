@@ -593,6 +593,9 @@ func GC() {
 		if debug.gcdeadtrace > 0 {
 			gcDeadTracePrint()
 		}
+		if gcDeadWindowActive.Load() != 0 || gcDeadWindowFinalPending {
+			gcDeadWindowPrint()
+		}
 		mProf_PostSweep()
 	}
 	releasem(mp)
@@ -1160,6 +1163,17 @@ top:
 
 	// Perform mark termination. This will restart the world.
 	gcMarkTermination(stw)
+
+	// gcDeadWindowPrint runs after the world restarts so it doesn't
+	// extend the STW pause. Sweeping from the previous cycle is
+	// guaranteed complete here (gcStart called finishsweep_m before
+	// marking began), so all of its frees have been recorded. The
+	// explicit runtime.GC() path has an additional hook that waits for
+	// the current cycle's sweep, producing a second, more accurate
+	// report; empty duplicates are suppressed inside the print.
+	if gcDeadWindowActive.Load() != 0 || gcDeadWindowFinalPending {
+		gcDeadWindowPrint()
+	}
 }
 
 // isMaybeRunnable checks whether a goroutine may still be semantically runnable.

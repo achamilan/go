@@ -32,8 +32,14 @@ OUT_STDERR="$OUTPUT_DIR/${MODE}_stderr.log"
 echo "Running: GODEBUG=gcdeadtrace=1 go run main.go -mode $MODE -duration $DURATION"
 echo
 
+# gcdeadwindow needs no GODEBUG (pure API) and takes its report path directly.
+EXTRA_ARGS=()
+if [ "$MODE" = "gcdeadwindow" ]; then
+    EXTRA_ARGS=(-windowfile "$OUTPUT_DIR/gcdeadwindow_demo.log")
+fi
+
 GODEBUG=gcdeadtrace=1 GOROOT=/d/code/go/go /d/code/go/go/bin/go run "$DEMO_DIR/main.go" \
-    -mode "$MODE" -duration "$DURATION" \
+    -mode "$MODE" -duration "$DURATION" "${EXTRA_ARGS[@]}" \
     > "$OUT_STDOUT" 2> "$OUT_STDERR" || true
 
 # --- Verification Summary ---
@@ -95,6 +101,19 @@ case "$MODE" in
         check "session 8000 output" "$S8000"
         check "freed output present" "$FREED"
         check "alive output present" "$ALIVE"
+        ;;
+    gcdeadwindow)
+        WIN_LOG="$OUTPUT_DIR/gcdeadwindow_demo.log"
+        GEN1=$(grep -c "gcdeadwindow gen=1" "$WIN_LOG" 2>/dev/null || echo 0)
+        GEN2=$(grep -c "gcdeadwindow gen=2" "$WIN_LOG" 2>/dev/null || echo 0)
+        ALIVE=$(grep -c "gcdeadwindow:alive:" "$WIN_LOG" 2>/dev/null || echo 0)
+        ALLOC=$(grep -c "gcdeadwindow:alloc:" "$WIN_LOG" 2>/dev/null || echo 0)
+        FREED=$(grep -c "gcdeadwindow:freed:" "$WIN_LOG" 2>/dev/null || echo 0)
+        check "gen=1 reports (explicit stop)" "$GEN1"
+        check "gen=2 reports (auto-stop)" "$GEN2"
+        check "alive sections" "$ALIVE"
+        check "alloc sections" "$ALLOC"
+        check "freed sections" "$FREED"
         ;;
     *)
         TOTAL_GC=$(grep -c "=== GC #" "$OUT_STDERR" 2>/dev/null || echo 0)
