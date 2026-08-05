@@ -2532,6 +2532,12 @@ var (
 	gcDeadWindowLastAlive      uintptr
 	gcDeadWindowLastAliveBytes uintptr
 
+	// gcDeadWindowLastTeeGC is the memstats.numgc of the last GC whose
+	// gctrace line was tee'd into the report file, so the tee happens
+	// once per cycle even though gcDeadWindowPrint can run twice per
+	// cycle (two hook points).
+	gcDeadWindowLastTeeGC uint32
+
 	// gcDeadWindowPrintLock serializes gcDeadWindowPrint. It can be
 	// invoked concurrently from the two GC hook points (the gcMarkDone
 	// hook on a background mark worker and the post-sweep hook on the
@@ -2556,6 +2562,10 @@ var (
 // seconds <= 0 means the window runs until GcDeadWindowStop is called.
 // If path is non-empty, reports are appended to that file; otherwise they
 // are written to stderr.
+//
+// Start forces a full GC before returning (clean baseline: pre-window
+// garbage is swept and per-cycle counters restart from zero), and Stop
+// forces another so the final report reflects the complete window.
 //
 // Only one window may be active at a time, and window mode is mutually
 // exclusive with gcdeadtrace sessions: the call is refused (with a message)
@@ -2604,6 +2614,7 @@ func GcDeadWindowStart(seconds int, path string) {
 	gcDeadWindowFinalPending = false
 	gcDeadWindowLastAlive = 0
 	gcDeadWindowLastAliveBytes = 0
+	gcDeadWindowLastTeeGC = 0
 
 	gcDeadSavedRate = MemProfileRate
 	MemProfileRate = 1
@@ -2624,6 +2635,12 @@ func GcDeadWindowStart(seconds int, path string) {
 	if seconds > 0 {
 		go gcDeadWindowTimer(gen, int64(seconds)*1e9)
 	}
+
+	// Force a full GC as a clean baseline: pre-window garbage is swept,
+	// the first report block (elapsed=0s) anchors the window in the file,
+	// and the per-cycle counters restart from zero afterwards, so every
+	// later cycle measures only allocations made after this point.
+	GC()
 }
 
 // gcDeadWindowTimer stops the window when its deadline expires. Stop wakes
@@ -2682,20 +2699,19 @@ func appendUint(b []byte, v uint64) []byte {
 }
 
 // gcDeadWindowGCTrace appends a gctrace-format line for the just-finished
-// GC cycle to the gcdeadwindow report file. It is called from
-// gcMarkTermination right after the standard gctrace block (which it
-// leaves untouched), so the report file interleaves GC log lines with the
-// per-GC window reports: each "gc N @..." line lands just before the
-// "=== GC #N gcdeadwindow ... ===" block emitted by the gcMarkDone hook.
+// GC cycle to the gcdeadwindow report file. It is called once per cycle
+// from gcDeadWindowPrint (which holds gcDeadWindowPrintLock) right before
+// the cycle's report block is written, so the "gc N @..." line always
+// lands just before the "=== GC #N gcdeadwindow ... ===" block — even
+// when the post-sweep hook on the runtime.GC() caller wins the race
+// against the mark-termination tail on the background mark worker.
 //
-// The line format matches the standard gctrace line exactly so existing
-// gctrace parsers can read the report file too. goroutineLeakDone is the
-// same-named local from gcMarkTermination (it is not package-visible).
-func gcDeadWindowGCTrace(goroutineLeakDone bool) {
-	if debug.gctrace == 0 {
-		return
-	}
-	if gcDeadWindowPath == "" || (gcDeadWindowActive.Load() == 0 && !gcDeadWindowFinalPending) {
+// The line format matches the standard gctrace line (minus the
+// "(checking for goroutine leaks)" annotation, which is only visible
+// inside gcMarkTermination) so existing gctrace parsers can read the
+// report file too.
+func gcDeadWindowGCTrace() {
+	if debug.gctrace == 0 || gcDeadWindowPath == "" {
 		return
 	}
 
@@ -2711,9 +2727,6 @@ func gcDeadWindowGCTrace(goroutineLeakDone bool) {
 	line = append(line, "s "...)
 	line = appendUint(line, uint64(util))
 	line = append(line, "%"...)
-	if goroutineLeakDone {
-		line = append(line, " (checking for goroutine leaks)"...)
-	}
 	line = append(line, ": "...)
 	prev := work.tSweepTerm
 	for i, ns := range []int64{work.tMark, work.tMarkTerm, work.tEnd} {
@@ -2946,6 +2959,17 @@ func gcDeadWindowPrint() {
 	}
 	gcDeadWindowLastAlive = totalAlive
 	gcDeadWindowLastAliveBytes = totalAliveBytes
+
+	// Tee this cycle's gctrace line into the report file, once per cycle,
+	// immediately before the block that reports it. Doing it here (under
+	// gcDeadWindowPrintLock, past the dedup check) rather than from
+	// gcMarkTermination guarantees the line always precedes its block,
+	// even when the post-sweep hook on the runtime.GC() caller wins the
+	// race against the mark-termination tail on the background worker.
+	if memstats.numgc != gcDeadWindowLastTeeGC {
+		gcDeadWindowLastTeeGC = memstats.numgc
+		gcDeadWindowGCTrace()
+	}
 
 	// Phase 2: resolve PCs and merge by the full site key.
 	siteCount := 0

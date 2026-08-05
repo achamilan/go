@@ -1625,11 +1625,6 @@ func gcMarkTermination(stw worldStop) {
 		printunlock()
 	}
 
-	// Tee a gctrace-format line into the gcdeadwindow report file so the
-	// GC log and window reports share one chronological file. No-op
-	// unless a window with a report file is active.
-	gcDeadWindowGCTrace(goroutineLeakDone)
-
 	// Print finalizer/cleanup queue length. Like gctrace, do this before the next GC starts.
 	// The fact that the next GC might start is not that problematic here, but acts as a convenient
 	// lock on printing this information (so it cannot overlap with itself from the next GC cycle).

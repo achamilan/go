@@ -66,6 +66,17 @@
 // To view all available profiles, open http://localhost:6060/debug/pprof/
 // in your browser.
 //
+// The package also exposes HTTP control for gcdeadwindow capture windows
+// (see [runtime.GcDeadWindowStart]). The window stops itself after the
+// requested duration; a full GC is forced at both start (clean baseline)
+// and stop (final report):
+//
+//	curl http://localhost:6060/debug/gcdeadwindow/start?seconds=30
+//
+// The report is appended to gcdeadwindow_<timestamp>.log in the process's
+// working directory (the path is deliberately not configurable over HTTP)
+// and can be turned into an Excel report with excel_report_window.
+//
 // For a study of the facility in action, visit
 // https://go.dev/blog/pprof.
 package pprof
@@ -103,6 +114,7 @@ func init() {
 	http.HandleFunc(prefix+"/debug/pprof/profile", Profile)
 	http.HandleFunc(prefix+"/debug/pprof/symbol", Symbol)
 	http.HandleFunc(prefix+"/debug/pprof/trace", Trace)
+	http.HandleFunc(prefix+"/debug/gcdeadwindow/start", GcDeadWindowStart)
 }
 
 // Cmdline responds with the running program's
@@ -112,6 +124,37 @@ func Cmdline(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	fmt.Fprint(w, strings.Join(os.Args, "\x00"))
+}
+
+// GcDeadWindowStart responds by starting a gcdeadwindow capture window
+// that stops itself after the requested duration. The package
+// initialization registers it as /debug/gcdeadwindow/start.
+//
+// Query parameters:
+//   - seconds: required positive integer; the window auto-stops after
+//     this many seconds. A full GC is forced at start (clean baseline)
+//     and again at stop (final report), so no stop endpoint is needed.
+//
+// The report file is gcdeadwindow_<yyyymmdd_hhmmss>.log in the process's
+// working directory; the path is deliberately not configurable over HTTP.
+// While the window is active, gctrace is enabled and its lines are
+// interleaved into the same file.
+func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+	seconds, err := strconv.Atoi(r.URL.Query().Get("seconds"))
+	if err != nil || seconds <= 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, "missing or invalid seconds: want a positive integer (window stops automatically)\n")
+		return
+	}
+
+	path := "gcdeadwindow_" + time.Now().Format("20060102_150405") + ".log"
+	runtime.GcDeadWindowStart(seconds, path)
+	fmt.Fprintf(w, "gcdeadwindow started: seconds=%d report=%s\n", seconds, path)
+	fmt.Fprint(w, "a baseline GC was forced; the window auto-stops with a final GC\n")
+	fmt.Fprint(w, "(if a window or gcdeadtrace session was already active, the start was refused; see process stderr)\n")
 }
 
 func sleep(r *http.Request, d time.Duration) {
