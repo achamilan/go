@@ -59,6 +59,19 @@ type winBlock struct {
 type parsedWindow struct {
 	name   string
 	blocks []*winBlock
+	traces map[int]*gcTrace // GC number -> gctrace heap data (from teed "gc N @..." lines)
+}
+
+// gcTrace holds the heap sizes parsed from a gctrace line:
+// "gc N @Ts U%: ... clock, ... cpu, H0->H1->H2 MB, G MB goal, S MB stacks, ... P (forced)"
+// All heap values are whole-process and MB-truncated by the runtime.
+type gcTrace struct {
+	atSec  float64
+	heap0  int64 // live heap before this GC (MB)
+	heap1  int64 // heap at mark termination (MB)
+	heap2  int64 // live heap after the GC (MB)
+	goal   int64 // heap goal (MB)
+	forced bool
 }
 
 // ── Parsing ───────────────────────────────────────────────────────
@@ -70,6 +83,9 @@ var (
 	freedSumRe = regexp.MustCompile(`^gcdeadwindow:freed: (\d+) objs \((\d+) bytes\) freed this cycle from (\d+) sites`)
 	siteLineRe = regexp.MustCompile(`^  (.+): (\d+) objs, (\d+) bytes$`)
 	frameRe    = regexp.MustCompile(`^(\S+) \(([^)]+)\)`)
+	// gctrace lines teed into the report file by the runtime when the
+	// window was started with a file path (see GcDeadWindowStart).
+	gcTraceLineRe = regexp.MustCompile(`^gc (\d+) @([0-9.]+)s (\d+)%: \S+ ms clock, \S+ ms cpu, (\d+)->(\d+)->(\d+) MB, (\d+) MB goal, \d+ MB stacks, \d+ MB globals, \d+ P( \(forced\))?$`)
 )
 
 func atoi64(s string) int64 {
@@ -125,6 +141,21 @@ func parseWindowFile(path string) (*parsedWindow, error) {
 			}
 			pd.blocks = append(pd.blocks, blk)
 			section = ""
+			continue
+		}
+		if m := gcTraceLineRe.FindStringSubmatch(line); m != nil {
+			if pd.traces == nil {
+				pd.traces = map[int]*gcTrace{}
+			}
+			at, _ := strconv.ParseFloat(m[2], 64)
+			pd.traces[int(atoi64(m[1]))] = &gcTrace{
+				atSec:  at,
+				heap0:  atoi64(m[4]),
+				heap1:  atoi64(m[5]),
+				heap2:  atoi64(m[6]),
+				goal:   atoi64(m[7]),
+				forced: m[8] != "",
+			}
 			continue
 		}
 		if blk == nil {
@@ -335,7 +366,7 @@ func fmtFloat(f float64) string {
 	if f == math.Trunc(f) {
 		return fmt.Sprintf("%.0f", f)
 	}
-	return fmt.Sprintf("%.1f", f)
+	return fmt.Sprintf("%.2f", f)
 }
 
 func (xb *xlsxBuilder) writeXLSX(path string) error {
@@ -650,6 +681,119 @@ func buildWindowSitesSheet(pd *parsedWindow) *xlsxSheet {
 	return s
 }
 
+// buildGCCompareSheet compares the window's per-cycle alloc/freed bytes
+// against heap deltas derived from the teed gctrace lines:
+//
+//   - GC Alloc MB = heap1[N] − heap2[N−1]: heap growth from "actual live
+//     after the previous GC" to "live at this mark termination" — i.e. all
+//     allocation during the cycle (process-wide).
+//   - GC Freed MB = heap1[N] − heap2[N]: garbage discovered by this GC —
+//     i.e. all freeing during the cycle (process-wide).
+//
+// The window counts only objects allocated during the window (exact bytes,
+// MemProfileRate=1); gctrace heap values are process-wide MB-truncated
+// integers. Expected diff sources: MB truncation (±1MB per value); the
+// freed diff additionally contains pre-window objects' garbage (GC freed
+// is process-wide, window freed only tracks window objects); window
+// reports are emitted after the world restarts so concurrent allocation
+// shifts attribution between adjacent cycles — the cumulative diff columns
+// are the consistency signal.
+func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
+	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 13)}
+
+	s.addRow("Mode:", pd.name)
+	s.addRow("说明:", "GC Alloc MB = heap1[N] − heap2[N−1]（上周期实际存活 → 本周期标记终止的堆增量 ≈ 本周期全进程分配）；")
+	s.addRow("", "GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
+	s.addRow("", "窗口 alloc/freed 只统计窗口期间分配的对象（精确字节）；gctrace 堆值为全进程 MB 截断整数。")
+	s.addRow("", "差值来源：① MB 截断 ±1MB/值；② freed 差值含窗口前旧对象的垃圾；③ 窗口报告在世界重启后输出，")
+	s.addRow("", "相邻周期存在归属偏移（单行 CHECK 后下一行通常反向冲销）。累计差值仅作趋势参考：MB 截断使其")
+	s.addRow("", "带每周期系统偏置，长窗口会缓慢漂移。Verdict 按单行差值判定（≤ ±2MB 为 OK）。")
+	s.addBlank()
+
+	if len(pd.traces) == 0 {
+		s.addRow("日志中无 gctrace 行。", "窗口需以文件路径启动（GcDeadWindowStart 会自动开启 gctrace 并 tee 到报告文件）。")
+		return s
+	}
+
+	fmtMBf := func(f float64) string { return fmt.Sprintf("%.2f", f) }
+
+	// Merge consecutive report blocks of the same GC (gcMarkDone hook +
+	// post-sweep hook both print for one GC, but gctrace has a single
+	// line per GC). Bytes are additive across the two snapshots.
+	type mergedRow struct {
+		gcNum, gen, elapsed      int
+		allocBytes, freedBytes   int64
+	}
+	var rows []mergedRow
+	for _, b := range pd.blocks {
+		t := pd.traces[b.gcNum]
+		if t == nil {
+			continue
+		}
+		if n := len(rows); n > 0 && rows[n-1].gcNum == b.gcNum {
+			rows[n-1].allocBytes += b.allocBytes
+			rows[n-1].freedBytes += b.freedBytes
+			if b.elapsed > rows[n-1].elapsed {
+				rows[n-1].elapsed = b.elapsed
+			}
+			continue
+		}
+		rows = append(rows, mergedRow{
+			gcNum: b.gcNum, gen: b.gen, elapsed: b.elapsed,
+			allocBytes: b.allocBytes, freedBytes: b.freedBytes,
+		})
+	}
+
+	s.addRow("=== 分配/释放对比 (窗口 alloc/freed vs GC日志堆变化) ===")
+	s.addHeaderRow("GC #", "Gen", "Elapsed (s)",
+		"窗口 Alloc MB", "GC Alloc MB", "Alloc 差值 MB",
+		"窗口 Freed MB", "GC Freed MB", "Freed 差值 MB",
+		"累计 Alloc 差值 MB", "累计 Freed 差值 MB", "Verdict", "Forced")
+
+	prevHeap2 := int64(-1)
+	cumAllocDiff, cumFreedDiff := 0.0, 0.0
+	for _, r := range rows {
+		t := pd.traces[r.gcNum]
+		gcFreedMB := t.heap1 - t.heap2
+		winAllocMB := float64(r.allocBytes) / 1048576
+		winFreedMB := float64(r.freedBytes) / 1048576
+		freedDiff := winFreedMB - float64(gcFreedMB)
+		cumFreedDiff += freedDiff
+		forced := ""
+		if t.forced {
+			forced = "forced"
+		}
+
+		var allocMBStr, allocDiffStr, cumAllocDiffStr string
+		rowDiff := freedDiff
+		if prevHeap2 < 0 {
+			// First traced GC: no previous heap2, GC alloc unknown.
+			allocMBStr, allocDiffStr, cumAllocDiffStr = "-", "-", "-"
+		} else {
+			gcAllocMB := t.heap1 - prevHeap2
+			allocDiff := winAllocMB - float64(gcAllocMB)
+			cumAllocDiff += allocDiff
+			allocMBStr = fmt.Sprint(gcAllocMB)
+			allocDiffStr = fmtMBf(allocDiff)
+			cumAllocDiffStr = fmtMBf(cumAllocDiff)
+			if math.Abs(allocDiff) > math.Abs(rowDiff) {
+				rowDiff = allocDiff
+			}
+		}
+		verdict := "OK"
+		if math.Abs(rowDiff) > 2 {
+			verdict = "CHECK"
+		}
+
+		s.addRow(fmt.Sprint(r.gcNum), fmt.Sprint(r.gen), fmt.Sprint(r.elapsed),
+			fmtMBf(winAllocMB), allocMBStr, allocDiffStr,
+			fmtMBf(winFreedMB), fmt.Sprint(gcFreedMB), fmtMBf(freedDiff),
+			cumAllocDiffStr, fmtMBf(cumFreedDiff), verdict, forced)
+		prevHeap2 = t.heap2
+	}
+	return s
+}
+
 // ── main ──────────────────────────────────────────────────────────
 
 func unique(in []string) []string {
@@ -710,6 +854,10 @@ func main() {
 		sites := buildWindowSitesSheet(pd)
 		sites.name = trimSheetName(sites.name, seen)
 		builder.sheets = append(builder.sheets, *sites)
+
+		cmp := buildGCCompareSheet(pd)
+		cmp.name = trimSheetName(cmp.name, seen)
+		builder.sheets = append(builder.sheets, *cmp)
 	}
 
 	out := "gcdeadwindow_report.xlsx"

@@ -640,16 +640,17 @@ func (w *WorkerActor) patternSessionLifecycle() {
 // alloc/freed deltas and the window's cumulative alive (the internal
 // per-GC "stop + start").
 
-// Distinct allocation sites for the gcdeadwindow demo.
+// Distinct allocation sites for the gcdeadwindow demo. Sizes are MB-scale
+// so the GC对比 sheet can compare window bytes against gctrace heap MB.
 //
 //go:noinline
-func winSiteChurn() []byte { return make([]byte, 256) }
+func winSiteChurn() []byte { return make([]byte, 4<<10) } // 4 KB, dead garbage
 
 //go:noinline
-func winSiteLive() []byte { return make([]byte, 512) }
+func winSiteLive() []byte { return make([]byte, 8<<10) } // 8 KB, long-lived
 
 //go:noinline
-func winSiteBurst() []byte { return make([]byte, 1024) }
+func winSiteBurst() []byte { return make([]byte, 16<<10) } // 16 KB, dropped later
 
 // runGcDeadWindowDemo runs two capture windows back to back:
 //
@@ -676,41 +677,41 @@ func runGcDeadWindowDemo(outputPath string) {
 	fmt.Println("[gen=1] GcDeadWindowStart(0, path) — explicit stop")
 	runtime.GcDeadWindowStart(0, outputPath)
 
-	// Phase 1: 500 dead churn allocs + 200 live allocs, then GC.
-	for i := 0; i < 500; i++ {
+	// Phase 1: 2000 dead churn allocs (8MB) + 2000 live allocs (16MB), then GC.
+	for i := 0; i < 2000; i++ {
 		winChurnSink = winSiteChurn()
 	}
-	winLiveSink = make([][]byte, 200)
+	winLiveSink = make([][]byte, 2000)
 	for i := range winLiveSink {
 		winLiveSink[i] = winSiteLive()
 	}
 	winChurnSink = nil
 	runtime.GC()
-	fmt.Println("[gen=1] phase 1: 500 churn (die) + 200 live (kept) -> GC")
+	fmt.Println("[gen=1] phase 1: 2000 churn (8MB, die) + 2000 live (16MB, kept) -> GC")
 
-	// Phase 2: 300 churn + 100 burst (kept), then GC.
-	for i := 0; i < 300; i++ {
+	// Phase 2: 1500 churn (6MB) + 1000 burst (16MB, kept), then GC.
+	for i := 0; i < 1500; i++ {
 		winChurnSink = winSiteChurn()
 	}
-	winBurstSink = make([][]byte, 100)
+	winBurstSink = make([][]byte, 1000)
 	for i := range winBurstSink {
 		winBurstSink[i] = winSiteBurst()
 	}
 	winChurnSink = nil
 	runtime.GC()
-	fmt.Println("[gen=1] phase 2: 300 churn (die) + 100 burst (kept) -> GC")
+	fmt.Println("[gen=1] phase 2: 1500 churn (6MB, die) + 1000 burst (16MB, kept) -> GC")
 
-	// Phase 3: drop the burst, more churn, then GC.
+	// Phase 3: drop the burst (16MB), more churn (4MB), then GC.
 	winBurstSink = nil
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 1000; i++ {
 		winChurnSink = winSiteChurn()
 	}
 	winChurnSink = nil
 	runtime.GC()
-	fmt.Println("[gen=1] phase 3: burst dropped + 200 churn -> GC")
+	fmt.Println("[gen=1] phase 3: burst dropped (16MB) + 1000 churn (4MB) -> GC")
 
 	runtime.GcDeadWindowStop()
-	fmt.Println("[gen=1] GcDeadWindowStop — final report (alive = the 200 live allocs only)")
+	fmt.Println("[gen=1] GcDeadWindowStop — final report (alive = the 2000 live allocs, 16MB)")
 	fmt.Println()
 
 	// ---- Window gen=2: auto-stop after 2 seconds ----
@@ -718,7 +719,7 @@ func runGcDeadWindowDemo(outputPath string) {
 	runtime.GcDeadWindowStart(2, outputPath)
 	start := time.Now()
 	for time.Since(start) < 3*time.Second {
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 500; i++ { // 2MB churn per iteration
 			winChurnSink = winSiteChurn()
 		}
 		winChurnSink = nil

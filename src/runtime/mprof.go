@@ -2538,6 +2538,11 @@ var (
 	// runtime.GC() caller), which share the aggregation tables and
 	// output buffer.
 	gcDeadWindowPrintLock mutex
+
+	// gcDeadWindowSavedGCTrace holds the debug.gctrace value to restore
+	// in GcDeadWindowStop when GcDeadWindowStart enabled it for the
+	// report-file tee; -1 means Start did not change it.
+	gcDeadWindowSavedGCTrace int32 = -1
 )
 
 // GcDeadWindowStart begins a gcdeadwindow capture: every allocation made
@@ -2603,6 +2608,15 @@ func GcDeadWindowStart(seconds int, path string) {
 	gcDeadSavedRate = MemProfileRate
 	MemProfileRate = 1
 
+	// Enable the GC log so gctrace lines are tee'd into the window
+	// report file alongside the per-GC reports. Restored by Stop.
+	if path != "" && debug.gctrace == 0 {
+		gcDeadWindowSavedGCTrace = 0
+		debug.gctrace = 1
+	} else {
+		gcDeadWindowSavedGCTrace = -1
+	}
+
 	gcDeadWindowActive.Store(1)
 	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ")\n")
 	unlock(&gcDeadWindowLock)
@@ -2642,6 +2656,110 @@ func GcDeadWindowStop() {
 
 	// Force a full GC to immediately collect and report window data.
 	GC()
+
+	// Restore gctrace only after the forced GC so its gctrace line is
+	// still tee'd into the report file (finalPending gates the tee).
+	if gcDeadWindowSavedGCTrace >= 0 {
+		debug.gctrace = gcDeadWindowSavedGCTrace
+		gcDeadWindowSavedGCTrace = -1
+	}
+}
+
+// appendUint appends the decimal representation of v to b. (itoaDiv is
+// not suitable here: with dec=0 it emits a leading zero for v < 10.)
+func appendUint(b []byte, v uint64) []byte {
+	var buf [20]byte
+	i := len(buf)
+	for {
+		i--
+		buf[i] = byte(v%10 + '0')
+		v /= 10
+		if v == 0 {
+			break
+		}
+	}
+	return append(b, buf[i:]...)
+}
+
+// gcDeadWindowGCTrace appends a gctrace-format line for the just-finished
+// GC cycle to the gcdeadwindow report file. It is called from
+// gcMarkTermination right after the standard gctrace block (which it
+// leaves untouched), so the report file interleaves GC log lines with the
+// per-GC window reports: each "gc N @..." line lands just before the
+// "=== GC #N gcdeadwindow ... ===" block emitted by the gcMarkDone hook.
+//
+// The line format matches the standard gctrace line exactly so existing
+// gctrace parsers can read the report file too. goroutineLeakDone is the
+// same-named local from gcMarkTermination (it is not package-visible).
+func gcDeadWindowGCTrace(goroutineLeakDone bool) {
+	if debug.gctrace == 0 {
+		return
+	}
+	if gcDeadWindowPath == "" || (gcDeadWindowActive.Load() == 0 && !gcDeadWindowFinalPending) {
+		return
+	}
+
+	util := int(memstats.gc_cpu_fraction * 100)
+
+	var sbuf [24]byte
+	var lbuf [256]byte
+	line := lbuf[:0]
+	line = append(line, "gc "...)
+	line = appendUint(line, uint64(memstats.numgc))
+	line = append(line, " @"...)
+	line = append(line, itoaDiv(sbuf[:], uint64(work.tSweepTerm-runtimeInitTime)/1e6, 3)...)
+	line = append(line, "s "...)
+	line = appendUint(line, uint64(util))
+	line = append(line, "%"...)
+	if goroutineLeakDone {
+		line = append(line, " (checking for goroutine leaks)"...)
+	}
+	line = append(line, ": "...)
+	prev := work.tSweepTerm
+	for i, ns := range []int64{work.tMark, work.tMarkTerm, work.tEnd} {
+		if i != 0 {
+			line = append(line, '+')
+		}
+		line = append(line, fmtNSAsMS(sbuf[:], uint64(ns-prev))...)
+		prev = ns
+	}
+	line = append(line, " ms clock, "...)
+	for i, ns := range []int64{
+		int64(work.stwprocs) * (work.tMark - work.tSweepTerm),
+		gcController.assistTime.Load(),
+		gcController.dedicatedMarkTime.Load() + gcController.fractionalMarkTime.Load(),
+		gcController.idleMarkTime.Load(),
+		int64(work.stwprocs) * (work.tEnd - work.tMarkTerm),
+	} {
+		if i == 2 || i == 3 {
+			// Separate mark time components with /.
+			line = append(line, '/')
+		} else if i != 0 {
+			line = append(line, '+')
+		}
+		line = append(line, fmtNSAsMS(sbuf[:], uint64(ns))...)
+	}
+	line = append(line, " ms cpu, "...)
+	line = appendUint(line, work.heap0>>20)
+	line = append(line, "->"...)
+	line = appendUint(line, work.heap1>>20)
+	line = append(line, "->"...)
+	line = appendUint(line, work.heap2>>20)
+	line = append(line, " MB, "...)
+	line = appendUint(line, gcController.lastHeapGoal>>20)
+	line = append(line, " MB goal, "...)
+	line = appendUint(line, gcController.lastStackScan.Load()>>20)
+	line = append(line, " MB stacks, "...)
+	line = appendUint(line, gcController.globalsScan.Load()>>20)
+	line = append(line, " MB globals, "...)
+	line = appendUint(line, uint64(work.maxprocs))
+	line = append(line, " P"...)
+	if work.userForced {
+		line = append(line, " (forced)"...)
+	}
+	line = append(line, '\n')
+
+	writeDeadTraceToFile(gcDeadWindowPath, line)
 }
 
 // gcdeadwindow aggregation types for gcDeadWindowPrint. Unlike the session
