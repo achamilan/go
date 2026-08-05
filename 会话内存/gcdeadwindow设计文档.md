@@ -19,47 +19,56 @@ v2:  gctrace 同步入文件 + GC对比 sheet + MB 量级 demo。[59e39f230f]
 v3:  tee 重构为独立函数 gcDeadWindowGCTrace 并移入 gcDeadWindowPrint 内
      （修复强制 GC 时"块→gc行→块"的顺序倒置），mgc.go 恢复上游零 diff。
      Start 强制基线 GC。新增 net/http/pprof HTTP start 端点。
+v4:  HTTP 端点改为 profile 式流式响应（连接保持到窗口结束，报告作为响应
+     体流回，curl -o 直接落客户端 cwd；服务器侧临时文件读完即删）。
+     GcDeadWindowStart 改为返回 bool（拒绝时 false，HTTP 据此返回 409）。
+     最终报告门控从 finalPending 布尔改为 finalCycle 周期号门控——修复
+     布尔"检查后清除"竞态导致 Stop 后的后续 GC 无限打印尾随块（会重建
+     已删除的临时文件）；Stop 的 GC 之后遗留对象的释放不再出现在报告中。
 
 
 2. API
 ========
 
 ```go
-runtime.GcDeadWindowStart(seconds int, path string)
+runtime.GcDeadWindowStart(seconds int, path string) bool
 runtime.GcDeadWindowStop()
 ```
 
-- 纯 API 控制，无需 GODEBUG。
+- 纯 API 控制，无需 GODEBUG。Start 返回是否成功启动（已有窗口/会话活跃时
+  拒绝、打 stderr、返回 false）；调用方可忽略返回值。
 - `seconds > 0`：定时 goroutine（`go gcDeadWindowTimer` + notetsleepg）到时
   自动 Stop；`seconds <= 0`：运行直到显式 Stop。
 - `path` 非空：报告追加写入该文件（CreateFileW + UTF-8→UTF-16，支持中文
   路径）；空串写 stderr。
-- 约束：同时只能有一个窗口；与 gcdeadtrace 会话互斥（双向检查，冲突时
-  Start 打印拒绝信息到 stderr 并直接返回）。
+- 约束：同时只能有一个窗口；与 gcdeadtrace 会话互斥（双向检查）。
 - 副作用：采集期间 MemProfileRate 置 1（Stop 恢复原值）；path 非空时自动
   开启 gctrace（Stop 恢复原值）。
 
 **基线 GC**：Start 在返回前强制一次完整 GC——扫掉窗口前的垃圾作为干净基线，
 首个报告块锚定窗口起点，本周期计数器随之清零，后续周期只统计新分配。
-**结束 GC**：Stop 强制一次完整 GC，最终报告在 Stop 返回前写出。gctrace 原值
-在这次 GC 之后才恢复（否则最终 GC 缺 gctrace 行）。
+**结束 GC**：Stop 强制一次完整 GC，最终报告在 Stop 返回前写出；该 GC 之后
+窗口遗留对象的释放不再被报告（final alive 即 Stop 点真实存活，数据验证
+alloc == freed + alive 精确成立）。gctrace 原值在这次 GC 之后才恢复。
 
 
 3. HTTP 接口
 ==============
 
-`import _ "net/http/pprof"` 后：
+`import _ "net/http/pprof"` 后，与 CPU profile 端点同语义——连接保持到
+窗口结束，报告作为响应体流回，客户端直接保存到本地：
 
 ```
-GET /debug/gcdeadwindow/start?seconds=30
+curl -o gcdeadwindow.log http://localhost:6060/debug/gcdeadwindow/start?seconds=30
 ```
 
-- 仅 start 端点；`seconds` 必须为正整数（缺失/非法 → 400），窗口到时自动停
-  （Start 基线 GC + Stop 最终 GC 均已内置，无需 stop 端点）。
-- 报告固定写进程工作目录下 `gcdeadwindow_<yyyymmdd_hhmmss>.log`，path 不可
-  通过 HTTP 指定（防任意路径写入）。
-- 注册遵循 httpmuxgo121 prefix 套路（`GET /debug/...`）。
-- 拒绝场景（已有窗口/会话活跃）信息在进程 stderr。
+- 仅 start 端点；`seconds` 必须为正整数（缺失/非法 → 400）。
+- 响应：200 + `Content-Disposition: attachment; filename="gcdeadwindow.log"`，
+  报告含交织的 gctrace 行。
+- 并发：HTTP 侧 single-flight（处理中再来请求 → 409）；runtime 拒绝（已有
+  窗口/会话活跃）→ 409（依据 GcDeadWindowStart 的 bool 返回值）。
+- 服务器侧用临时文件收集（os.CreateTemp），响应发出后删除；最终报告周期
+  门控保证 Stop 后的后续 GC 不会再写该文件（不会重建泄漏）。
 
 
 4. 实现原理
@@ -91,7 +100,13 @@ gcMarkTermination 的尾部），共享聚合表与输出 buffer，因此：
 
 - `gcDeadWindowPrintLock` 串行化 gcDeadWindowPrint；
 - 去重：某钩子发现本周期计数全 0 且 alive 总量未变则跳过（同步 GC 时两个
-  钩子常看到相同状态）。
+  钩子常看到相同状态）；
+- 报告门控统一走 `gcDeadWindowReportDue()`：窗口活跃 ⇒ 每周期都报；Stop 后
+  仅 `memstats.numgc == gcDeadWindowFinalCycle`（Stop 时存 numgc+1）的那一个
+  周期可报。**不能用"布尔 + 打印后清除"**：钩子门控在锁外检查、清除在打印
+  末尾，下一周期的钩子可在清除前穿过门控，导致 Stop 后无限尾随打印（HTTP
+  场景实测重建了已删除的临时文件；且同一最终 GC 的两个钩子只能活一个，可能
+  丢掉更准的 post-sweep 块）。周期号单调只读比较，无竞态。
 
 注意：gcMarkTermination 内 `startTheWorldWithSema`（mgc.go:1518）在 gctrace
 打印（mgc.go:1575）**之前**，即 gctrace 打印时世界已重启。
@@ -198,6 +213,8 @@ go run excel_report_window.go output/gcdeadwindow_demo.log   # → gcdeadwindow_
 
 - 与 gcdeadtrace 会话模式互斥；同时只能一个窗口。
 - 采集期间 MemProfileRate=1，高分配率服务有可见性能开销，仅限诊断使用。
-- 窗口 alive 只含窗口期间分配且仍存活的对象，不含窗口前存量。
+- 窗口 alive 只含窗口期间分配且仍存活的对象，不含窗口前存量；Stop 的最终
+  GC 之后遗留对象的释放不再报告（final alive 为 Stop 点真实存活）。
 - gctrace 堆值为 MB 截断整数，亚 MB 场景 GC对比 sheet 数值偏粗。
-- HTTP 端点固定写 cwd；多实例同机部署时注意文件名时间戳冲突（秒级）。
+- HTTP 端点响应期间占用一个连接（与 CPU profile 相同）；客户端断开则窗口
+  提前停止并丢弃报告。

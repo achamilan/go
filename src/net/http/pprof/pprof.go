@@ -66,16 +66,15 @@
 // To view all available profiles, open http://localhost:6060/debug/pprof/
 // in your browser.
 //
-// The package also exposes HTTP control for gcdeadwindow capture windows
-// (see [runtime.GcDeadWindowStart]). The window stops itself after the
-// requested duration; a full GC is forced at both start (clean baseline)
-// and stop (final report):
+// The package also exposes gcdeadwindow capture windows over HTTP (see
+// [runtime.GcDeadWindowStart]). Like the CPU profile endpoint, the
+// connection stays open for the requested duration and the collected
+// report is streamed back as the response body, so the client can save
+// it directly (a full GC is forced at both start and stop):
 //
-//	curl http://localhost:6060/debug/gcdeadwindow/start?seconds=30
+//	curl -o gcdeadwindow.log http://localhost:6060/debug/gcdeadwindow/start?seconds=30
 //
-// The report is appended to gcdeadwindow_<timestamp>.log in the process's
-// working directory (the path is deliberately not configurable over HTTP)
-// and can be turned into an Excel report with excel_report_window.
+// The report can be turned into an Excel report with excel_report_window.
 //
 // For a study of the facility in action, visit
 // https://go.dev/blog/pprof.
@@ -101,8 +100,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// gcDeadWindowInFlight serializes /debug/gcdeadwindow/start requests:
+// the handler holds the slot for the whole window duration.
+var gcDeadWindowInFlight atomic.Int32
 
 func init() {
 	prefix := ""
@@ -126,19 +130,25 @@ func Cmdline(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, strings.Join(os.Args, "\x00"))
 }
 
-// GcDeadWindowStart responds by starting a gcdeadwindow capture window
-// that stops itself after the requested duration. The package
-// initialization registers it as /debug/gcdeadwindow/start.
+// GcDeadWindowStart starts a gcdeadwindow capture window and streams the
+// collected report back as the response body when the window ends, like
+// the CPU profile endpoint: the connection stays open for the requested
+// duration, so the client can save the report directly:
+//
+//	curl -o gcdeadwindow.log http://localhost:6060/debug/gcdeadwindow/start?seconds=30
+//
+// The package initialization registers it as /debug/gcdeadwindow/start.
 //
 // Query parameters:
 //   - seconds: required positive integer; the window auto-stops after
 //     this many seconds. A full GC is forced at start (clean baseline)
-//     and again at stop (final report), so no stop endpoint is needed.
+//     and again at stop (final report).
 //
-// The report file is gcdeadwindow_<yyyymmdd_hhmmss>.log in the process's
-// working directory; the path is deliberately not configurable over HTTP.
-// While the window is active, gctrace is enabled and its lines are
-// interleaved into the same file.
+// The report is collected in a server-side temporary file that is removed
+// after the response is sent. gctrace lines are interleaved into the
+// report while the window is active. Only one window may be captured at
+// a time; concurrent requests and starts refused by the runtime (a
+// window or gcdeadtrace session is already active) get 409.
 func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -146,15 +156,46 @@ func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 	seconds, err := strconv.Atoi(r.URL.Query().Get("seconds"))
 	if err != nil || seconds <= 0 {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, "missing or invalid seconds: want a positive integer (window stops automatically)\n")
+		fmt.Fprint(w, "missing or invalid seconds: want a positive integer\n")
 		return
 	}
 
-	path := "gcdeadwindow_" + time.Now().Format("20060102_150405") + ".log"
-	runtime.GcDeadWindowStart(seconds, path)
-	fmt.Fprintf(w, "gcdeadwindow started: seconds=%d report=%s\n", seconds, path)
-	fmt.Fprint(w, "a baseline GC was forced; the window auto-stops with a final GC\n")
-	fmt.Fprint(w, "(if a window or gcdeadtrace session was already active, the start was refused; see process stderr)\n")
+	if !gcDeadWindowInFlight.CompareAndSwap(0, 1) {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, "another /debug/gcdeadwindow/start request is already in flight\n")
+		return
+	}
+	defer gcDeadWindowInFlight.Store(0)
+
+	tmp, err := os.CreateTemp("", "gcdeadwindow_*.log")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "cannot create temporary report file: %v\n", err)
+		return
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	if !runtime.GcDeadWindowStart(seconds, tmpPath) {
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, "gcdeadwindow start refused: a window or gcdeadtrace session is already active (see process stderr)\n")
+		return
+	}
+
+	// Wait for the window to end (or the client to go away), then force
+	// the final report; Stop is a no-op if the timer already fired.
+	sleep(r, time.Duration(seconds)*time.Second)
+	runtime.GcDeadWindowStop()
+
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "cannot read report file: %v\n", err)
+		return
+	}
+	w.Header().Set("Content-Disposition", `attachment; filename="gcdeadwindow.log"`)
+	w.Write(data)
 }
 
 func sleep(r *http.Request, d time.Duration) {

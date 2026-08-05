@@ -2523,9 +2523,16 @@ var (
 	gcDeadWindowLock      mutex
 	gcDeadWindowNote      note // timer goroutine sleep/wakeup
 
-	// gcDeadWindowFinalPending requests one final report from the GC hook
-	// after GcDeadWindowStop clears the active flag.
-	gcDeadWindowFinalPending bool
+	// gcDeadWindowFinalCycle requests one final report from the GC hooks
+	// after GcDeadWindowStop clears the active flag: it holds the GC
+	// number (memstats.numgc) of the cycle that should still report, or
+	// 0 when no final report is pending. Gating on the cycle number
+	// (instead of a plain boolean cleared after printing) lets both hook
+	// points of that cycle report, while later cycles can never slip
+	// through — a boolean's check-then-clear races with the next cycle's
+	// hooks, which could print trailing blocks indefinitely (recreating
+	// an already-removed report file).
+	gcDeadWindowFinalCycle atomic.Uint32
 
 	// Last printed alive totals, for suppressing duplicate reports from
 	// the two GC hook points when nothing changed.
@@ -2551,6 +2558,18 @@ var (
 	gcDeadWindowSavedGCTrace int32 = -1
 )
 
+// gcDeadWindowReportDue reports whether a GC hook should invoke
+// gcDeadWindowPrint for the cycle that just ended: always while the
+// window is active, and once more for the single cycle that
+// GcDeadWindowStop designated as the final report.
+func gcDeadWindowReportDue() bool {
+	if gcDeadWindowActive.Load() != 0 {
+		return true
+	}
+	c := gcDeadWindowFinalCycle.Load()
+	return c != 0 && memstats.numgc == c
+}
+
 // GcDeadWindowStart begins a gcdeadwindow capture: every allocation made
 // until the window ends is tracked (MemProfileRate is set to 1) and a
 // per-site report is appended at the end of every GC cycle. The internal
@@ -2568,19 +2587,21 @@ var (
 // forces another so the final report reflects the complete window.
 //
 // Only one window may be active at a time, and window mode is mutually
-// exclusive with gcdeadtrace sessions: the call is refused (with a message)
-// if a window or session is already active.
-func GcDeadWindowStart(seconds int, path string) {
+// exclusive with gcdeadtrace sessions. Start reports whether the window
+// was started; it returns false (after printing a message to stderr) if
+// a window or session is already active. Callers that don't care may
+// simply ignore the result.
+func GcDeadWindowStart(seconds int, path string) bool {
 	lock(&gcDeadWindowLock)
 	if gcDeadWindowActive.Load() != 0 {
 		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: window already active\n")
 		unlock(&gcDeadWindowLock)
-		return
+		return false
 	}
 	if gcDeadSessionCount.Load() > 0 {
 		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: gcdeadtrace session active (mutually exclusive)\n")
 		unlock(&gcDeadWindowLock)
-		return
+		return false
 	}
 
 	// Bump the generation first so frees of previous windows' leftover
@@ -2611,7 +2632,7 @@ func GcDeadWindowStart(seconds int, path string) {
 	} else {
 		gcDeadWindowDeadline = 0
 	}
-	gcDeadWindowFinalPending = false
+	gcDeadWindowFinalCycle.Store(0)
 	gcDeadWindowLastAlive = 0
 	gcDeadWindowLastAliveBytes = 0
 	gcDeadWindowLastTeeGC = 0
@@ -2641,6 +2662,7 @@ func GcDeadWindowStart(seconds int, path string) {
 	// and the per-cycle counters restart from zero afterwards, so every
 	// later cycle measures only allocations made after this point.
 	GC()
+	return true
 }
 
 // gcDeadWindowTimer stops the window when its deadline expires. Stop wakes
@@ -2668,14 +2690,18 @@ func GcDeadWindowStop() {
 	MemProfileRate = gcDeadSavedRate
 	print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (elapsed ",
 		uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")
-	gcDeadWindowFinalPending = true
+	// Designate the next completed GC (the forced one below, or an
+	// in-flight cycle finishing first) as the final report. Later cycles
+	// never report: trailing frees of leftover objects are not tracked.
+	gcDeadWindowFinalCycle.Store(memstats.numgc + 1)
 	unlock(&gcDeadWindowLock)
 
 	// Force a full GC to immediately collect and report window data.
 	GC()
 
 	// Restore gctrace only after the forced GC so its gctrace line is
-	// still tee'd into the report file (finalPending gates the tee).
+	// still tee'd into the report file (the final-cycle gate lets the
+	// forced GC report).
 	if gcDeadWindowSavedGCTrace >= 0 {
 		debug.gctrace = gcDeadWindowSavedGCTrace
 		gcDeadWindowSavedGCTrace = -1
@@ -3183,7 +3209,6 @@ func gcDeadWindowPrint() {
 		printunlock()
 	}
 
-	gcDeadWindowFinalPending = false
 	gcDeadWindowCheckDeadline()
 }
 

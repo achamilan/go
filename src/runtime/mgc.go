@@ -593,7 +593,7 @@ func GC() {
 		if debug.gcdeadtrace > 0 {
 			gcDeadTracePrint()
 		}
-		if gcDeadWindowActive.Load() != 0 || gcDeadWindowFinalPending {
+		if gcDeadWindowReportDue() {
 			gcDeadWindowPrint()
 		}
 		mProf_PostSweep()
@@ -1171,7 +1171,7 @@ top:
 	// explicit runtime.GC() path has an additional hook that waits for
 	// the current cycle's sweep, producing a second, more accurate
 	// report; empty duplicates are suppressed inside the print.
-	if gcDeadWindowActive.Load() != 0 || gcDeadWindowFinalPending {
+	if gcDeadWindowReportDue() {
 		gcDeadWindowPrint()
 	}
 }
