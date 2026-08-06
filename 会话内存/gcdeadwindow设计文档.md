@@ -25,6 +25,15 @@ v4:  HTTP 端点改为 profile 式流式响应（连接保持到窗口结束，�
      最终报告门控从 finalPending 布尔改为 finalCycle 周期号门控——修复
      布尔"检查后清除"竞态导致 Stop 后的后续 GC 无限打印尾随块（会重建
      已删除的临时文件）；Stop 的 GC 之后遗留对象的释放不再出现在报告中。
+v5:  单块输出改为分块冲刷（超过 1MB 高水位即写盘重置），彻底消除单周期
+     报告 8MB 截断（产品环境实测触发 ..TRUNCATED）；gcDeadTraceBufSize
+     现在只约束单次写盘大小。8192 站点上限仍在（超出打 warning 行，
+     段首汇总计数不受丢弃影响）。
+v6:  站点数上限移除：聚合表（raw + sites）改为持久切片，初始 1024、按需
+     翻倍（persistentalloc 不释放，废弃一半浪费 ≤2× 终态；站点数天然受
+     程序分配调用点总数约束）。droppedSiteCount 与 warning 行移除。
+     注意 Phase 2 合并与 Phase 3 插入排序均为 O(n²)，数万站点时单次
+     报告耗时可达秒级（仅采集窗口期间）。
 
 
 2. API
@@ -216,5 +225,7 @@ go run excel_report_window.go output/gcdeadwindow_demo.log   # → gcdeadwindow_
 - 窗口 alive 只含窗口期间分配且仍存活的对象，不含窗口前存量；Stop 的最终
   GC 之后遗留对象的释放不再报告（final alive 为 Stop 点真实存活）。
 - gctrace 堆值为 MB 截断整数，亚 MB 场景 GC对比 sheet 数值偏粗。
+- 单 GC 周期报告不再截断（分块冲刷），站点数无上限（聚合表自动翻倍）。
+  注意合并/排序为 O(n²)：数万站点时单次报告可达秒级（仅窗口期间）。
 - HTTP 端点响应期间占用一个连接（与 CPU profile 相同）；客户端断开则窗口
   提前停止并丢弃报告。

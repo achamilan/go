@@ -680,6 +680,13 @@ const gcDeadTraceMaxFrames = 3
 // but the buffer must still be large enough to hold the full output.
 const gcDeadTraceBufSize = 8 << 20
 
+// gcDeadWinFlushThreshold is the high-water mark at which gcDeadWindowPrint
+// flushes the output buffer to the file/stderr mid-block, so a single GC
+// cycle's report is never truncated regardless of size. Individual output
+// pieces (a site line with a full stack) are at most a few KB, so 1MB
+// leaves ample headroom below gcDeadTraceBufSize.
+const gcDeadWinFlushThreshold = 1 << 20
+
 // gcDeadTrace storage types, defined at package level so persistentalloc
 // can compute their size.
 type gcDeadRawEntry struct {
@@ -2743,8 +2750,11 @@ func gcDeadWindowGCTrace() {
 
 	util := int(memstats.gc_cpu_fraction * 100)
 
+	// 512 bytes covers worst-case wrapped-uint64 fields (observed in
+	// practice: negative time deltas print as ~14-digit values); a normal
+	// line is ~150 bytes.
 	var sbuf [24]byte
-	var lbuf [256]byte
+	var lbuf [512]byte
 	line := lbuf[:0]
 	line = append(line, "gc "...)
 	line = appendUint(line, uint64(memstats.numgc))
@@ -2830,12 +2840,35 @@ type gcDeadWinSite struct {
 	aliveBytes uintptr
 }
 
-// Persistent storage for gcDeadWindowPrint, allocated once on first use.
-// The output buffer is shared with gcDeadTracePrint (gcDeadBufData).
+// Persistent storage for gcDeadWindowPrint, allocated on first use and
+// doubled on demand by gcDeadWinGrow. There is no site-count cap: the
+// number of distinct allocation sites is bounded by the program's
+// allocation call stacks. persistentalloc never frees, so the abandoned
+// halves waste at most 2x the final size. The output buffer is shared
+// with gcDeadTracePrint (gcDeadBufData).
 var (
-	gcDeadWinRawData   *[gcDeadTraceMaxSites]gcDeadWinRawEntry
-	gcDeadWinSitesData *[gcDeadTraceMaxSites]gcDeadWinSite
+	gcDeadWinRaw   []gcDeadWinRawEntry
+	gcDeadWinSites []gcDeadWinSite
 )
+
+// gcDeadWinSitesInitial is the initial capacity of the aggregation slices.
+const gcDeadWinSitesInitial = 1024
+
+// gcDeadWinGrow doubles the gcdeadwindow aggregation slices. Callers must
+// re-read the globals (or refresh local slices) after calling.
+func gcDeadWinGrow() {
+	n := 2 * len(gcDeadWinRaw)
+	p := persistentalloc(uintptr(n)*unsafe.Sizeof(gcDeadWinRawEntry{}), 0, &memstats.other_sys)
+	nr := unsafe.Slice((*gcDeadWinRawEntry)(p), n)
+	copy(nr, gcDeadWinRaw)
+	gcDeadWinRaw = nr
+
+	m := 2 * len(gcDeadWinSites)
+	p2 := persistentalloc(uintptr(m)*unsafe.Sizeof(gcDeadWinSite{}), 0, &memstats.other_sys)
+	ns := unsafe.Slice((*gcDeadWinSite)(p2), m)
+	copy(ns, gcDeadWinSites)
+	gcDeadWinSites = ns
+}
 
 // gcDeadWindowPrint prints the per-GC-cycle gcdeadwindow report: objects
 // allocated and freed during the last cycle, plus everything allocated
@@ -2854,25 +2887,24 @@ func gcDeadWindowPrint() {
 	defer unlock(&gcDeadWindowPrintLock)
 
 	// Allocate persistent storage on first call.
-	if gcDeadWinRawData == nil {
-		p := persistentalloc(unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadWinRawEntry{}), 0, &memstats.other_sys)
-		gcDeadWinRawData = (*[gcDeadTraceMaxSites]gcDeadWinRawEntry)(p)
-		p2 := persistentalloc(unsafe.Sizeof([gcDeadTraceMaxSites]gcDeadWinSite{}), 0, &memstats.other_sys)
-		gcDeadWinSitesData = (*[gcDeadTraceMaxSites]gcDeadWinSite)(p2)
+	if gcDeadWinRaw == nil {
+		p := persistentalloc(gcDeadWinSitesInitial*unsafe.Sizeof(gcDeadWinRawEntry{}), 0, &memstats.other_sys)
+		gcDeadWinRaw = unsafe.Slice((*gcDeadWinRawEntry)(p), gcDeadWinSitesInitial)
+		p2 := persistentalloc(gcDeadWinSitesInitial*unsafe.Sizeof(gcDeadWinSite{}), 0, &memstats.other_sys)
+		gcDeadWinSites = unsafe.Slice((*gcDeadWinSite)(p2), gcDeadWinSitesInitial)
 		if gcDeadBufData == nil {
 			p3 := persistentalloc(gcDeadTraceBufSize, 0, &memstats.other_sys)
 			gcDeadBufData = (*[gcDeadTraceBufSize]byte)(p3)
 		}
 	}
-	raw := gcDeadWinRawData[:]
-	sites := gcDeadWinSitesData[:]
+	raw := gcDeadWinRaw
+	sites := gcDeadWinSites
 	buf := gcDeadBufData[:]
 
 	// Phase 1: collect per-bucket counters under lock (no symbol lookup).
 	// Per-cycle counters are read-and-cleared (Xchg): this is the internal
 	// per-GC "stop + start" of the window.
 	rawCount := 0
-	droppedSiteCount := 0
 	totalAllocs := uintptr(0)
 	totalAllocBytes := uintptr(0)
 	totalFrees := uintptr(0)
@@ -2954,7 +2986,12 @@ func gcDeadWindowPrint() {
 			raw[idx].freeBytes += fb
 			raw[idx].alive += alive
 			raw[idx].aliveBytes += aliveBytes
-		} else if rawCount < gcDeadTraceMaxSites {
+		} else {
+			if rawCount == len(raw) {
+				gcDeadWinGrow()
+				raw = gcDeadWinRaw
+				sites = gcDeadWinSites
+			}
 			raw[rawCount] = gcDeadWinRawEntry{
 				pcs: pcs, nframes: nframes,
 				allocs: a, allocBytes: ab,
@@ -2962,8 +2999,6 @@ func gcDeadWindowPrint() {
 				alive: alive, aliveBytes: aliveBytes,
 			}
 			rawCount++
-		} else {
-			droppedSiteCount++
 		}
 
 		totalAllocs += a
@@ -3044,7 +3079,13 @@ func gcDeadWindowPrint() {
 			sites[idx].freeBytes += r.freeBytes
 			sites[idx].alive += r.alive
 			sites[idx].aliveBytes += r.aliveBytes
-		} else if siteCount < gcDeadTraceMaxSites {
+		} else {
+			if siteCount == len(sites) {
+				gcDeadWinGrow()
+				raw = gcDeadWinRaw
+				sites = gcDeadWinSites
+				r = &raw[i]
+			}
 			sites[siteCount] = gcDeadWinSite{
 				funcs: key, nframes: r.nframes,
 				allocs: r.allocs, allocBytes: r.allocBytes,
@@ -3052,8 +3093,6 @@ func gcDeadWindowPrint() {
 				alive: r.alive, aliveBytes: r.aliveBytes,
 			}
 			siteCount++
-		} else {
-			droppedSiteCount++
 		}
 	}
 
@@ -3068,17 +3107,37 @@ func gcDeadWindowPrint() {
 		sites[j] = tmp
 	}
 
-	// Phase 4: build output into the buffer.
+	// Phase 4: build output into the buffer. The buffer is flushed to the
+	// output whenever it fills past gcDeadWinFlushThreshold, so a cycle
+	// with very many sites produces multiple writes and is never
+	// truncated; gcDeadTraceBufSize only bounds one write syscall.
 	n := 0
 
+	flush := func() {
+		if n == 0 {
+			return
+		}
+		if gcDeadWindowPath != "" {
+			writeDeadTraceToFile(gcDeadWindowPath, buf[:n])
+		} else {
+			printlock()
+			write(2, unsafe.Pointer(&buf[0]), int32(n))
+			printunlock()
+		}
+		n = 0
+	}
+
 	appendStr := func(s string) {
+		if n >= gcDeadWinFlushThreshold {
+			flush()
+		}
 		m := copy(buf[n:], s)
 		n += m
 	}
 
 	appendUintptr := func(v uintptr) {
-		if n >= gcDeadTraceBufSize {
-			return
+		if n >= gcDeadWinFlushThreshold {
+			flush()
 		}
 		if v == 0 {
 			buf[n] = '0'
@@ -3121,15 +3180,7 @@ func gcDeadWindowPrint() {
 	appendUintptr(uintptr((nanotime() - gcDeadWindowStartTime) / 1e9))
 	appendStr("s ===\n")
 
-	if droppedSiteCount > 0 {
-		appendStr("gcdeadwindow: warning: ")
-		appendUintptr(uintptr(droppedSiteCount))
-		appendStr(" allocation sites dropped (limit ")
-		appendUintptr(gcDeadTraceMaxSites)
-		appendStr(")\n")
-	}
-
-	// Alive report first: most critical, least likely to be truncated.
+	// Alive report first: most critical section.
 	if totalAlive > 0 {
 		aliveSites := uintptr(0)
 		for i := 0; i < siteCount; i++ {
@@ -3193,22 +3244,8 @@ func gcDeadWindowPrint() {
 		}
 	}
 
-	// Phase 5: write output.
-	if n >= gcDeadTraceBufSize {
-		marker := "..TRUNCATED"
-		if n >= len(marker) {
-			copy(buf[n-len(marker):], marker)
-		}
-		n = gcDeadTraceBufSize
-	}
-	if gcDeadWindowPath != "" {
-		writeDeadTraceToFile(gcDeadWindowPath, buf[:n])
-	} else {
-		printlock()
-		write(2, unsafe.Pointer(&buf[0]), int32(n))
-		printunlock()
-	}
-
+	// Phase 5: write whatever is left in the buffer.
+	flush()
 	gcDeadWindowCheckDeadline()
 }
 
