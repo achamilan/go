@@ -30,6 +30,93 @@ func userArenaSpanReserveBytes(spanBytes uintptr) uintptr {
 	return spanBytes/goarch.PtrSize/8 + unsafe.Sizeof(_type{})
 }
 
+// Deferred-fault span cache: freed spans are kept mapped (skipping
+// sysFault/sysMap/memclr on the next same-size alloc) and only really
+// released at the start of the next GC cycle.
+//
+// Correctness: a cached span is still mSpanInUse and unreferenced by the
+// application, so the sweeper would want to recycle it — but the cache
+// holds the span's base pointer in a scanned Go container, so the GC
+// marks it every cycle and the sweeper preserves it (nalloc > 0), exactly
+// like userArena's refs slice. mpSpanCacheFlush drains the cache from
+// gcStart, before any sweep of the new cycle can observe such a span.
+const mpSpanCacheCap = 32
+
+type mpCachedSpan struct {
+	s *mspan
+	x unsafe.Pointer
+}
+
+var mpSpanCache struct {
+	lock mutex
+	m    map[uintptr][]mpCachedSpan // key: npages<<1 | noscan
+	n    int
+}
+
+func mpSpanCacheGet(npages uintptr, noscan bool) (s *mspan, x unsafe.Pointer) {
+	key := npages<<1 | uintptr(b2i(noscan))
+	lockWithRank(&mpSpanCache.lock, lockRankMpArena)
+	if lst := mpSpanCache.m[key]; len(lst) > 0 {
+		c := lst[len(lst)-1]
+		lst[len(lst)-1] = mpCachedSpan{}
+		mpSpanCache.m[key] = lst[:len(lst)-1]
+		mpSpanCache.n--
+		s, x = c.s, c.x
+	}
+	unlock(&mpSpanCache.lock)
+	return s, x
+}
+
+func mpSpanCachePut(s *mspan, x unsafe.Pointer) bool {
+	key := s.npages<<1 | uintptr(b2i(s.spanclass.noscan()))
+	lockWithRank(&mpSpanCache.lock, lockRankMpArena)
+	defer unlock(&mpSpanCache.lock)
+	if mpSpanCache.n >= mpSpanCacheCap {
+		return false
+	}
+	if mpSpanCache.m == nil {
+		mpSpanCache.m = make(map[uintptr][]mpCachedSpan)
+	}
+	mpSpanCache.m[key] = append(mpSpanCache.m[key], mpCachedSpan{s, x})
+	mpSpanCache.n++
+	return true
+}
+
+// mpSpanCacheFlush drains the deferred-fault cache, really releasing
+// every cached span. Called from gcStart with the world stopped.
+func mpSpanCacheFlush() {
+	lockWithRank(&mpSpanCache.lock, lockRankMpArena)
+	m := mpSpanCache.m
+	mpSpanCache.m = nil
+	mpSpanCache.n = 0
+	unlock(&mpSpanCache.lock)
+	// freeUserArenaChunk takes userArenaState/mheap locks; do it after
+	// releasing the cache lock to keep lock nesting simple.
+	for _, lst := range m {
+		for _, c := range lst {
+			freeUserArenaChunk(c.s, c.x)
+		}
+	}
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// mpSpanCacheReinit prepares a cached span for reuse by a new allocation:
+// clears the bitmap (scan spans) and the object area. No page operations
+// and no heap-size accounting: the span never left the heap while cached.
+// GC marking is handled by the caller's common path.
+func mpSpanCacheReinit(s *mspan, x unsafe.Pointer, noscan bool) {
+	if !noscan {
+		s.initHeapBits()
+	}
+	memclrNoHeapPointers(x, s.elemsize)
+}
+
 // mpTypedAllocLarge allocates one object of type typ with size bytes on
 // its own span. size must be at least typ.Size_. The object is zeroed.
 func mpTypedAllocLarge(typ *_type, size uintptr) unsafe.Pointer {
@@ -69,14 +156,20 @@ func mpTypedAllocLarge(typ *_type, size uintptr) unsafe.Pointer {
 	}
 	mp.mallocing = 1
 
-	var span *mspan
-	systemstack(func() {
-		span = mheap_.allocUserArenaSpan(npages, false)
-	})
-	if span == nil {
-		throw("out of memory")
+	// Fast path: reuse a deferred-fault span; no page operations.
+	span, x := mpSpanCacheGet(npages, false)
+	fresh := span == nil
+	if fresh {
+		systemstack(func() {
+			span = mheap_.allocUserArenaSpan(npages, false)
+		})
+		if span == nil {
+			throw("out of memory")
+		}
+		x = unsafe.Pointer(span.base())
+	} else {
+		mpSpanCacheReinit(span, x, false)
 	}
-	x := unsafe.Pointer(span.base())
 
 	// Allocate black during GC. The object is all zeroed, so no scanning
 	// is needed yet. This may race with GC marking, so do it atomically.
@@ -100,7 +193,10 @@ func mpTypedAllocLarge(typ *_type, size uintptr) unsafe.Pointer {
 	// the object according to typ.
 	userArenaHeapBitsSetType(typ, x, span)
 
-	if rate := MemProfileRate; rate > 0 {
+	if rate := MemProfileRate; rate > 0 && fresh {
+		// Cached spans keep their original profile bucket; profiling
+		// again would collide. (Cache-hit allocations are invisible to
+		// the memory profiler, a documented approximation.)
 		c := getMCache(mp)
 		if c == nil {
 			throw("mpTypedAllocLarge called without a P or outside bootstrapping")
@@ -123,9 +219,10 @@ func mpTypedAllocLarge(typ *_type, size uintptr) unsafe.Pointer {
 }
 
 // mpTypedFreeLarge frees an object allocated by mpTypedAllocLarge. The
-// span is returned to the runtime immediately: pages are faulted as soon
-// as the GC phase permits and the address space becomes reusable.
-// Using x after this call will fault (that is the point).
+// span goes to the deferred-fault cache when it has room (no page
+// operations; released at the next gcStart), otherwise it is returned to
+// the runtime immediately: pages are faulted as soon as the GC phase
+// permits and the address space becomes reusable.
 func mpTypedFreeLarge(x unsafe.Pointer) {
 	if x == nil {
 		return
@@ -133,6 +230,9 @@ func mpTypedFreeLarge(x unsafe.Pointer) {
 	s := spanOf(uintptr(x))
 	if s == nil || !s.isUserArenaChunk {
 		throw("mpTypedFreeLarge: pointer not in a typed arena span")
+	}
+	if mpSpanCachePut(s, x) {
+		return
 	}
 	freeUserArenaChunk(s, x)
 }
@@ -295,14 +395,19 @@ func mpAllocLargeNoscan(size uintptr) unsafe.Pointer {
 	}
 	mp.mallocing = 1
 
-	var span *mspan
-	systemstack(func() {
-		span = mheap_.allocUserArenaSpan(npages, true)
-	})
+	// Fast path: reuse a deferred-fault span; no page operations.
+	span, x := mpSpanCacheGet(npages, true)
 	if span == nil {
-		throw("out of memory")
+		systemstack(func() {
+			span = mheap_.allocUserArenaSpan(npages, true)
+		})
+		if span == nil {
+			throw("out of memory")
+		}
+		x = unsafe.Pointer(span.base())
+	} else {
+		mpSpanCacheReinit(span, x, true)
 	}
-	x := unsafe.Pointer(span.base())
 
 	if gcphase != _GCoff {
 		gcmarknewobject(span, span.base())

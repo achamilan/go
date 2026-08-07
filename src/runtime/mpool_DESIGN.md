@@ -144,9 +144,22 @@ typed 与 noscan 共用 `(*mheap).allocUserArenaSpan(npages, noscan)`——
 4. GC 相位检查（marktermination 禁入）、assist credit、`gcmarknewobject`、
    sanitizer 钩子、heapLive 记账全套对齐 userArena
 
-### 3.2 释放（立即物理释放的关键）
+### 3.2 释放与延迟 fault 缓存
 
-`freeUserArenaChunk` → `setUserArenaChunkToFault`：
+**缓存路径（热点）**：`mpTypedFreeLarge` 优先把 span 放进 `mpSpanCache`
+（容量 32，按 `npages|noscan` 分键），不做任何页操作；同尺寸 Alloc 直接命中——
+只剩位图清零 + 对象区 memset + 记账，**~1.6µs/op（对比无缓存 196µs/op，122×）**。
+
+**正确性关键**：缓存的 span 仍是 mSpanInUse 且不被应用引用，sweeper 本应将
+其回收（并要求它在 quarantineList 上，否则 throw）——但缓存用 Go map 持有
+span 基址（GC 扫描容器），GC 每轮都会标记它，sweep 见到 nalloc>0 即保留，
+与 userArena 的 `refs` 保活机制同构。`mpSpanCacheFlush` 在 **gcStart**（STW，
+`mpFlushAll` 旁）drain 全部缓存 span 走真正释放，保证新一轮 sweep 之前没有
+"活着但无引用"的缓存 span。其它细节：缓存命中跳过 profilealloc（避免
+profile bucket 冲突，内存 profiler 对命中分配不可见，属已文档化的近似）。
+
+**真正释放路径**（缓存满 / drain 时）：`freeUserArenaChunk` →
+`setUserArenaChunkToFault`：
 - GC 不在标记期：立即 `sysFault`——**物理内存马上还 OS**，地址空间保留
 - GC 标记期：进 fault 队列，GC 结束时批量 fault
 - span 进 quarantine → sweeper 确认无引用后移入 readyList（地址空间回收复用）
@@ -170,7 +183,8 @@ typed 与 noscan 共用 `(*mheap).allocUserArenaSpan(npages, noscan)`——
 | mpMalloc/mpFree (128B) | **4.4 ns/op** |
 | 原模块版（sync.Pool 亲和） | 12 ns/op |
 | sync.Pool Get/Put | ~4-19 ns/op |
-| span alloc+free（typed/noscan） | ~196 µs/op（页系统调用） |
+| span alloc+free（缓存命中） | **~1.6 µs/op**（memset + 记账） |
+| span alloc+free（缓存未命中/直接释放） | ~196 µs/op（页系统调用） |
 
 高并发压测（32 workers，64KB~2MB 随机，ring 驻留，逐页写入，2s/模式）：
 
@@ -241,7 +255,8 @@ runtime 内部（`src/runtime/`）：
 
 ## 8. 已知限制与后续方向
 
-- span 层每次 alloc/free 有页系统调用（~196µs），可加"延迟 fault 缓存"优化
+- 延迟 fault 缓存按精确 npages 命中，随机尺寸负载命中率低（真实 buffer 池
+  尺寸聚簇时效果好）；缓存命中对内存 profiler 不可见（近似）
 - mpool 字节层 GC 版驻留 = chunk 高水位（arena 语义固有）
 - 公共包目前只暴露基础 API；观测接口（ChunkCount 等）仅在 runtime 测试钩子层
 - `-race` 需 cgo（本机 Windows 不可用），并发正确性靠压测覆盖

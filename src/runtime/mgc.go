@@ -860,6 +860,10 @@ func gcStart(trigger gcTrigger) {
 	// idle chunks can be reclaimed this cycle.
 	mpFlushAll()
 
+	// Really release every span in the deferred-fault cache, before any
+	// sweep of this cycle can observe a cached span as unreferenced.
+	mpSpanCacheFlush()
+
 	work.cycles.Add(1)
 
 	// Assists and workers can start the moment we start
