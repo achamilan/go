@@ -120,6 +120,10 @@ hchan,
 # User arena state
 NONE < userArenaState;
 
+# Manual memory pool (mpool): per-class central caches are taken before
+# the arena registry lock.
+NONE < mpCentral < mpArena;
+
 # Tracing without a P uses a global trace buffer.
 scavenge
 # Above TRACEGLOBAL can emit a trace event without a P.
@@ -138,6 +142,8 @@ allg,
   execR, # May grow stack
   execW, # May allocate after BeforeFork
   hchan,
+  mpCentral,
+  mpArena,
   notifyList,
   reflectOffs,
   timer,

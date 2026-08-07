@@ -856,6 +856,10 @@ func gcStart(trigger gcTrigger) {
 	// reclaimed until the next GC cycle.
 	clearpools()
 
+	// Flush mpool's per-P caches back to the central caches so that fully
+	// idle chunks can be reclaimed this cycle.
+	mpFlushAll()
+
 	work.cycles.Add(1)
 
 	// Assists and workers can start the moment we start

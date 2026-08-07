@@ -2122,3 +2122,31 @@ func MallocGC(size uintptr, typ *abi.Type, needzero bool) unsafe.Pointer {
 func FuncNamePiecesForPrint(name string) (string, string, string, string, string) {
 	return funcNamePiecesForPrint(name)
 }
+
+// Manual memory pool (mpool) test hooks.
+
+var (
+	MPMalloc     = mpMalloc
+	MPCalloc     = mpCalloc
+	MPFree       = mpFree
+	MPRealloc    = mpRealloc
+	MPUsableSize = mpUsableSize
+)
+
+func MPChunkCount() int { return mpGlobal.arena.chunkCount() }
+
+func MPFlushAllPs() { mpFlushAll() }
+
+// Typed large allocation (one object, one span; immediate release).
+
+func MPTypedAllocLarge(t *abi.Type, size uintptr) unsafe.Pointer {
+	return mpTypedAllocLarge(t, size)
+}
+
+func MPTypedFreeLarge(p unsafe.Pointer) { mpTypedFreeLarge(p) }
+
+// Noscan large allocation (one object, one span; immediate release).
+
+func MPAllocLargeNoscan(size uintptr) unsafe.Pointer { return mpAllocLargeNoscan(size) }
+
+func MPFreeLargeNoscan(p unsafe.Pointer) { mpFreeLargeNoscan(p) }
