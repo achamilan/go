@@ -117,6 +117,12 @@ func BenchmarkMPTypedLarge(b *testing.B) {
 // force physical commit. alloc/free are supplied by the caller so the
 // same workload can compare mpTypedAllocLarge against make.
 func mpLargeStress(t *testing.T, workers int, dur time.Duration, alloc func(uintptr) unsafe.Pointer, free func(unsafe.Pointer, uintptr)) (ops int64, peakInuse, endReleased uint64) {
+	return mpLargeStressSizes(t, workers, dur, nil, alloc, free)
+}
+
+// mpLargeStressSizes is mpLargeStress with an explicit size set; a nil
+// sizes slice means the default uniform 64KB..2MB random distribution.
+func mpLargeStressSizes(t *testing.T, workers int, dur time.Duration, sizes []uintptr, alloc func(uintptr) unsafe.Pointer, free func(unsafe.Pointer, uintptr)) (ops int64, peakInuse, endReleased uint64) {
 	t.Helper()
 	var total atomic.Int64
 	var peak atomic.Uint64
@@ -160,8 +166,13 @@ func mpLargeStress(t *testing.T, workers int, dur time.Duration, alloc func(uint
 					return
 				default:
 				}
-				// 64KB .. 2MB, uniform.
-				sz := uintptr(64<<10) + uintptr(r.Intn(1984<<10))
+				// 64KB .. 2MB, uniform; or from the explicit size set.
+				var sz uintptr
+				if len(sizes) > 0 {
+					sz = sizes[r.Intn(len(sizes))]
+				} else {
+					sz = uintptr(64<<10) + uintptr(r.Intn(1984<<10))
+				}
 				p := alloc(sz)
 				// Touch every page to force commit.
 				for off := uintptr(0); off < sz; off += 4096 {

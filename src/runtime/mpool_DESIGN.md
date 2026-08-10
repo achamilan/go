@@ -190,16 +190,25 @@ profile bucket 冲突，内存 profiler 对命中分配不可见，属已文档�
 
 | 模式 | 吞吐 | 峰值 HeapInuse |
 |---|---|---|
-| **sync.Pool**（2 幂分桶） | **949K ops/s** | 365MB |
-| make | 22.4K ops/s | 1102MB（GC 节奏回收） |
-| typed span | 8.3K ops/s | **168MB**（≈活集合 128MB） |
-| noscan span | 7.1K ops/s | **171MB** |
+| **sync.Pool**（2 幂分桶） | **891K ops/s** | 361MB |
+| make | 19.3K ops/s | 868MB（GC 节奏回收） |
+| typed span | 9.2K ops/s | **208MB** |
+| noscan span | 8.4K ops/s | **204MB** |
+
+固定尺寸集压测（64/128/256/512KB 四档，真实 buffer 池形态，缓存可命中）：
+
+| 模式 | 吞吐 | 峰值 HeapInuse |
+|---|---|---|
+| **sync.Pool** | **10.3M ops/s** | 127MB |
+| **noscan span** | **147K ops/s** | **51MB** |
+| **typed span** | **136K ops/s** | **55MB** |
+| make | 96K ops/s | 548MB |
 
 结论：
 - **sync.Pool 在稳态复用负载下吞吐碾压**（桶命中时纯复用，无分配无页操作），
   但峰值内存取决于池内缓存量且 GC 清池后需重建——它是缓存，不是分配契约
-- **span 层用页系统调用换内存地板**：峰值即活水位，Free 立即物理释放，
-  适合内存敏感/突发型负载
+- **span 层用页系统调用换内存地板**：峰值即活水位，Free 立即物理释放；
+  延迟 fault 缓存让尺寸聚簇负载下吞吐**反超 make**（147K vs 96K）且内存低 10 倍
 - mpool 字节层用 chunk 高水位换 4ns 级的确定性分配
 - 选型：要吞吐选 sync.Pool，要内存地板选 span，要小对象确定性高频选 mpool
 

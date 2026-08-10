@@ -107,3 +107,39 @@ func TestMPNoscanLargeStress(t *testing.T) {
 	t.Logf("sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops4, float64(ops4)/dur.Seconds(), float64(peak4)/(1<<20), float64(released4)/(1<<20))
 }
+
+// TestMPSpanStressFixedSizes uses a small discrete size set (realistic
+// buffer-pool shape) where the deferred-fault cache can actually hit.
+func TestMPSpanStressFixedSizes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("stress test")
+	}
+	const workers = 32
+	const dur = 2 * time.Second
+	sizes := []uintptr{64 << 10, 128 << 10, 256 << 10, 512 << 10}
+
+	ops, peak, released := mpLargeStressSizes(t, workers, dur, sizes, MPAllocLargeNoscan, mpStressWrapFree(MPFreeLargeNoscan))
+	t.Logf("noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+		ops, float64(ops)/dur.Seconds(), float64(peak)/(1<<20), float64(released)/(1<<20))
+
+	ops3, peak3, released3 := mpLargeStressSizes(t, workers, dur, sizes,
+		func(sz uintptr) unsafe.Pointer {
+			return MPTypedAllocLarge(mpTypedNodeType, max(mpTypedNodeSize, sz))
+		},
+		mpStressWrapFree(MPTypedFreeLarge))
+	t.Logf("typed:  %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+		ops3, float64(ops3)/dur.Seconds(), float64(peak3)/(1<<20), float64(released3)/(1<<20))
+
+	ops2, peak2, released2 := mpLargeStressSizes(t, workers, dur, sizes,
+		func(sz uintptr) unsafe.Pointer {
+			b := make([]byte, sz)
+			return unsafe.Pointer(unsafe.SliceData(b))
+		},
+		func(unsafe.Pointer, uintptr) {})
+	t.Logf("make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+		ops2, float64(ops2)/dur.Seconds(), float64(peak2)/(1<<20), float64(released2)/(1<<20))
+
+	ops4, peak4, released4 := mpLargeStressSizes(t, workers, dur, sizes, mpStressPoolAlloc, mpStressPoolFree)
+	t.Logf("sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+		ops4, float64(ops4)/dur.Seconds(), float64(peak4)/(1<<20), float64(released4)/(1<<20))
+}
