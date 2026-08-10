@@ -854,9 +854,7 @@ func (s *mspan) setUserArenaChunkToFault() {
 	if !s.isUserArenaChunk {
 		throw("invalid span in heapArena for user arena")
 	}
-	if s.npages*pageSize != userArenaChunkBytes {
-		throw("span on userArena.faultList has invalid size")
-	}
+	// Note: spans from mpTypedAllocLarge may have any size.
 
 	// Update the span class to be noscan. What we want to happen is that
 	// any pointer into the span keeps it from getting recycled, so we want
@@ -935,9 +933,7 @@ func freeUserArenaChunk(s *mspan, x unsafe.Pointer) {
 	if !s.isUserArenaChunk {
 		throw("span is not for a user arena")
 	}
-	if s.npages*pageSize != userArenaChunkBytes {
-		throw("invalid user arena span size")
-	}
+	// Note: spans from mpTypedAllocLarge may have any size.
 
 	// Mark the region as free to various sanitizers immediately instead
 	// of handling them at sweep time.
@@ -993,13 +989,18 @@ func (h *mheap) allocUserArenaChunk() *mspan {
 	var s *mspan
 	var base uintptr
 
-	// First check the free list.
+	// First check the free list. Variable-size spans (from
+	// mpTypedAllocLarge) may share the list; skip those.
 	lock(&h.lock)
-	if !h.userArena.readyList.isEmpty() {
-		s = h.userArena.readyList.first
-		h.userArena.readyList.remove(s)
-		base = s.base()
-	} else {
+	for c := h.userArena.readyList.first; c != nil; c = c.next {
+		if c.npages == userArenaChunkPages {
+			h.userArena.readyList.remove(c)
+			s = c
+			base = c.base()
+			break
+		}
+	}
+	if base == 0 {
 		// Free list was empty, so allocate a new arena.
 		hintList := &h.userArena.arenaHints
 		if raceenabled {

@@ -101,6 +101,10 @@ hchan, root, timers, timer, notifyList, reflectOffs < synctest;
 # User arena state
 NONE < userArenaState;
 
+# Manual memory pool (mpool): per-class central caches are taken before
+# the arena registry lock.
+NONE < mpCentral < mpArena;
+
 # Tracing without a P uses a global trace buffer.
 scavenge
 # Above TRACEGLOBAL can emit a trace event without a P.
@@ -122,6 +126,8 @@ allg,
   notifyList,
   reflectOffs,
   timer,
+  mpCentral,
+  mpArena,
   traceStrings,
   userArenaState
 # Above MALLOC are things that can allocate memory.

@@ -639,6 +639,7 @@ type p struct {
 	sysmontick  sysmontick // last tick observed by sysmon
 	m           muintptr   // back-link to associated m (nil if idle)
 	mcache      *mcache
+	mpcache     mpThreadCache // mpool per-P free block caches
 	pcache      pageCache
 	raceprocctx uintptr
 

@@ -1879,3 +1879,31 @@ func (b BitCursor) Write(data *byte, cnt uintptr) {
 func (b BitCursor) Offset(cnt uintptr) BitCursor {
 	return BitCursor{b: b.b.offset(cnt)}
 }
+
+// Manual memory pool (mpool) test hooks.
+
+var (
+	MPMalloc     = mpMalloc
+	MPCalloc     = mpCalloc
+	MPFree       = mpFree
+	MPRealloc    = mpRealloc
+	MPUsableSize = mpUsableSize
+)
+
+func MPChunkCount() int { return mpGlobal.arena.chunkCount() }
+
+func MPFlushAllPs() { mpFlushAll() }
+
+// Typed large allocation (one object, one span; immediate release).
+
+func MPTypedAllocLarge(t *abi.Type, size uintptr) unsafe.Pointer {
+	return mpTypedAllocLarge(t, size)
+}
+
+func MPTypedFreeLarge(p unsafe.Pointer) { mpTypedFreeLarge(p) }
+
+// Noscan large allocation (one object, one span; immediate release).
+
+func MPAllocLargeNoscan(size uintptr) unsafe.Pointer { return mpAllocLargeNoscan(size) }
+
+func MPFreeLargeNoscan(p unsafe.Pointer) { mpFreeLargeNoscan(p) }
