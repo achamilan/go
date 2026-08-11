@@ -59,3 +59,39 @@ func TestConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+type ptrlessObj struct {
+	magic uint32
+	val   int64
+	pad   [64 << 10]byte
+}
+
+type withPtr struct {
+	next *withPtr
+	pad  [64 << 10]byte
+}
+
+func TestAllocObject(t *testing.T) {
+	o := mempool.AllocObject[ptrlessObj]()
+	if o == nil {
+		t.Fatal("AllocObject returned nil")
+	}
+	if o.magic != 0 || o.val != 0 {
+		t.Fatal("not zeroed")
+	}
+	o.magic = 0xDEADBEEF
+	runtime.GC()
+	if o.magic != 0xDEADBEEF {
+		t.Fatal("data corrupted after GC")
+	}
+	mempool.FreeObject(o)
+}
+
+func TestAllocObjectRejectsPointers(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic for pointer-containing type")
+		}
+	}()
+	mempool.AllocObject[withPtr]()
+}

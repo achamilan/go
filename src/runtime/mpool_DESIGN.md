@@ -9,16 +9,24 @@ Go runtime 内的手动内存分配器，**单一职责：大的无指针对象�
 ```go
 import "mempool"
 
+// 原始字节 buffer
 p := mempool.AllocSpan(size)   // 一对象一 span；内存已清零；noscan
 mempool.FreeSpan(p)            // 立即还物理内存；FreeSpan(nil) 是 no-op
+
+// 无指针复杂类型（泛型封装，带约束检查）
+type Header struct { Magic uint32; Pad [64 << 10]byte }
+h := mempool.AllocObject[Header]()  // T 含指针时 panic
+h.Magic = 0xDEADBEEF
+mempool.FreeObject(h)
 ```
 
 调用约定（C 语义，违反即未定义行为）：
 
-- **内存不被 GC 扫描（noscan），禁止存放 Go 指针**（指向的对象会被回收）
+- **内存不被 GC 扫描（noscan），禁止存放 Go 指针**（指向的对象会被回收）；
+  `AllocObject` 在分配时检查 `T.Pointers()`，含指针直接 panic
 - Free 后访问**会段错误**（sysFault 的 fault 页，这是特性）
 - 重复 Free / Free 非本包指针：未定义行为
-- 适用：>1KB 的纯字节数据（IO buffer、序列化缓冲等）；
+- 适用：>1KB 的纯字节/纯值数据（IO buffer、序列化缓冲、无指针结构体等）；
   小于 1KB 或含指针的对象请用普通 Go 分配 / sync.Pool
 
 ## 2. 架构

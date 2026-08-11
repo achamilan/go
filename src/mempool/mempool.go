@@ -18,7 +18,10 @@
 //     undefined behavior.
 package mempool
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
 
 // AllocSpan allocates size bytes on its own span. The memory is zeroed,
 // is not scanned by the garbage collector (it must not contain Go
@@ -28,6 +31,23 @@ func AllocSpan(size uintptr) unsafe.Pointer { return runtime_mempool_AllocSpan(s
 
 // FreeSpan frees a span allocated by AllocSpan. FreeSpan(nil) is a no-op.
 func FreeSpan(p unsafe.Pointer) { runtime_mempool_FreeSpan(p) }
+
+// AllocObject allocates one zeroed object of type T on its own span.
+// T must not contain pointers (no pointers, slices, strings, maps,
+// channels, functions, or interfaces); it panics otherwise.
+// Free with FreeObject or FreeSpan.
+func AllocObject[T any]() *T {
+	t := abi.TypeOf((*T)(nil)).Elem()
+	if t.Pointers() {
+		panic("mempool: AllocObject requires a pointer-free type")
+	}
+	return (*T)(AllocSpan(t.Size_))
+}
+
+// FreeObject frees an object allocated by AllocObject.
+func FreeObject[T any](p *T) {
+	FreeSpan(unsafe.Pointer(p))
+}
 
 //go:linkname runtime_mempool_AllocSpan
 func runtime_mempool_AllocSpan(size uintptr) unsafe.Pointer

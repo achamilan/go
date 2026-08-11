@@ -1,2 +1,4 @@
+pkg mempool, func AllocObject[T any]() *T #76986
 pkg mempool, func AllocSpan(uintptr) unsafe.Pointer #76986
+pkg mempool, func FreeObject[T any](*T) #76986
 pkg mempool, func FreeSpan(unsafe.Pointer) #76986

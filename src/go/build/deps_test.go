@@ -106,7 +106,7 @@ var depsRules = `
 	< internal/oserror;
 
 	# Manual memory allocation.
-	unsafe
+	internal/abi, unsafe
 	< mempool;
 
 	cmp, runtime, math/bits
