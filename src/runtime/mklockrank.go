@@ -101,9 +101,8 @@ hchan, root, timers, timer, notifyList, reflectOffs < synctest;
 # User arena state
 NONE < userArenaState;
 
-# Manual memory pool (mpool): per-class central caches are taken before
-# the arena registry lock.
-NONE < mpCentral < mpArena;
+# Manual memory pool (mpool): deferred-fault span cache lock.
+NONE < mpArena;
 
 # Tracing without a P uses a global trace buffer.
 scavenge
@@ -126,7 +125,6 @@ allg,
   notifyList,
   reflectOffs,
   timer,
-  mpCentral,
   mpArena,
   traceStrings,
   userArenaState

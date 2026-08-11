@@ -5,8 +5,10 @@
 package runtime_test
 
 import (
+	"math/rand"
 	. "runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -75,6 +77,132 @@ func TestMPNoscanLargeConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
+// mpLargeStress drives a high-concurrency, high-churn workload of large
+// allocations: each worker keeps a small ring of live objects, evicting
+// (freeing) the oldest on every iteration, and touches every page to
+// force physical commit. alloc/free are supplied by the caller so the
+// same workload can compare different allocation paths.
+func mpLargeStress(t *testing.T, workers int, dur time.Duration, alloc func(uintptr) unsafe.Pointer, free func(unsafe.Pointer, uintptr)) (ops int64, peakInuse, endReleased uint64) {
+	return mpLargeStressSizes(t, workers, dur, nil, alloc, free)
+}
+
+// mpLargeStressSizes is mpLargeStress with an explicit size set; a nil
+// sizes slice means the default uniform 64KB..2MB random distribution.
+func mpLargeStressSizes(t *testing.T, workers int, dur time.Duration, sizes []uintptr, alloc func(uintptr) unsafe.Pointer, free func(unsafe.Pointer, uintptr)) (ops int64, peakInuse, endReleased uint64) {
+	t.Helper()
+	var total atomic.Int64
+	var peak atomic.Uint64
+	stop := make(chan struct{})
+
+	// Peak HeapInuse sampler.
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var ms MemStats
+			ReadMemStats(&ms)
+			if ms.HeapInuse > peak.Load() {
+				peak.Store(ms.HeapInuse)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(seed))
+			const ringSize = 4
+			ring := make([]unsafe.Pointer, ringSize)
+			ringSz := make([]uintptr, ringSize)
+			i := 0
+			for {
+				select {
+				case <-stop:
+					for j := range ring {
+						if ring[j] != nil {
+							free(ring[j], ringSz[j])
+						}
+					}
+					return
+				default:
+				}
+				// 64KB .. 2MB, uniform; or from the explicit size set.
+				var sz uintptr
+				if len(sizes) > 0 {
+					sz = sizes[r.Intn(len(sizes))]
+				} else {
+					sz = uintptr(64<<10) + uintptr(r.Intn(1984<<10))
+				}
+				p := alloc(sz)
+				// Touch every page to force commit.
+				for off := uintptr(0); off < sz; off += 4096 {
+					*(*byte)(unsafe.Add(p, off)) = 1
+				}
+				if ring[i] != nil {
+					free(ring[i], ringSz[i])
+				}
+				ring[i], ringSz[i] = p, sz
+				i = (i + 1) % ringSize
+				total.Add(1)
+			}
+		}(int64(w)*7919 + 1)
+	}
+	time.Sleep(dur)
+	close(stop)
+	wg.Wait()
+
+	GC()
+	GC()
+	var ms MemStats
+	ReadMemStats(&ms)
+	return total.Load(), peak.Load(), ms.HeapReleased
+}
+
+// sync.Pool mode for the stress workload: power-of-two bucketed []byte pools.
+var mpStressPools [16]sync.Pool // bucket i holds 64KB<<i buffers
+
+func mpStressPoolBucket(size uintptr) (int, uintptr) {
+	n := uintptr(64 << 10)
+	for i := 0; ; i++ {
+		if n >= size {
+			return i, n
+		}
+		n <<= 1
+	}
+}
+
+func mpStressPoolAlloc(size uintptr) unsafe.Pointer {
+	i, n := mpStressPoolBucket(size)
+	b, _ := mpStressPools[i].Get().([]byte)
+	if cap(b) < int(n) {
+		b = make([]byte, n)
+	}
+	b = b[:n]
+	return unsafe.Pointer(unsafe.SliceData(b))
+}
+
+func mpStressPoolFree(p unsafe.Pointer, size uintptr) {
+	i, n := mpStressPoolBucket(size)
+	mpStressPools[i].Put(unsafe.Slice((*byte)(p), n))
+}
+
+func mpStressWrapFree(f func(unsafe.Pointer)) func(unsafe.Pointer, uintptr) {
+	return func(p unsafe.Pointer, _ uintptr) { f(p) }
+}
+
+func mpStressMakeAlloc(sz uintptr) unsafe.Pointer {
+	b := make([]byte, sz)
+	return unsafe.Pointer(unsafe.SliceData(b))
+}
+
+func mpStressNoFree(unsafe.Pointer, uintptr) {}
+
 func TestMPNoscanLargeStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
@@ -86,20 +214,7 @@ func TestMPNoscanLargeStress(t *testing.T) {
 	t.Logf("noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops, float64(ops)/dur.Seconds(), float64(peak)/(1<<20), float64(released)/(1<<20))
 
-	ops3, peak3, released3 := mpLargeStress(t, workers, dur,
-		func(sz uintptr) unsafe.Pointer {
-			return MPTypedAllocLarge(mpTypedNodeType, max(mpTypedNodeSize, sz))
-		},
-		mpStressWrapFree(MPTypedFreeLarge))
-	t.Logf("typed:  %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
-		ops3, float64(ops3)/dur.Seconds(), float64(peak3)/(1<<20), float64(released3)/(1<<20))
-
-	ops2, peak2, released2 := mpLargeStress(t, workers, dur,
-		func(sz uintptr) unsafe.Pointer {
-			b := make([]byte, sz)
-			return unsafe.Pointer(unsafe.SliceData(b))
-		},
-		func(unsafe.Pointer, uintptr) {})
+	ops2, peak2, released2 := mpLargeStress(t, workers, dur, mpStressMakeAlloc, mpStressNoFree)
 	t.Logf("make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops2, float64(ops2)/dur.Seconds(), float64(peak2)/(1<<20), float64(released2)/(1<<20))
 
@@ -122,20 +237,7 @@ func TestMPSpanStressFixedSizes(t *testing.T) {
 	t.Logf("noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops, float64(ops)/dur.Seconds(), float64(peak)/(1<<20), float64(released)/(1<<20))
 
-	ops3, peak3, released3 := mpLargeStressSizes(t, workers, dur, sizes,
-		func(sz uintptr) unsafe.Pointer {
-			return MPTypedAllocLarge(mpTypedNodeType, max(mpTypedNodeSize, sz))
-		},
-		mpStressWrapFree(MPTypedFreeLarge))
-	t.Logf("typed:  %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
-		ops3, float64(ops3)/dur.Seconds(), float64(peak3)/(1<<20), float64(released3)/(1<<20))
-
-	ops2, peak2, released2 := mpLargeStressSizes(t, workers, dur, sizes,
-		func(sz uintptr) unsafe.Pointer {
-			b := make([]byte, sz)
-			return unsafe.Pointer(unsafe.SliceData(b))
-		},
-		func(unsafe.Pointer, uintptr) {})
+	ops2, peak2, released2 := mpLargeStressSizes(t, workers, dur, sizes, mpStressMakeAlloc, mpStressNoFree)
 	t.Logf("make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops2, float64(ops2)/dur.Seconds(), float64(peak2)/(1<<20), float64(released2)/(1<<20))
 

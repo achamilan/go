@@ -1,9 +1,2 @@
 pkg mempool, func AllocSpan(uintptr) unsafe.Pointer #76986
-pkg mempool, func AllocSpanTyped[T any]() *T #76986
-pkg mempool, func Calloc(uintptr, uintptr) unsafe.Pointer #76986
-pkg mempool, func Free(unsafe.Pointer) #76986
 pkg mempool, func FreeSpan(unsafe.Pointer) #76986
-pkg mempool, func FreeSpanTyped[T any](*T) #76986
-pkg mempool, func Malloc(uintptr) unsafe.Pointer #76986
-pkg mempool, func Realloc(unsafe.Pointer, uintptr) unsafe.Pointer #76986
-pkg mempool, func UsableSize(unsafe.Pointer) uintptr #76986

@@ -738,10 +738,6 @@ func gcStart(trigger gcTrigger) {
 	// reclaimed until the next GC cycle.
 	clearpools()
 
-	// Flush mpool's per-P caches back to the central caches so that fully
-	// idle chunks can be reclaimed this cycle.
-	mpFlushAll()
-
 	// Really release every span in the deferred-fault cache, before any
 	// sweep of this cycle can observe a cached span as unreferenced.
 	mpSpanCacheFlush()
