@@ -5,7 +5,9 @@
 package runtime_test
 
 import (
+	"fmt"
 	"math/rand"
+	"os"
 	. "runtime"
 	"sync"
 	"sync/atomic"
@@ -13,6 +15,24 @@ import (
 	"time"
 	"unsafe"
 )
+
+// mpStressLogFile, when the MPSTRESS_LOG env var names a file, receives
+// every stress-test result line (in addition to t.Logf output).
+var mpStressLogFile = sync.OnceValues(func() (*os.File, error) {
+	path := os.Getenv("MPSTRESS_LOG")
+	if path == "" {
+		return nil, nil
+	}
+	return os.Create(path)
+})
+
+func mpStressLog(t *testing.T, format string, args ...any) {
+	t.Helper()
+	t.Logf(format, args...)
+	if f, _ := mpStressLogFile(); f != nil {
+		fmt.Fprintf(f, t.Name()+": "+format+"\n", args...)
+	}
+}
 
 func TestMPNoscanLargeBasic(t *testing.T) {
 	for _, sz := range []uintptr{1025, 4096, 100 << 10, 2 << 20, 8 << 20} {
@@ -211,15 +231,15 @@ func TestMPNoscanLargeStress(t *testing.T) {
 	const dur = 2 * time.Second
 
 	ops, peak, released := mpLargeStress(t, workers, dur, MPAllocLargeNoscan, mpStressWrapFree(MPFreeLargeNoscan))
-	t.Logf("noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops, float64(ops)/dur.Seconds(), float64(peak)/(1<<20), float64(released)/(1<<20))
 
 	ops2, peak2, released2 := mpLargeStress(t, workers, dur, mpStressMakeAlloc, mpStressNoFree)
-	t.Logf("make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops2, float64(ops2)/dur.Seconds(), float64(peak2)/(1<<20), float64(released2)/(1<<20))
 
 	ops4, peak4, released4 := mpLargeStress(t, workers, dur, mpStressPoolAlloc, mpStressPoolFree)
-	t.Logf("sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops4, float64(ops4)/dur.Seconds(), float64(peak4)/(1<<20), float64(released4)/(1<<20))
 }
 
@@ -234,14 +254,14 @@ func TestMPSpanStressFixedSizes(t *testing.T) {
 	sizes := []uintptr{64 << 10, 128 << 10, 256 << 10, 512 << 10}
 
 	ops, peak, released := mpLargeStressSizes(t, workers, dur, sizes, MPAllocLargeNoscan, mpStressWrapFree(MPFreeLargeNoscan))
-	t.Logf("noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops, float64(ops)/dur.Seconds(), float64(peak)/(1<<20), float64(released)/(1<<20))
 
 	ops2, peak2, released2 := mpLargeStressSizes(t, workers, dur, sizes, mpStressMakeAlloc, mpStressNoFree)
-	t.Logf("make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "make:   %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops2, float64(ops2)/dur.Seconds(), float64(peak2)/(1<<20), float64(released2)/(1<<20))
 
 	ops4, peak4, released4 := mpLargeStressSizes(t, workers, dur, sizes, mpStressPoolAlloc, mpStressPoolFree)
-	t.Logf("sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
+	mpStressLog(t, "sync.Pool: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
 		ops4, float64(ops4)/dur.Seconds(), float64(peak4)/(1<<20), float64(released4)/(1<<20))
 }
