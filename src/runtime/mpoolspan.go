@@ -45,6 +45,15 @@ var mpSpanCache struct {
 	n    int
 }
 
+// mpLog prints a span alloc/free debug line when GODEBUG=mpoolspan=1.
+// All lines carry the "[runtime mpool]" prefix for log filtering.
+func mpLog(op string, x unsafe.Pointer, npages uintptr, note string) {
+	if debug.mpoolspan == 0 {
+		return
+	}
+	print("[runtime mpool] ", op, " base=", hex(uintptr(x)), " npages=", npages, " ", note, "\n")
+}
+
 func mpSpanCacheGet(npages uintptr) (s *mspan, x unsafe.Pointer) {
 	lockWithRank(&mpSpanCache.lock, lockRankMpArena)
 	if lst := mpSpanCache.m[npages]; len(lst) > 0 {
@@ -78,8 +87,12 @@ func mpSpanCacheFlush() {
 	lockWithRank(&mpSpanCache.lock, lockRankMpArena)
 	m := mpSpanCache.m
 	mpSpanCache.m = nil
+	n := mpSpanCache.n
 	mpSpanCache.n = 0
 	unlock(&mpSpanCache.lock)
+	if debug.mpoolspan != 0 && n > 0 {
+		print("[runtime mpool] flush drain=", n, " spans\n")
+	}
 	// freeUserArenaChunk takes userArenaState/mheap locks; do it after
 	// releasing the cache lock to keep lock nesting simple.
 	for _, lst := range m {
@@ -131,8 +144,10 @@ func mpAllocLargeNoscan(size uintptr) unsafe.Pointer {
 			throw("out of memory")
 		}
 		x = unsafe.Pointer(span.base())
+		mpLog("alloc", x, npages, "fresh")
 	} else {
 		memclrNoHeapPointers(x, span.elemsize)
+		mpLog("alloc", x, npages, "cache-hit")
 	}
 
 	if gcphase != _GCoff {
@@ -188,8 +203,10 @@ func mpFreeLargeNoscan(x unsafe.Pointer) {
 		throw("mpFreeLargeNoscan: pointer not in an arena span")
 	}
 	if mpSpanCachePut(s, x) {
+		mpLog("free", x, s.npages, "cached")
 		return
 	}
+	mpLog("free", x, s.npages, "fault")
 	freeUserArenaChunk(s, x)
 }
 
@@ -206,6 +223,7 @@ func (h *mheap) allocUserArenaSpan(npages uintptr) *mspan {
 	var s *mspan
 	var base uintptr
 
+	reused := false
 	lock(&h.lock)
 	// Reuse an exact-size faulted span if there is one.
 	for c := h.userArena.readyList.first; c != nil; c = c.next {
@@ -213,6 +231,7 @@ func (h *mheap) allocUserArenaSpan(npages uintptr) *mspan {
 			h.userArena.readyList.remove(c)
 			s = c
 			base = c.base()
+			reused = true
 			break
 		}
 	}
@@ -238,6 +257,11 @@ func (h *mheap) allocUserArenaSpan(npages uintptr) *mspan {
 		s = h.allocMSpanLocked()
 	}
 	unlock(&h.lock)
+	if reused {
+		mpLog("span", unsafe.Pointer(base), npages, "readylist-reuse")
+	} else {
+		mpLog("span", unsafe.Pointer(base), npages, "sysalloc")
+	}
 
 	// Reused spans are faulted (Reserved) and fresh spans are Reserved;
 	// transition to Prepared and then Ready.

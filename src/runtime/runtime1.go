@@ -319,6 +319,7 @@ var debug struct {
 	gctrace                  int32
 	invalidptr               int32
 	madvdontneed             int32 // for Linux; issue 28466
+	mpoolspan                int32 // mpool span alloc/free debug log
 	runtimeContentionStacks  atomic.Int32
 	scavtrace                int32
 	scheddetail              int32
@@ -381,6 +382,7 @@ var dbgvars = []*dbgVar{
 	{name: "inittrace", value: &debug.inittrace},
 	{name: "invalidptr", value: &debug.invalidptr},
 	{name: "madvdontneed", value: &debug.madvdontneed},
+	{name: "mpoolspan", value: &debug.mpoolspan},
 	{name: "panicnil", atomic: &debug.panicnil},
 	{name: "profstackdepth", value: &debug.profstackdepth, def: 128},
 	{name: "runtimecontentionstacks", atomic: &debug.runtimeContentionStacks},

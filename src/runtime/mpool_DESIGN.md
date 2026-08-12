@@ -86,6 +86,28 @@ FreeSpan(p)
 - `TestLockRank`、`go test go/build`（deps 白名单）
 - `go test runtime -short` 全套通过
 
+## 4.1 Debug 日志（GODEBUG=mpoolspan=1）
+
+所有日志带 `[runtime mpool]` 前缀，零成本默认关闭
+（`debug.mpoolspan` 注册于 runtime1.go 的 dbgvars）：
+
+```
+[runtime mpool] span base=0x40c000000000 npages=8 sysalloc      # sysAlloc 新分配
+[runtime mpool] alloc base=0x40c000000000 npages=8 fresh        # 慢路径分配
+[runtime mpool] free  base=0x40c000000000 npages=8 cached       # 进延迟 fault 缓存
+[runtime mpool] alloc base=0x40c000000000 npages=8 cache-hit    # 缓存命中
+[runtime mpool] free  base=... npages=8 fault                   # 缓存满，真释放
+[runtime mpool] flush drain=3 spans                             # gcStart drain
+[runtime mpool] span base=... npages=8 readylist-reuse          # readyList 复用
+```
+
+日志过滤：`grep '\[runtime mpool\]' product.log`。
+
+排查速查：
+- 出现 `fault` 后仍有同 base 的访问崩溃 → 产品 use-after-free
+- 只有 `sysalloc` 无 `cache-hit` → 尺寸太分散，缓存没命中
+- `flush drain=N` 频繁且 N 大 → 缓存驻留集中在 GC 点释放
+
 ## 5. 构建与测试命令（本树）
 
 ```bash
