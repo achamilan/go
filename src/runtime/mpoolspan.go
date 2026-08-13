@@ -225,15 +225,27 @@ func (h *mheap) allocUserArenaSpan(npages uintptr) *mspan {
 
 	reused := false
 	lock(&h.lock)
-	// Reuse an exact-size faulted span if there is one.
+	// Reuse a faulted span from the ready list: best-fit (smallest span
+	// with at least npages), splitting the tail back onto the list.
+	// Exact-match-only would strand the 64MB sysAlloc tail span forever,
+	// wasting a whole heap arena of address space per allocation.
+	var best *mspan
 	for c := h.userArena.readyList.first; c != nil; c = c.next {
-		if c.npages == npages {
-			h.userArena.readyList.remove(c)
-			s = c
-			base = c.base()
-			reused = true
-			break
+		if c.npages >= npages && (best == nil || c.npages < best.npages) {
+			best = c
 		}
+	}
+	if best != nil {
+		h.userArena.readyList.remove(best)
+		if best.npages > npages {
+			tail := h.allocMSpanLocked()
+			tail.init(best.base()+npages*pageSize, best.npages-npages)
+			h.userArena.readyList.insertBack(tail)
+			best.init(best.base(), npages)
+		}
+		s = best
+		base = s.base()
+		reused = true
 	}
 	if base == 0 {
 		hintList := &h.userArena.arenaHints

@@ -63,6 +63,30 @@ FreeSpan(p)
 2. 跳过 `initHeapBits`（零长位图区，否则越界写）与 `largeType` 假类型初始化
    （dummy type 驻留在保留区里；mspan 结构体复用，需置 nil 防残留指针）
 
+### 2.3 VA 密集排列（readyList best-fit + 切分）
+
+`sysAlloc` 内部 `alignUp(n, heapArenaBytes)`——每次新分配都预留 64MB
+（arm64）地址空间。若 readyList 只做精确尺寸匹配，64MB 余量 span 永远
+等不到"正好要 16382 页"的请求 → 每个存活 span 浪费 64MB VA
+（实测：521 个泄漏 span = 33GB VA，直接触发 out of memory）。
+
+修复：readyList 改为 **best-fit（≥npages 的最小 span）+ 尾部切分回表**：
+
+```
+64MB 区域: [span1:12KB][span2:12KB][span3:12KB]...[tail:余量] ← 一个 arena 装 ~5000 个 span
+```
+
+实测 8 个存活 span 的基址间隔 = 精确的 span 大小（16KB），不再 64MB 步进。
+
+## 2.4 内存浪费账本（修复后）
+
+| 维度 | 量级 | 性质 |
+|---|---|---|
+| VA 对齐 | ≈0（页粒度密集排列） | 已修复（2.3） |
+| 页尾 | <8KB / 对象（runtime 页 8KB） | 物理，与 Go 堆同级 |
+| 缓存驻留 | ≤32 span | 物理，有界 |
+| readyList VA | 已释放 span 的地址空间（物理已还） | 仅 VA，供复用 |
+
 ## 3. 性能（go1.24.12，i7-1165G7）
 
 固定尺寸集压测（64/128/256/512KB，32 workers，ring 驻留，逐页写入，2s/模式）：
