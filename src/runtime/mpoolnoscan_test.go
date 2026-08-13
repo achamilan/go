@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"os"
 	. "runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -223,12 +224,29 @@ func mpStressMakeAlloc(sz uintptr) unsafe.Pointer {
 
 func mpStressNoFree(unsafe.Pointer, uintptr) {}
 
+// mpStressParams returns worker count and duration, overridable via
+// MPSTRESS_WORKERS / MPSTRESS_DUR (e.g. MPSTRESS_WORKERS=128 MPSTRESS_DUR=5s).
+func mpStressParams() (int, time.Duration) {
+	workers := 32
+	dur := 2 * time.Second
+	if v := os.Getenv("MPSTRESS_WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
+	if v := os.Getenv("MPSTRESS_DUR"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			dur = d
+		}
+	}
+	return workers, dur
+}
+
 func TestMPNoscanLargeStress(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	const workers = 32
-	const dur = 2 * time.Second
+	workers, dur := mpStressParams()
 
 	ops, peak, released := mpLargeStress(t, workers, dur, MPAllocLargeNoscan, mpStressWrapFree(MPFreeLargeNoscan))
 	mpStressLog(t, "noscan: %d ops (%.0f ops/s), peak HeapInuse %.1fMB, HeapReleased after GC %.1fMB",
@@ -249,8 +267,7 @@ func TestMPSpanStressFixedSizes(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	const workers = 32
-	const dur = 2 * time.Second
+	workers, dur := mpStressParams()
 	sizes := []uintptr{64 << 10, 128 << 10, 256 << 10, 512 << 10}
 
 	ops, peak, released := mpLargeStressSizes(t, workers, dur, sizes, MPAllocLargeNoscan, mpStressWrapFree(MPFreeLargeNoscan))
