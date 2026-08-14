@@ -49,6 +49,12 @@ type winBlock struct {
 	allocObjs, allocBytes, allocSites int64
 	freedObjs, freedBytes, freedSites int64
 
+	// totalAllocDelta is the gcdeadwindow:totalalloc line: delta of the
+	// runtime's sampling-independent total allocation counter since the
+	// previous report (span granularity).
+	totalAllocDelta int64
+	hasTotalAlloc   bool
+
 	hasAlive, hasAlloc, hasFreed bool
 
 	aliveLines []winSite
@@ -81,6 +87,7 @@ var (
 	aliveSumRe = regexp.MustCompile(`^gcdeadwindow:alive: (\d+) objs \((\d+) bytes\) still alive from (\d+) sites`)
 	allocSumRe = regexp.MustCompile(`^gcdeadwindow:alloc: (\d+) objs \((\d+) bytes\) allocated this cycle from (\d+) sites`)
 	freedSumRe = regexp.MustCompile(`^gcdeadwindow:freed: (\d+) objs \((\d+) bytes\) freed this cycle from (\d+) sites`)
+	totalAllocRe = regexp.MustCompile(`^gcdeadwindow:totalalloc: (\d+) bytes allocated since last report`)
 	siteLineRe = regexp.MustCompile(`^  (.+): (\d+) objs, (\d+) bytes$`)
 	frameRe    = regexp.MustCompile(`^(\S+) \(([^)]+)\)`)
 	// gctrace lines teed into the report file by the runtime when the
@@ -177,6 +184,12 @@ func parseWindowFile(path string) (*parsedWindow, error) {
 			blk.hasFreed = true
 			blk.freedObjs, blk.freedBytes, blk.freedSites = atoi64(m[1]), atoi64(m[2]), atoi64(m[3])
 			section = "freed"
+			continue
+		}
+		if m := totalAllocRe.FindStringSubmatch(line); m != nil {
+			blk.hasTotalAlloc = true
+			blk.totalAllocDelta = atoi64(m[1])
+			section = ""
 			continue
 		}
 		if strings.HasPrefix(line, "  ") && section != "" {
@@ -666,30 +679,57 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	return s
 }
 
-func buildWindowSitesSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name + " - Sites", colWidths: make([]float64, 11)}
+// buildWindowSiteSheets splits the per-site aggregation into four
+// category sheets: Alloc (all sites by alloc volume), Freed (sites with
+// frees), Fully Dead (allocated but nothing survives), and Alive
+// (objects still live at window end — leak candidates).
+func buildWindowSiteSheets(pd *parsedWindow) []*xlsxSheet {
 	sites := aggregateSites(pd)
 
-	s.addRow("Mode:", pd.name)
-	s.addRow("Note:", "Alloc/Freed are summed over all reports of the gen; Final Alive is from the gen's last report.")
-	s.addBlank()
-
-	s.addRow("=== Sites by Gen (sorted by alloc bytes) ===")
-	s.addHeaderRow("Gen", "Function", "File:Line",
-		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
-		"Final Alive Objs", "Final Alive MB", "Fully Dead", "Full Stack")
-	for _, a := range sites {
-		fullyDead := ""
-		if a.allocObjs > 0 && a.finalAliveObjs == 0 {
-			fullyDead = "YES"
+	mk := func(suffix, note string, keep func(*siteAgg) bool, sortKey func(*siteAgg) int64) *xlsxSheet {
+		s := &xlsxSheet{name: pd.name + " - " + suffix, colWidths: make([]float64, 11)}
+		var rows []*siteAgg
+		for _, a := range sites {
+			if keep(a) {
+				rows = append(rows, a)
+			}
 		}
-		s.addRow(fmt.Sprint(a.key.gen), a.key.fn, a.key.loc,
-			fmt.Sprint(a.allocObjs), fmtMB2(a.allocBytes),
-			fmt.Sprint(a.freedObjs), fmtMB2(a.freedBytes),
-			fmt.Sprint(a.finalAliveObjs), fmtMB2(a.finalAliveByte),
-			fullyDead, a.stack)
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].key.gen != rows[j].key.gen {
+				return rows[i].key.gen < rows[j].key.gen
+			}
+			return sortKey(rows[i]) > sortKey(rows[j])
+		})
+		s.addRow("Mode:", pd.name)
+		s.addRow("Category:", note)
+		s.addBlank()
+		s.addHeaderRow("Gen", "Function", "File:Line",
+			"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
+			"Final Alive Objs", "Final Alive MB", "Fully Dead", "Full Stack")
+		for _, a := range rows {
+			fullyDead := ""
+			if a.allocObjs > 0 && a.finalAliveObjs == 0 {
+				fullyDead = "YES"
+			}
+			s.addRow(fmt.Sprint(a.key.gen), a.key.fn, a.key.loc,
+				fmt.Sprint(a.allocObjs), fmtMB2(a.allocBytes),
+				fmt.Sprint(a.freedObjs), fmtMB2(a.freedBytes),
+				fmt.Sprint(a.finalAliveObjs), fmtMB2(a.finalAliveByte),
+				fullyDead, a.stack)
+		}
+		return s
 	}
-	return s
+
+	return []*xlsxSheet{
+		mk("Alloc", "全部站点，按分配量排序", func(a *siteAgg) bool { return a.allocObjs > 0 },
+			func(a *siteAgg) int64 { return a.allocBytes }),
+		mk("Freed", "有释放的站点，按释放量排序", func(a *siteAgg) bool { return a.freedObjs > 0 },
+			func(a *siteAgg) int64 { return a.freedBytes }),
+		mk("FullyDead", "全死站点（alloc>0 且窗口结束时无存活）——churn，池化/复用候选", func(a *siteAgg) bool { return a.allocObjs > 0 && a.finalAliveObjs == 0 },
+			func(a *siteAgg) int64 { return a.allocBytes }),
+		mk("Alive", "窗口结束仍有存活的站点，按存活量排序——疑似泄漏/长生命周期", func(a *siteAgg) bool { return a.finalAliveObjs > 0 },
+			func(a *siteAgg) int64 { return a.finalAliveByte }),
+	}
 }
 
 // buildGCCompareSheet compares the window's per-cycle alloc/freed bytes
@@ -710,15 +750,15 @@ func buildWindowSitesSheet(pd *parsedWindow) *xlsxSheet {
 // shifts attribution between adjacent cycles — the cumulative diff columns
 // are the consistency signal.
 func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 14)}
+	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 15)}
 
 	s.addRow("Mode:", pd.name)
-	s.addRow("说明:", "GC Alloc MB = heap1[N] − heap2[N−1]（上周期实际存活 → 本周期标记终止的堆增量 ≈ 本周期全进程分配）；")
-	s.addRow("", "GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
-	s.addRow("", "窗口 alloc/freed 只统计窗口期间分配的对象（精确字节）；gctrace 堆值为全进程 MB 截断整数。")
-	s.addRow("", "差值来源：① MB 截断 ±1MB/值；② freed 差值含窗口前旧对象的垃圾；③ 窗口报告在世界重启后输出，")
-	s.addRow("", "相邻周期存在归属偏移（单行 CHECK 后下一行通常反向冲销）。累计差值仅作趋势参考：MB 截断使其")
-	s.addRow("", "带每周期系统偏置，长窗口会缓慢漂移。Verdict 按单行差值判定（≤ ±2MB 为 OK）。")
+	s.addRow("说明:", "totalAlloc Δ = 块头 gcdeadwindow:totalalloc 行的增量：runtime 累计分配计数（span 粒度，与采样无关，不受")
+	s.addRow("", "sweep 时滞影响）——最可靠的全进程分配口径；Alloc 差值 = 窗口 Alloc − totalAlloc Δ（含 span 空闲槽位，")
+	s.addRow("", "窗口值略低 10~30% 属正常）。GC Alloc MB(heap口径) = heap1[N]−heap2[N−1]，大堆+sweep 滞后时严重失真，")
+	s.addRow("", "仅作参考。GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
+	s.addRow("", "freed 差值来源：MB 截断 ±1MB；窗口前旧对象垃圾（大堆服务此项必然很大，仅作参考）；")
+	s.addRow("", "世界重启后输出的相邻周期归属偏移。Verdict 只看 alloc 侧：|差值| ≤ max(2MB, 30%×totalAllocΔ) 为 OK。")
 	s.addBlank()
 
 	if len(pd.traces) == 0 {
@@ -732,8 +772,10 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	// post-sweep hook both print for one GC, but gctrace has a single
 	// line per GC). Bytes are additive across the two snapshots.
 	type mergedRow struct {
-		gcNum, gen, elapsed      int
-		allocBytes, freedBytes   int64
+		gcNum, gen, elapsed    int
+		allocBytes, freedBytes int64
+		totalAllocDelta        int64
+		hasTotalAlloc          bool
 	}
 	var rows []mergedRow
 	for _, b := range pd.blocks {
@@ -744,6 +786,8 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		if n := len(rows); n > 0 && rows[n-1].gcNum == b.gcNum {
 			rows[n-1].allocBytes += b.allocBytes
 			rows[n-1].freedBytes += b.freedBytes
+			rows[n-1].totalAllocDelta += b.totalAllocDelta
+			rows[n-1].hasTotalAlloc = rows[n-1].hasTotalAlloc || b.hasTotalAlloc
 			if b.elapsed > rows[n-1].elapsed {
 				rows[n-1].elapsed = b.elapsed
 			}
@@ -752,20 +796,37 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		rows = append(rows, mergedRow{
 			gcNum: b.gcNum, gen: b.gen, elapsed: b.elapsed,
 			allocBytes: b.allocBytes, freedBytes: b.freedBytes,
+			totalAllocDelta: b.totalAllocDelta, hasTotalAlloc: b.hasTotalAlloc,
 		})
 	}
 
-	s.addRow("=== 分配/释放对比 (窗口 alloc/freed vs GC日志堆变化) ===")
+	s.addRow("=== 分配/释放对比 (窗口 alloc/freed vs 全进程分配) ===")
 	s.addHeaderRow("GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
-		"窗口 Alloc MB", "GC Alloc MB", "Alloc 差值 MB",
-		"窗口 Freed MB", "GC Freed MB", "Freed 差值 MB",
+		"窗口 Alloc MB", "totalAlloc Δ MB", "Alloc 差值 MB",
+		"GC Alloc MB (heap口径)", "窗口 Freed MB", "GC Freed MB", "Freed 差值 MB",
 		"累计 Alloc 差值 MB", "累计 Freed 差值 MB", "Verdict", "Forced")
+
+	// The final cycle of each gen is excluded: the window closes mid-cycle
+	// (deadline or explicit Stop), so allocations between the close and the
+	// final GC's completion are untracked and the coverage comparison for
+	// that cycle is meaningless. Its data remains in the other sheets.
+	lastCycleOfGen := map[int]int{}
+	for _, r := range rows {
+		lastCycleOfGen[r.gen] = r.gcNum
+	}
 
 	prevHeap2 := int64(-1)
 	prevAt := -1.0
 	cumAllocDiff, cumFreedDiff := 0.0, 0.0
+	excluded := 0
 	for _, r := range rows {
 		t := pd.traces[r.gcNum]
+		if lastCycleOfGen[r.gen] == r.gcNum {
+			excluded++
+			prevHeap2 = t.heap2 // keep the heap-delta chain continuous
+			prevAt = t.atSec
+			continue
+		}
 		gcFreedMB := t.heap1 - t.heap2
 		winAllocMB := float64(r.allocBytes) / 1048576
 		winFreedMB := float64(r.freedBytes) / 1048576
@@ -781,32 +842,63 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		}
 		prevAt = t.atSec
 
-		var allocMBStr, allocDiffStr, cumAllocDiffStr string
-		rowDiff := freedDiff
+		var allocMBStr, allocDiffStr, cumAllocDiffStr, totAllocMBStr string
+		var allocDiff float64
 		if prevHeap2 < 0 {
 			// First traced GC: no previous heap2, GC alloc unknown.
-			allocMBStr, allocDiffStr, cumAllocDiffStr = "-", "-", "-"
+			allocMBStr = "-"
 		} else {
 			gcAllocMB := t.heap1 - prevHeap2
-			allocDiff := winAllocMB - float64(gcAllocMB)
-			cumAllocDiff += allocDiff
 			allocMBStr = fmt.Sprint(gcAllocMB)
+		}
+		verdict := ""
+		if r.hasTotalAlloc {
+			// totalAlloc delta is the reliable whole-process figure:
+			// sampling-independent and immune to heapLive sweep lag.
+			// Span granularity pre-counts free slots, so the window figure
+			// runs 10~30% lower by design; tolerance scales with volume.
+			taMB := float64(r.totalAllocDelta) / 1048576
+			totAllocMBStr = fmtMBf(taMB)
+			allocDiff = winAllocMB - taMB
+			cumAllocDiff += allocDiff
 			allocDiffStr = fmtMBf(allocDiff)
 			cumAllocDiffStr = fmtMBf(cumAllocDiff)
+			verdict = "OK"
+			if math.Abs(allocDiff) > math.Max(2, 0.3*taMB) {
+				verdict = "CHECK"
+			}
+		} else if prevHeap2 >= 0 {
+			// Legacy logs without totalalloc lines: fall back to the
+			// heap-delta formula (unreliable under sweep lag).
+			gcAllocMB := t.heap1 - prevHeap2
+			allocDiff = winAllocMB - float64(gcAllocMB)
+			cumAllocDiff += allocDiff
+			allocDiffStr = fmtMBf(allocDiff)
+			cumAllocDiffStr = fmtMBf(cumAllocDiff)
+			totAllocMBStr = "-"
+			rowDiff := freedDiff
 			if math.Abs(allocDiff) > math.Abs(rowDiff) {
 				rowDiff = allocDiff
 			}
-		}
-		verdict := "OK"
-		if math.Abs(rowDiff) > 2 {
-			verdict = "CHECK"
+			verdict = "OK"
+			if math.Abs(rowDiff) > 2 {
+				verdict = "CHECK"
+			}
+		} else {
+			allocDiffStr, cumAllocDiffStr, totAllocMBStr = "-", "-", "-"
+			verdict = "-"
 		}
 
 		s.addRow(fmt.Sprint(r.gcNum), fmt.Sprint(r.gen), fmt.Sprint(r.elapsed), interval,
-			fmtMBf(winAllocMB), allocMBStr, allocDiffStr,
+			fmtMBf(winAllocMB), totAllocMBStr, allocDiffStr, allocMBStr,
 			fmtMBf(winFreedMB), fmt.Sprint(gcFreedMB), fmtMBf(freedDiff),
 			cumAllocDiffStr, fmtMBf(cumFreedDiff), verdict, forced)
 		prevHeap2 = t.heap2
+	}
+	if excluded > 0 {
+		s.addBlank()
+		s.addRow(fmt.Sprintf("注：已排除 %d 个窗口关闭周期（每个 gen 的最后一个 GC 周期；窗口在周期中途关闭，", excluded))
+		s.addRow("该周期 totalAlloc Δ 含窗口关闭后的分配，覆盖率对比无意义。其数据仍在其他 sheet 中）。")
 	}
 	return s
 }
@@ -868,9 +960,10 @@ func main() {
 		main1.name = trimSheetName(main1.name, seen)
 		builder.sheets = append(builder.sheets, *main1)
 
-		sites := buildWindowSitesSheet(pd)
-		sites.name = trimSheetName(sites.name, seen)
-		builder.sheets = append(builder.sheets, *sites)
+		for _, ss := range buildWindowSiteSheets(pd) {
+			ss.name = trimSheetName(ss.name, seen)
+			builder.sheets = append(builder.sheets, *ss)
+		}
 
 		cmp := buildGCCompareSheet(pd)
 		cmp.name = trimSheetName(cmp.name, seen)
