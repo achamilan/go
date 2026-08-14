@@ -2552,6 +2552,12 @@ var (
 	// cycle (two hook points).
 	gcDeadWindowLastTeeGC uint32
 
+	// gcDeadWindowLastTotalAlloc is the gcController.totalAlloc value at
+	// the last report; the per-cycle delta printed in each block header
+	// is a sampling-independent total allocation figure (span
+	// granularity), used to cross-check the window's tracked alloc.
+	gcDeadWindowLastTotalAlloc uint64
+
 	// gcDeadWindowPrintLock serializes gcDeadWindowPrint. It can be
 	// invoked concurrently from the two GC hook points (the gcMarkDone
 	// hook on a background mark worker and the post-sweep hook on the
@@ -2643,6 +2649,7 @@ func GcDeadWindowStart(seconds int, path string) bool {
 	gcDeadWindowLastAlive = 0
 	gcDeadWindowLastAliveBytes = 0
 	gcDeadWindowLastTeeGC = 0
+	gcDeadWindowLastTotalAlloc = gcController.totalAlloc.Load()
 
 	gcDeadSavedRate = MemProfileRate
 	MemProfileRate = 1
@@ -3182,6 +3189,16 @@ func gcDeadWindowPrint() {
 	appendStr(" elapsed=")
 	appendUintptr(uintptr((nanotime() - gcDeadWindowStartTime) / 1e9))
 	appendStr("s ===\n")
+
+	// Sampling-independent allocation total (span granularity, covers all
+	// mallocgc paths): cross-checks the window's tracked alloc below.
+	ta := gcController.totalAlloc.Load()
+	appendStr("gcdeadwindow:totalalloc: ")
+	appendUintptr(uintptr(ta - gcDeadWindowLastTotalAlloc))
+	appendStr(" bytes allocated since last report (")
+	appendUintptr(uintptr(ta))
+	appendStr(" bytes total)\n")
+	gcDeadWindowLastTotalAlloc = ta
 
 	// Alive report first: most critical section.
 	if totalAlive > 0 {

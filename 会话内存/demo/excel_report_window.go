@@ -591,7 +591,7 @@ func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 }
 
 func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 11)}
+	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 12)}
 	gens := aggregateGens(pd)
 
 	var totAllocObjs, totAllocBytes, totFreedObjs, totFreedBytes int64
@@ -646,11 +646,19 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 
 	// === Per-GC Summary === — one row per report block.
 	s.addRow("=== Per-GC Summary ===")
-	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)",
+	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
 		"Alive Objs", "Alive MB", "Alive Sites")
+	prevAt := -1.0
 	for i, b := range pd.blocks {
-		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed),
+		interval := "-"
+		if t := pd.traces[b.gcNum]; t != nil {
+			if prevAt >= 0 {
+				interval = fmt.Sprintf("%.1f", t.atSec-prevAt)
+			}
+			prevAt = t.atSec
+		}
+		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
 			fmt.Sprint(b.allocObjs), fmtMB2(b.allocBytes),
 			fmt.Sprint(b.freedObjs), fmtMB2(b.freedBytes),
 			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites))
@@ -702,7 +710,7 @@ func buildWindowSitesSheet(pd *parsedWindow) *xlsxSheet {
 // shifts attribution between adjacent cycles — the cumulative diff columns
 // are the consistency signal.
 func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 13)}
+	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 14)}
 
 	s.addRow("Mode:", pd.name)
 	s.addRow("说明:", "GC Alloc MB = heap1[N] − heap2[N−1]（上周期实际存活 → 本周期标记终止的堆增量 ≈ 本周期全进程分配）；")
@@ -748,12 +756,13 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	}
 
 	s.addRow("=== 分配/释放对比 (窗口 alloc/freed vs GC日志堆变化) ===")
-	s.addHeaderRow("GC #", "Gen", "Elapsed (s)",
+	s.addHeaderRow("GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"窗口 Alloc MB", "GC Alloc MB", "Alloc 差值 MB",
 		"窗口 Freed MB", "GC Freed MB", "Freed 差值 MB",
 		"累计 Alloc 差值 MB", "累计 Freed 差值 MB", "Verdict", "Forced")
 
 	prevHeap2 := int64(-1)
+	prevAt := -1.0
 	cumAllocDiff, cumFreedDiff := 0.0, 0.0
 	for _, r := range rows {
 		t := pd.traces[r.gcNum]
@@ -766,6 +775,11 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		if t.forced {
 			forced = "forced"
 		}
+		interval := "-"
+		if prevAt >= 0 {
+			interval = fmt.Sprintf("%.1f", t.atSec-prevAt)
+		}
+		prevAt = t.atSec
 
 		var allocMBStr, allocDiffStr, cumAllocDiffStr string
 		rowDiff := freedDiff
@@ -788,7 +802,7 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			verdict = "CHECK"
 		}
 
-		s.addRow(fmt.Sprint(r.gcNum), fmt.Sprint(r.gen), fmt.Sprint(r.elapsed),
+		s.addRow(fmt.Sprint(r.gcNum), fmt.Sprint(r.gen), fmt.Sprint(r.elapsed), interval,
 			fmtMBf(winAllocMB), allocMBStr, allocDiffStr,
 			fmtMBf(winFreedMB), fmt.Sprint(gcFreedMB), fmtMBf(freedDiff),
 			cumAllocDiffStr, fmtMBf(cumFreedDiff), verdict, forced)
