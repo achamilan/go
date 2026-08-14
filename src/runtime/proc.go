@@ -7952,6 +7952,26 @@ func sync_runtime_procUnpin() {
 	procUnpin()
 }
 
+// sync_runtime_poolStatsInterval backs sync's pool statistics
+// instrumentation (GODEBUG=syncpoolstats=N): it returns the reporting
+// interval in number of Get calls, or 0 when disabled.
+//
+//go:linkname sync_runtime_poolStatsInterval sync.runtime_poolStatsInterval
+func sync_runtime_poolStatsInterval() int32 {
+	return debug.syncpoolstats
+}
+
+// sync_runtime_poolTypeName resolves the name of the type stored in an
+// interface's type word, for sync's pool statistics instrumentation.
+//
+//go:linkname sync_runtime_poolTypeName sync.runtime_poolTypeName
+func sync_runtime_poolTypeName(t unsafe.Pointer) string {
+	if t == nil {
+		return "?"
+	}
+	return toRType((*abi.Type)(t)).string()
+}
+
 //go:linkname sync_atomic_runtime_procPin sync/atomic.runtime_procPin
 //go:nosplit
 func sync_atomic_runtime_procPin() int {

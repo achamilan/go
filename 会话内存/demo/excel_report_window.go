@@ -369,6 +369,9 @@ func fmtFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)
 }
 
+// fmtMB2 formats an exact byte count as MB with two decimals.
+func fmtMB2(b int64) string { return fmt.Sprintf("%.2f", float64(b)/1048576) }
+
 func (xb *xlsxBuilder) writeXLSX(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -556,8 +559,8 @@ func trimSheetName(name string, seen map[string]int) string {
 
 func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 	s := &xlsxSheet{name: "Overview", colWidths: make([]float64, 11)}
-	s.addHeaderRow("Mode", "Windows", "GC Reports", "Alloc Objs", "Alloc Bytes",
-		"Freed Objs", "Freed Bytes", "Final Alive Objs", "Final Alive Bytes", "Peak Alive Objs", "Peak Alive Bytes")
+	s.addHeaderRow("Mode", "Windows", "GC Reports", "Alloc Objs", "Alloc MB",
+		"Freed Objs", "Freed MB", "Final Alive Objs", "Final Alive MB", "Peak Alive Objs", "Peak Alive MB")
 	for _, pd := range files {
 		gens := aggregateGens(pd)
 		var ao, ab, fo, fb int64
@@ -581,8 +584,8 @@ func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 			}
 		}
 		s.addRow(pd.name, fmt.Sprint(len(gens)), fmt.Sprint(len(pd.blocks)),
-			fmt.Sprint(ao), fmt.Sprint(ab), fmt.Sprint(fo), fmt.Sprint(fb),
-			fmt.Sprint(fao), fmt.Sprint(fab), fmt.Sprint(pao), fmt.Sprint(pab))
+			fmt.Sprint(ao), fmtMB2(ab), fmt.Sprint(fo), fmtMB2(fb),
+			fmt.Sprint(fao), fmtMB2(fab), fmt.Sprint(pao), fmtMB2(pab))
 	}
 	return s
 }
@@ -602,21 +605,21 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("Mode:", pd.name)
 	s.addRow("GC Reports:", fmt.Sprint(len(pd.blocks)))
 	s.addRow("Windows (gen):", fmt.Sprint(len(gens)))
-	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%d bytes)", totAllocObjs, totAllocBytes))
-	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%d bytes)", totFreedObjs, totFreedBytes))
+	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%.2f MB)", totAllocObjs, float64(totAllocBytes)/1048576))
+	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%.2f MB)", totFreedObjs, float64(totFreedBytes)/1048576))
 	s.addBlank()
 
 	// === Summary === — per-gen aggregates.
 	s.addRow("=== Summary ===")
-	s.addHeaderRow("Gen", "GC Reports", "Alloc Objs", "Alloc Bytes",
-		"Freed Objs", "Freed Bytes", "Final Alive Objs", "Final Alive Bytes",
-		"Peak Alive Objs", "Peak Alive Bytes")
+	s.addHeaderRow("Gen", "GC Reports", "Alloc Objs", "Alloc MB",
+		"Freed Objs", "Freed MB", "Final Alive Objs", "Final Alive MB",
+		"Peak Alive Objs", "Peak Alive MB")
 	for _, g := range gens {
 		s.addRow(fmt.Sprint(g.gen), fmt.Sprint(g.reports),
-			fmt.Sprint(g.allocObjs), fmt.Sprint(g.allocBytes),
-			fmt.Sprint(g.freedObjs), fmt.Sprint(g.freedBytes),
-			fmt.Sprint(g.finalAliveObjs), fmt.Sprint(g.finalAliveByte),
-			fmt.Sprint(g.peakAliveObjs), fmt.Sprint(g.peakAliveBytes))
+			fmt.Sprint(g.allocObjs), fmtMB2(g.allocBytes),
+			fmt.Sprint(g.freedObjs), fmtMB2(g.freedBytes),
+			fmt.Sprint(g.finalAliveObjs), fmtMB2(g.finalAliveByte),
+			fmt.Sprint(g.peakAliveObjs), fmtMB2(g.peakAliveBytes))
 	}
 	s.addBlank()
 
@@ -626,7 +629,7 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	// Small diffs can remain from racy increments landing mid-report.
 	s.addRow("=== 数据验证 (per gen: alloc == freed + alive) ===")
 	s.addHeaderRow("Gen", "Σ Alloc Objs", "Σ Freed + Alive Objs", "Diff Objs",
-		"Σ Alloc Bytes", "Σ Freed + Alive Bytes", "Diff Bytes", "Verdict")
+		"Σ Alloc MB", "Σ Freed + Alive MB", "Diff MB", "Verdict")
 	for _, g := range gens {
 		faObjs := g.freedObjs + g.finalAliveObjs
 		faBytes := g.freedBytes + g.finalAliveByte
@@ -637,20 +640,20 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 			verdict = fmt.Sprintf("diff=%+d objs", diffObjs)
 		}
 		s.addRow(fmt.Sprint(g.gen), fmt.Sprint(g.allocObjs), fmt.Sprint(faObjs), fmt.Sprint(diffObjs),
-			fmt.Sprint(g.allocBytes), fmt.Sprint(faBytes), fmt.Sprint(diffBytes), verdict)
+			fmtMB2(g.allocBytes), fmtMB2(faBytes), fmtMB2(diffBytes), verdict)
 	}
 	s.addBlank()
 
 	// === Per-GC Summary === — one row per report block.
 	s.addRow("=== Per-GC Summary ===")
 	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)",
-		"Alloc Objs", "Alloc Bytes", "Freed Objs", "Freed Bytes",
-		"Alive Objs", "Alive Bytes", "Alive Sites")
+		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
+		"Alive Objs", "Alive MB", "Alive Sites")
 	for i, b := range pd.blocks {
 		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed),
-			fmt.Sprint(b.allocObjs), fmt.Sprint(b.allocBytes),
-			fmt.Sprint(b.freedObjs), fmt.Sprint(b.freedBytes),
-			fmt.Sprint(b.aliveObjs), fmt.Sprint(b.aliveBytes), fmt.Sprint(b.aliveSites))
+			fmt.Sprint(b.allocObjs), fmtMB2(b.allocBytes),
+			fmt.Sprint(b.freedObjs), fmtMB2(b.freedBytes),
+			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites))
 	}
 	return s
 }
@@ -665,17 +668,17 @@ func buildWindowSitesSheet(pd *parsedWindow) *xlsxSheet {
 
 	s.addRow("=== Sites by Gen (sorted by alloc bytes) ===")
 	s.addHeaderRow("Gen", "Function", "File:Line",
-		"Alloc Objs", "Alloc Bytes", "Freed Objs", "Freed Bytes",
-		"Final Alive Objs", "Final Alive Bytes", "Fully Dead", "Full Stack")
+		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
+		"Final Alive Objs", "Final Alive MB", "Fully Dead", "Full Stack")
 	for _, a := range sites {
 		fullyDead := ""
 		if a.allocObjs > 0 && a.finalAliveObjs == 0 {
 			fullyDead = "YES"
 		}
 		s.addRow(fmt.Sprint(a.key.gen), a.key.fn, a.key.loc,
-			fmt.Sprint(a.allocObjs), fmt.Sprint(a.allocBytes),
-			fmt.Sprint(a.freedObjs), fmt.Sprint(a.freedBytes),
-			fmt.Sprint(a.finalAliveObjs), fmt.Sprint(a.finalAliveByte),
+			fmt.Sprint(a.allocObjs), fmtMB2(a.allocBytes),
+			fmt.Sprint(a.freedObjs), fmtMB2(a.freedBytes),
+			fmt.Sprint(a.finalAliveObjs), fmtMB2(a.finalAliveByte),
 			fullyDead, a.stack)
 	}
 	return s

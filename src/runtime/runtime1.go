@@ -324,6 +324,7 @@ var debug struct {
 	scavtrace                int32
 	scheddetail              int32
 	schedtrace               int32
+	syncpoolstats            int32
 	tracebackancestors       int32
 	updatemaxprocs           int32
 	asyncpreemptoff          int32
@@ -399,6 +400,7 @@ var dbgvars = []*dbgVar{
 	{name: "scavtrace", value: &debug.scavtrace},
 	{name: "scheddetail", value: &debug.scheddetail},
 	{name: "schedtrace", value: &debug.schedtrace},
+	{name: "syncpoolstats", value: &debug.syncpoolstats},
 	{name: "traceadvanceperiod", value: &debug.traceadvanceperiod},
 	{name: "traceallocfree", atomic: &debug.traceallocfree},
 	{name: "tracecheckstackownership", value: &debug.traceCheckStackOwnership},

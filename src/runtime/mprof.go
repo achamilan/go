@@ -2694,6 +2694,9 @@ func GcDeadWindowStop() {
 	}
 	gcDeadWindowActive.Store(0)
 	notewakeup(&gcDeadWindowNote)
+	// Print the live rate before restoring: if it is not 1, some code
+	// clobbered it mid-window and the window's coverage was degraded.
+	print("runtime: gcdeadwindow: MemProfileRate before restore = ", uint64(MemProfileRate), " (saved = ", uint64(gcDeadSavedRate), ")\n")
 	MemProfileRate = gcDeadSavedRate
 	print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (elapsed ",
 		uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")
@@ -3254,6 +3257,8 @@ func gcDeadWindowPrint() {
 // extra GC is needed); the timer goroutine covers the idle case.
 func gcDeadWindowCheckDeadline() {
 	if gcDeadWindowDeadline > 0 && nanotime() >= gcDeadWindowDeadline && gcDeadWindowActive.CompareAndSwap(1, 0) {
+		// Print the live rate before restoring (see GcDeadWindowStop).
+		print("runtime: gcdeadwindow: MemProfileRate before restore = ", uint64(MemProfileRate), " (saved = ", uint64(gcDeadSavedRate), ")\n")
 		MemProfileRate = gcDeadSavedRate
 		print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (deadline reached, elapsed ",
 			uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")

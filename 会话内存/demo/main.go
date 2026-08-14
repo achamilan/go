@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1175,7 +1177,15 @@ func main() {
 	duration := flag.Duration("duration", 10*time.Second, "total run duration")
 	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle, gcdeadwindow")
 	windowFile := flag.String("windowfile", "output/gcdeadwindow_demo.log", "gcdeadwindow report file (mode=gcdeadwindow)")
+	httpAddr := flag.String("http", "", "pprof HTTP listen address (e.g. :6060); enables /debug/gcdeadwindow/start?seconds=N")
 	flag.Parse()
+
+	if *httpAddr != "" {
+		go func() {
+			fmt.Printf("  pprof HTTP: http://localhost%s/debug/pprof/ (gcdeadwindow: /debug/gcdeadwindow/start?seconds=N)\n", *httpAddr)
+			log.Println(http.ListenAndServe(*httpAddr, nil))
+		}()
+	}
 
 	fmt.Println("========================================")
 	fmt.Println("  Go Actor Pattern + gcdeadtrace Demo")

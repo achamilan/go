@@ -10,6 +10,21 @@ var Runtime_Semrelease = runtime_Semrelease
 var Runtime_procPin = runtime_procPin
 var Runtime_procUnpin = runtime_procUnpin
 
+// PoolCounts returns the pool's Get/Put counters maintained by the
+// syncpoolstats instrumentation.
+func PoolCounts(p *Pool) (gets, puts uint64) {
+	return p.getCnt.Load(), p.putCnt.Load()
+}
+
+// SetPoolStatsForTest overrides the reporting interval and the report
+// sink for the syncpoolstats instrumentation, and returns a function
+// that restores the previous state.
+func SetPoolStatsForTest(interval int32, printFn func(p *Pool, gets, puts uint64, typeName string)) (restore func()) {
+	oldI, oldP := poolStatsInterval, poolStatsPrint
+	poolStatsInterval, poolStatsPrint = interval, printFn
+	return func() { poolStatsInterval, poolStatsPrint = oldI, oldP }
+}
+
 // PoolDequeue exports an interface for pollDequeue testing.
 type PoolDequeue interface {
 	PushHead(val any) bool

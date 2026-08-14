@@ -9,6 +9,7 @@
 package sync_test
 
 import (
+	"bytes"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -17,6 +18,70 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPoolStats(t *testing.T) {
+	type report struct {
+		gets, puts uint64
+		name       string
+	}
+	var reports []report
+	restore := SetPoolStatsForTest(10, func(p *Pool, gets, puts uint64, typeName string) {
+		reports = append(reports, report{gets, puts, typeName})
+	})
+	defer restore()
+
+	p := &Pool{New: func() any { return new(bytes.Buffer) }}
+	for i := 0; i < 45; i++ {
+		x := p.Get()
+		if i%2 == 0 {
+			p.Put(x)
+		}
+	}
+
+	gets, puts := PoolCounts(p)
+	if gets != 45 || puts != 23 {
+		t.Fatalf("PoolCounts = %d gets, %d puts; want 45, 23", gets, puts)
+	}
+
+	// Reports fire on the 10th, 20th, 30th and 40th Get.
+	if len(reports) != 4 {
+		t.Fatalf("got %d reports, want 4: %v", len(reports), reports)
+	}
+	for i, r := range reports {
+		if want := uint64(10 * (i + 1)); r.gets != want {
+			t.Errorf("report %d: gets = %d, want %d", i, r.gets, want)
+		}
+		if r.name != "*bytes.Buffer" {
+			t.Errorf("report %d: type = %q, want %q", i, r.name, "*bytes.Buffer")
+		}
+	}
+	// At the 40th Get, 20 Puts have happened (even i in 0..38).
+	if reports[3].puts != 20 {
+		t.Errorf("report 3: puts = %d, want 20", reports[3].puts)
+	}
+}
+
+func TestPoolStatsDisabled(t *testing.T) {
+	// Interval 0: instrumentation fully off, no counters, no reports.
+	called := false
+	restore := SetPoolStatsForTest(0, func(p *Pool, gets, puts uint64, typeName string) {
+		called = true
+	})
+	defer restore()
+
+	p := &Pool{New: func() any { return new(bytes.Buffer) }}
+	for i := 0; i < 100; i++ {
+		x := p.Get()
+		p.Put(x)
+	}
+	gets, puts := PoolCounts(p)
+	if gets != 0 || puts != 0 {
+		t.Fatalf("PoolCounts = %d gets, %d puts; want 0, 0 when disabled", gets, puts)
+	}
+	if called {
+		t.Fatal("report fired with interval 0")
+	}
+}
 
 func TestPool(t *testing.T) {
 	// disable GC so we can control when it happens.

@@ -61,6 +61,24 @@ type Pool struct {
 	// a value when Get would otherwise return nil.
 	// It may not be changed concurrently with calls to Get.
 	New func() any
+
+	// Pool statistics, maintained only when GODEBUG=syncpoolstats=N
+	// is set. See poolStatsInterval.
+	getCnt   atomic.Uint64
+	putCnt   atomic.Uint64
+	lastType unsafe.Pointer // type word of the most recent Put value
+}
+
+// poolStatsInterval is the GODEBUG=syncpoolstats value: every
+// poolStatsInterval-th Get on a pool prints that pool's get/put counts
+// and the type of its pooled objects. 0 (the default) disables the
+// instrumentation entirely (zero per-op overhead).
+var poolStatsInterval = runtime_poolStatsInterval()
+
+// poolStatsPrint reports one pool's statistics. It is a variable so
+// tests can capture the reports (see SetPoolStatsForTest).
+var poolStatsPrint = func(p *Pool, gets, puts uint64, typeName string) {
+	println("runtime: syncpool: pool=", p, " get=", gets, " put=", puts, " type=", typeName)
 }
 
 // Local per-P Pool appendix.
@@ -100,6 +118,11 @@ func (p *Pool) Put(x any) {
 	if x == nil {
 		return
 	}
+	if poolStatsInterval > 0 {
+		p.putCnt.Add(1)
+		// Record the value's dynamic type for the periodic report.
+		atomic.StorePointer(&p.lastType, (*[2]unsafe.Pointer)(unsafe.Pointer(&x))[0])
+	}
 	if race.Enabled {
 		if runtime_randn(4) == 0 {
 			// Randomly drop x on floor.
@@ -129,6 +152,11 @@ func (p *Pool) Put(x any) {
 // If Get would otherwise return nil and p.New is non-nil, Get returns
 // the result of calling p.New.
 func (p *Pool) Get() any {
+	if poolStatsInterval > 0 {
+		if n := p.getCnt.Add(1); n%uint64(poolStatsInterval) == 0 {
+			poolStatsPrint(p, n, p.putCnt.Load(), runtime_poolTypeName(atomic.LoadPointer(&p.lastType)))
+		}
+	}
 	if race.Enabled {
 		race.Disable()
 	}
@@ -306,6 +334,8 @@ func indexLocal(l unsafe.Pointer, i int) *poolLocal {
 func runtime_registerPoolCleanup(cleanup func())
 func runtime_procPin() int
 func runtime_procUnpin()
+func runtime_poolStatsInterval() int32
+func runtime_poolTypeName(t unsafe.Pointer) string
 
 // The below are implemented in internal/runtime/atomic and the
 // compiler also knows to intrinsify the symbol we linkname into this
