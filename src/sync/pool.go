@@ -64,21 +64,45 @@ type Pool struct {
 
 	// Pool statistics, maintained only when GODEBUG=syncpoolstats=N
 	// is set. See poolStatsInterval.
-	getCnt   atomic.Uint64
-	putCnt   atomic.Uint64
-	lastType unsafe.Pointer // type word of the most recent Put value
+	getCnt       atomic.Uint64
+	putCnt       atomic.Uint64
+	gcReclaimCnt atomic.Uint64 // objects dropped from this pool by GC poolCleanup
+	lastType     unsafe.Pointer // type word of the most recent Put value
 }
 
 // poolStatsInterval is the GODEBUG=syncpoolstats value: every
-// poolStatsInterval-th Get on a pool prints that pool's get/put counts
-// and the type of its pooled objects. 0 (the default) disables the
+// poolStatsInterval-th Get on a pool prints that pool's get/put/GC-reclaim
+// counts and the type of its pooled objects. 0 (the default) disables the
 // instrumentation entirely (zero per-op overhead).
 var poolStatsInterval = runtime_poolStatsInterval()
 
 // poolStatsPrint reports one pool's statistics. It is a variable so
 // tests can capture the reports (see SetPoolStatsForTest).
-var poolStatsPrint = func(p *Pool, gets, puts uint64, typeName string) {
-	println("runtime: syncpool: pool=", p, " get=", gets, " put=", puts, " type=", typeName)
+var poolStatsPrint = func(p *Pool, gets, puts, gcfree uint64, live int64, typeName string) {
+	println("runtime: syncpool: pool=", p, " get=", gets, " put=", puts, " gcfree=", gcfree, " live=", live, " type=", typeName)
+}
+
+// drainAndCount pops every object from a dropped victim cache (locals
+// array of size n) and returns how many were found. Called from
+// poolCleanup (STW) before the cache is discarded, only when the
+// syncpoolstats instrumentation is enabled.
+func drainAndCount(locals unsafe.Pointer, n uintptr) uint64 {
+	var cnt uint64
+	for i := 0; i < int(n); i++ {
+		l := indexLocal(locals, i)
+		if l.private != nil {
+			cnt++
+			l.private = nil
+		}
+		for {
+			x, _ := l.shared.popTail()
+			if x == nil {
+				break
+			}
+			cnt++
+		}
+	}
+	return cnt
 }
 
 // Local per-P Pool appendix.
@@ -111,6 +135,34 @@ func poolRaceAddr(x any) unsafe.Pointer {
 	ptr := uintptr((*[2]unsafe.Pointer)(unsafe.Pointer(&x))[1])
 	h := uint32((uint64(uint32(ptr)) * 0x85ebca6b) >> 16)
 	return unsafe.Pointer(&poolRaceHash[h%uint32(len(poolRaceHash))])
+}
+
+// poolCountCurrent walks the pool's per-P local and victim caches and
+// counts the objects currently sitting in them (private slots plus the
+// entries of every shared-chain dequeue). It is a racy, non-destructive
+// read used only for the syncpoolstats periodic report.
+func poolCountCurrent(p *Pool) int64 {
+	var n int64
+	countLocal := func(l *poolLocal) {
+		if l.private != nil {
+			n++
+		}
+		for el := l.shared.head; el != nil; el = el.prev.Load() {
+			head, tail := el.unpack(el.headTail.Load())
+			n += int64(head - tail) // uint32 wrap-safe subtraction
+		}
+	}
+	size := atomic.LoadUintptr(&p.localSize)
+	locals := p.local
+	for i := 0; i < int(size); i++ {
+		countLocal(indexLocal(locals, i))
+	}
+	vsize := atomic.LoadUintptr(&p.victimSize)
+	victim := p.victim
+	for i := 0; i < int(vsize); i++ {
+		countLocal(indexLocal(victim, i))
+	}
+	return n
 }
 
 // Put adds x to the pool.
@@ -154,7 +206,7 @@ func (p *Pool) Put(x any) {
 func (p *Pool) Get() any {
 	if poolStatsInterval > 0 {
 		if n := p.getCnt.Add(1); n%uint64(poolStatsInterval) == 0 {
-			poolStatsPrint(p, n, p.putCnt.Load(), runtime_poolTypeName(atomic.LoadPointer(&p.lastType)))
+			poolStatsPrint(p, n, p.putCnt.Load(), p.gcReclaimCnt.Load(), poolCountCurrent(p), runtime_poolTypeName(atomic.LoadPointer(&p.lastType)))
 		}
 	}
 	if race.Enabled {
@@ -291,6 +343,11 @@ func poolCleanup() {
 
 	// Drop victim caches from all pools.
 	for _, p := range oldPools {
+		if poolStatsInterval > 0 && p.victim != nil {
+			// These objects are being reclaimed by this GC: count them
+			// for the syncpoolstats report.
+			p.gcReclaimCnt.Add(drainAndCount(p.victim, p.victimSize))
+		}
 		p.victim = nil
 		p.victimSize = 0
 	}

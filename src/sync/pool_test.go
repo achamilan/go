@@ -21,12 +21,12 @@ import (
 
 func TestPoolStats(t *testing.T) {
 	type report struct {
-		gets, puts uint64
-		name       string
+		gets, puts, gcfree uint64
+		name               string
 	}
 	var reports []report
-	restore := SetPoolStatsForTest(10, func(p *Pool, gets, puts uint64, typeName string) {
-		reports = append(reports, report{gets, puts, typeName})
+	restore := SetPoolStatsForTest(10, func(p *Pool, gets, puts, gcfree uint64, live int64, typeName string) {
+		reports = append(reports, report{gets, puts, gcfree, typeName})
 	})
 	defer restore()
 
@@ -38,9 +38,14 @@ func TestPoolStats(t *testing.T) {
 		}
 	}
 
-	gets, puts := PoolCounts(p)
+	gets, puts, _, live := PoolCounts(p)
 	if gets != 45 || puts != 23 {
 		t.Fatalf("PoolCounts = %d gets, %d puts; want 45, 23", gets, puts)
+	}
+	// 23 Puts, 22 of the 45 Gets were served from the pool (odd i),
+	// so exactly one object should remain.
+	if live != 1 {
+		t.Fatalf("live = %d, want 1", live)
 	}
 
 	// Reports fire on the 10th, 20th, 30th and 40th Get.
@@ -64,7 +69,7 @@ func TestPoolStats(t *testing.T) {
 func TestPoolStatsDisabled(t *testing.T) {
 	// Interval 0: instrumentation fully off, no counters, no reports.
 	called := false
-	restore := SetPoolStatsForTest(0, func(p *Pool, gets, puts uint64, typeName string) {
+	restore := SetPoolStatsForTest(0, func(p *Pool, gets, puts, gcfree uint64, live int64, typeName string) {
 		called = true
 	})
 	defer restore()
@@ -74,12 +79,112 @@ func TestPoolStatsDisabled(t *testing.T) {
 		x := p.Get()
 		p.Put(x)
 	}
-	gets, puts := PoolCounts(p)
-	if gets != 0 || puts != 0 {
-		t.Fatalf("PoolCounts = %d gets, %d puts; want 0, 0 when disabled", gets, puts)
+	gets, puts, gcfree, _ := PoolCounts(p)
+	if gets != 0 || puts != 0 || gcfree != 0 {
+		t.Fatalf("PoolCounts = %d gets, %d puts, %d gcfree; want all 0 when disabled", gets, puts, gcfree)
 	}
 	if called {
 		t.Fatal("report fired with interval 0")
+	}
+}
+
+func TestPoolStatsGCReclaim(t *testing.T) {
+	// Disable GC so we control exactly when poolCleanup runs.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	restore := SetPoolStatsForTest(1000, func(p *Pool, gets, puts, gcfree uint64, live int64, name string) {})
+	defer restore()
+
+	p := &Pool{New: func() any { return new(bytes.Buffer) }}
+	for i := 0; i < 5; i++ {
+		p.Put(p.New())
+	}
+	if _, _, _, live := PoolCounts(p); live != 5 {
+		t.Fatalf("before GC: live = %d, want 5", live)
+	}
+
+	// First GC: primary cache moves to the victim cache; nothing is
+	// reclaimed yet.
+	runtime.GC()
+	if _, _, gcfree, live := PoolCounts(p); gcfree != 0 || live != 5 {
+		t.Fatalf("after 1st GC: gcfree = %d, live = %d; want 0, 5 (objects moved to victim cache)", gcfree, live)
+	}
+
+	// Second GC: the victim cache is dropped; its 5 objects are reclaimed.
+	runtime.GC()
+	if _, _, gcfree, live := PoolCounts(p); gcfree != 5 || live != 0 {
+		t.Fatalf("after 2nd GC: gcfree = %d, live = %d; want 5, 0", gcfree, live)
+	}
+}
+
+func TestPoolCountCurrent(t *testing.T) {
+	// Disable GC so only our explicit GCs run poolCleanup.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	live := func(p *Pool) int64 {
+		_, _, _, n := PoolCounts(p)
+		return n
+	}
+
+	p := &Pool{New: func() any { return new(bytes.Buffer) }}
+	if n := live(p); n != 0 {
+		t.Fatalf("empty pool: live = %d, want 0", n)
+	}
+
+	// Same-goroutine puts: first goes to the P's private slot, the
+	// rest to the shared chain.
+	for i := 0; i < 3; i++ {
+		p.Put(p.New())
+	}
+	if n := live(p); n != 3 {
+		t.Fatalf("after 3 puts: live = %d, want 3", n)
+	}
+
+	// Get pops the private slot.
+	if x := p.Get(); x == nil {
+		t.Fatal("Get returned nil from a non-empty pool")
+	}
+	if n := live(p); n != 2 {
+		t.Fatalf("after 1 get: live = %d, want 2", n)
+	}
+
+	// 300 more puts force multiple poolChainElt blocks (a dequeue
+	// holds 128 entries per block).
+	for i := 0; i < 300; i++ {
+		p.Put(p.New())
+	}
+	if n := live(p); n != 302 {
+		t.Fatalf("after 302 total puts: live = %d, want 302 (multi-block chain)", n)
+	}
+
+	// Concurrent puts spread objects across all Ps' caches.
+	extra := 2 * runtime.GOMAXPROCS(0) * 10
+	var wg WaitGroup
+	for g := 0; g < 2*runtime.GOMAXPROCS(0); g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				p.Put(p.New())
+			}
+		}()
+	}
+	wg.Wait()
+	want := int64(302 + extra)
+	if n := live(p); n != want {
+		t.Fatalf("after %d concurrent puts: live = %d, want %d", extra, n, want)
+	}
+
+	// First GC: primary cache moves to victim; objects must still be
+	// counted.
+	runtime.GC()
+	if n := live(p); n != want {
+		t.Fatalf("after 1st GC: live = %d, want %d (victim cache still counts)", n, want)
+	}
+
+	// Second GC: victim cache dropped; pool is empty.
+	runtime.GC()
+	if n := live(p); n != 0 {
+		t.Fatalf("after 2nd GC: live = %d, want 0", n)
 	}
 }
 
