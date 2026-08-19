@@ -55,15 +55,6 @@ type winBlock struct {
 	totalAllocDelta int64
 	hasTotalAlloc   bool
 
-	// Arena accounting from the gcdeadwindow:arena line (gcController,
-	// authoritative span-granularity snapshot at report time).
-	arenaCount   int64
-	heapInUse    int64 // bytes in mSpanInUse spans
-	heapFree     int64 // retained but not in any span
-	heapReleased int64 // returned to the OS
-	heapLive     int64 // GC's live-object figure (accurate post-sweep)
-	hasArena     bool
-
 	hasAlive, hasAlloc, hasFreed bool
 
 	aliveLines []winSite
@@ -97,7 +88,6 @@ var (
 	allocSumRe = regexp.MustCompile(`^gcdeadwindow:alloc: (\d+) objs \((\d+) bytes\) allocated this cycle from (\d+) sites`)
 	freedSumRe = regexp.MustCompile(`^gcdeadwindow:freed: (\d+) objs \((\d+) bytes\) freed this cycle from (\d+) sites`)
 	totalAllocRe = regexp.MustCompile(`^gcdeadwindow:totalalloc: (\d+) bytes allocated since last report`)
-	arenaRe      = regexp.MustCompile(`^gcdeadwindow:arena: (\d+) arenas, inuse (\d+) bytes, free (\d+) bytes, released (\d+) bytes, heaplive (\d+) bytes`)
 	siteLineRe = regexp.MustCompile(`^  (.+): (\d+) objs, (\d+) bytes$`)
 	frameRe    = regexp.MustCompile(`^(\S+) \(([^)]+)\)`)
 	// gctrace lines teed into the report file by the runtime when the
@@ -199,16 +189,6 @@ func parseWindowFile(path string) (*parsedWindow, error) {
 		if m := totalAllocRe.FindStringSubmatch(line); m != nil {
 			blk.hasTotalAlloc = true
 			blk.totalAllocDelta = atoi64(m[1])
-			section = ""
-			continue
-		}
-		if m := arenaRe.FindStringSubmatch(line); m != nil {
-			blk.hasArena = true
-			blk.arenaCount = atoi64(m[1])
-			blk.heapInUse = atoi64(m[2])
-			blk.heapFree = atoi64(m[3])
-			blk.heapReleased = atoi64(m[4])
-			blk.heapLive = atoi64(m[5])
 			section = ""
 			continue
 		}
@@ -624,7 +604,7 @@ func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 }
 
 func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 17)}
+	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 12)}
 	gens := aggregateGens(pd)
 
 	var totAllocObjs, totAllocBytes, totFreedObjs, totFreedBytes int64
@@ -640,34 +620,6 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("Windows (gen):", fmt.Sprint(len(gens)))
 	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%.2f MB)", totAllocObjs, float64(totAllocBytes)/1048576))
 	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%.2f MB)", totFreedObjs, float64(totFreedBytes)/1048576))
-
-	// Arena summary from the gcdeadwindow:arena lines: final snapshot
-	// (last block carrying the line) and peaks across the window.
-	var finalArena *winBlock
-	var peakInUse, peakLive, peakReleased int64
-	for _, b := range pd.blocks {
-		if !b.hasArena {
-			continue
-		}
-		finalArena = b
-		if b.heapInUse > peakInUse {
-			peakInUse = b.heapInUse
-		}
-		if b.heapLive > peakLive {
-			peakLive = b.heapLive
-		}
-		if b.heapReleased > peakReleased {
-			peakReleased = b.heapReleased
-		}
-	}
-	if finalArena != nil {
-		mb := func(v int64) float64 { return float64(v) / 1048576 }
-		s.addRow("Arenas (final):", fmt.Sprintf("%d arenas", finalArena.arenaCount))
-		s.addRow("HeapInUse (final/peak):", fmt.Sprintf("%.2f / %.2f MB", mb(finalArena.heapInUse), mb(peakInUse)))
-		s.addRow("HeapFree (final):", fmt.Sprintf("%.2f MB", mb(finalArena.heapFree)))
-		s.addRow("HeapReleased (final/peak):", fmt.Sprintf("%.2f / %.2f MB", mb(finalArena.heapReleased), mb(peakReleased)))
-		s.addRow("HeapLive (final/peak):", fmt.Sprintf("%.2f / %.2f MB", mb(finalArena.heapLive), mb(peakLive)))
-	}
 	s.addBlank()
 
 	// === Summary === — per-gen aggregates.
@@ -709,8 +661,7 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("=== Per-GC Summary ===")
 	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
-		"Alive Objs", "Alive MB", "Alive Sites",
-		"Arenas", "HeapInUse MB", "HeapFree MB", "HeapReleased MB", "HeapLive MB")
+		"Alive Objs", "Alive MB", "Alive Sites")
 	prevAt := -1.0
 	for i, b := range pd.blocks {
 		interval := "-"
@@ -720,19 +671,10 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 			}
 			prevAt = t.atSec
 		}
-		arenas, inUse, free, released, live := "-", "-", "-", "-", "-"
-		if b.hasArena {
-			arenas = fmt.Sprint(b.arenaCount)
-			inUse = fmtMB2(b.heapInUse)
-			free = fmtMB2(b.heapFree)
-			released = fmtMB2(b.heapReleased)
-			live = fmtMB2(b.heapLive)
-		}
 		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
 			fmt.Sprint(b.allocObjs), fmtMB2(b.allocBytes),
 			fmt.Sprint(b.freedObjs), fmtMB2(b.freedBytes),
-			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites),
-			arenas, inUse, free, released, live)
+			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites))
 	}
 	return s
 }
@@ -808,7 +750,7 @@ func buildWindowSiteSheets(pd *parsedWindow) []*xlsxSheet {
 // shifts attribution between adjacent cycles — the cumulative diff columns
 // are the consistency signal.
 func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 24)}
+	s := &xlsxSheet{name: pd.name + " - GC对比", colWidths: make([]float64, 15)}
 
 	s.addRow("Mode:", pd.name)
 	s.addRow("说明:", "totalAlloc Δ = 块头 gcdeadwindow:totalalloc 行的增量：runtime 累计分配计数（span 粒度，与采样无关，不受")
@@ -817,11 +759,6 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("", "仅作参考。GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
 	s.addRow("", "freed 差值来源：MB 截断 ±1MB；窗口前旧对象垃圾（大堆服务此项必然很大，仅作参考）；")
 	s.addRow("", "世界重启后输出的相邻周期归属偏移。Verdict 只看 alloc 侧：|差值| ≤ max(2MB, 30%×totalAllocΔ) 为 OK。")
-	s.addRow("", "Arenas/HeapInUse/HeapFree/HeapReleased/HeapLive = 块头 gcdeadwindow:arena 行的 gcController 权威快照")
-	s.addRow("", "（span 粒度、采样无关）：inuse+free+released=HeapSys（总映射）；HeapInUse 远高于 HeapLive 说明")
-	s.addRow("", "span 内堆积未 sweep 垃圾+空闲槽位（sweep 滞后），HeapLive 在上一轮 sweep 完成后才准确。")
-	s.addRow("", "Δ 列 = 相对上一个 GC 的净变化：ΔHeapInUse+ΔHeapFree 为正 ≈ 本周期净从 OS 获取；")
-	s.addRow("", "ΔHeapReleased 为正 ≈ 本周期净归还 OS；Δ Arenas × 64MB ≈ 新映射的虚拟内存。")
 	s.addBlank()
 
 	if len(pd.traces) == 0 {
@@ -833,19 +770,12 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 
 	// Merge consecutive report blocks of the same GC (gcMarkDone hook +
 	// post-sweep hook both print for one GC, but gctrace has a single
-	// line per GC). Bytes are additive across the two snapshots; arena
-	// counters are point-in-time snapshots, so the later block wins.
+	// line per GC). Bytes are additive across the two snapshots.
 	type mergedRow struct {
 		gcNum, gen, elapsed    int
 		allocBytes, freedBytes int64
 		totalAllocDelta        int64
 		hasTotalAlloc          bool
-		arenaCount             int64
-		heapInUse              int64
-		heapFree               int64
-		heapReleased           int64
-		heapLive               int64
-		hasArena               bool
 	}
 	var rows []mergedRow
 	for _, b := range pd.blocks {
@@ -858,14 +788,6 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			rows[n-1].freedBytes += b.freedBytes
 			rows[n-1].totalAllocDelta += b.totalAllocDelta
 			rows[n-1].hasTotalAlloc = rows[n-1].hasTotalAlloc || b.hasTotalAlloc
-			if b.hasArena {
-				rows[n-1].arenaCount = b.arenaCount
-				rows[n-1].heapInUse = b.heapInUse
-				rows[n-1].heapFree = b.heapFree
-				rows[n-1].heapReleased = b.heapReleased
-				rows[n-1].heapLive = b.heapLive
-				rows[n-1].hasArena = true
-			}
 			if b.elapsed > rows[n-1].elapsed {
 				rows[n-1].elapsed = b.elapsed
 			}
@@ -875,9 +797,6 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			gcNum: b.gcNum, gen: b.gen, elapsed: b.elapsed,
 			allocBytes: b.allocBytes, freedBytes: b.freedBytes,
 			totalAllocDelta: b.totalAllocDelta, hasTotalAlloc: b.hasTotalAlloc,
-			arenaCount: b.arenaCount, heapInUse: b.heapInUse,
-			heapFree: b.heapFree, heapReleased: b.heapReleased,
-			heapLive: b.heapLive, hasArena: b.hasArena,
 		})
 	}
 
@@ -885,9 +804,7 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	s.addHeaderRow("GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"窗口 Alloc MB", "totalAlloc Δ MB", "Alloc 差值 MB",
 		"GC Alloc MB (heap口径)", "窗口 Freed MB", "GC Freed MB", "Freed 差值 MB",
-		"累计 Alloc 差值 MB", "累计 Freed 差值 MB", "Verdict", "Forced",
-		"Arenas", "HeapInUse MB", "HeapFree MB", "HeapReleased MB", "HeapLive MB",
-		"Δ Arenas", "Δ HeapInUse MB", "Δ HeapFree MB", "Δ HeapReleased MB")
+		"累计 Alloc 差值 MB", "累计 Freed 差值 MB", "Verdict", "Forced")
 
 	// The final cycle of each gen is excluded: the window closes mid-cycle
 	// (deadline or explicit Stop), so allocations between the close and the
@@ -902,16 +819,12 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	prevAt := -1.0
 	cumAllocDiff, cumFreedDiff := 0.0, 0.0
 	excluded := 0
-	prevArena, prevInUse, prevFree, prevReleased := int64(-1), int64(0), int64(0), int64(0)
 	for _, r := range rows {
 		t := pd.traces[r.gcNum]
 		if lastCycleOfGen[r.gen] == r.gcNum {
 			excluded++
 			prevHeap2 = t.heap2 // keep the heap-delta chain continuous
 			prevAt = t.atSec
-			if r.hasArena { // keep the arena-delta chain continuous too
-				prevArena, prevInUse, prevFree, prevReleased = r.arenaCount, r.heapInUse, r.heapFree, r.heapReleased
-			}
 			continue
 		}
 		gcFreedMB := t.heap1 - t.heap2
@@ -976,28 +889,10 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			verdict = "-"
 		}
 
-		arenas, inUse, free, released, live := "-", "-", "-", "-", "-"
-		dArenas, dInUse, dFree, dReleased := "-", "-", "-", "-"
-		if r.hasArena {
-			arenas = fmt.Sprint(r.arenaCount)
-			inUse = fmtMBf(float64(r.heapInUse) / 1048576)
-			free = fmtMBf(float64(r.heapFree) / 1048576)
-			released = fmtMBf(float64(r.heapReleased) / 1048576)
-			live = fmtMBf(float64(r.heapLive) / 1048576)
-			if prevArena >= 0 {
-				dArenas = fmt.Sprintf("%+d", r.arenaCount-prevArena)
-				dInUse = fmt.Sprintf("%+.2f", float64(r.heapInUse-prevInUse)/1048576)
-				dFree = fmt.Sprintf("%+.2f", float64(r.heapFree-prevFree)/1048576)
-				dReleased = fmt.Sprintf("%+.2f", float64(r.heapReleased-prevReleased)/1048576)
-			}
-			prevArena, prevInUse, prevFree, prevReleased = r.arenaCount, r.heapInUse, r.heapFree, r.heapReleased
-		}
 		s.addRow(fmt.Sprint(r.gcNum), fmt.Sprint(r.gen), fmt.Sprint(r.elapsed), interval,
 			fmtMBf(winAllocMB), totAllocMBStr, allocDiffStr, allocMBStr,
 			fmtMBf(winFreedMB), fmt.Sprint(gcFreedMB), fmtMBf(freedDiff),
-			cumAllocDiffStr, fmtMBf(cumFreedDiff), verdict, forced,
-			arenas, inUse, free, released, live,
-			dArenas, dInUse, dFree, dReleased)
+			cumAllocDiffStr, fmtMBf(cumFreedDiff), verdict, forced)
 		prevHeap2 = t.heap2
 	}
 	if excluded > 0 {
