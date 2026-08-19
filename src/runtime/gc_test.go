@@ -341,6 +341,24 @@ func TestGcDeadWindowSessionMutex(t *testing.T) {
 	}
 }
 
+func TestGcDeadWindowGCInterval(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadWindowGCInterval")
+
+	// A 3s window with a 1s periodic GC: baseline + ~3 periodic + final
+	// report blocks. Require at least 3 to prove the periodic trigger
+	// works (the pacer alone would not fire on this tiny heap).
+	n := strings.Count(got, "=== GC #")
+	if n < 3 {
+		t.Fatalf("expected >= 3 report blocks from periodic GC, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "gcinterval=1") {
+		t.Fatalf("expected gcinterval in start message, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end (gcpercent restore check), got:\n%s", got)
+	}
+}
+
 func TestGcDeadTraceSession(t *testing.T) {
 	got := runTestProg(t, "testprog", "GCDeadTraceSession", "GODEBUG=gcdeadtrace=1")
 

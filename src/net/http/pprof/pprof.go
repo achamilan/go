@@ -143,6 +143,11 @@ func Cmdline(w http.ResponseWriter, r *http.Request) {
 //   - seconds: required positive integer; the window auto-stops after
 //     this many seconds. A full GC is forced at start (clean baseline)
 //     and again at stop (final report).
+//   - gcinterval: optional integer seconds; when positive, the regular
+//     GC triggers (heap pacer and forcegc) are disabled for the window
+//     and a full GC is forced every gcinterval seconds instead, giving
+//     evenly spaced report cycles. 0 or negative keeps the regular
+//     triggers. The previous gcpercent is restored at stop.
 //
 // The report is collected in a server-side temporary file that is removed
 // after the response is sent. gctrace lines are interleaved into the
@@ -158,6 +163,16 @@ func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprint(w, "missing or invalid seconds: want a positive integer\n")
 		return
+	}
+
+	gcInterval := 0
+	if s := r.URL.Query().Get("gcinterval"); s != "" {
+		gcInterval, err = strconv.Atoi(s)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, "invalid gcinterval: want an integer (seconds)\n")
+			return
+		}
 	}
 
 	if !gcDeadWindowInFlight.CompareAndSwap(0, 1) {
@@ -177,7 +192,7 @@ func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	if !runtime.GcDeadWindowStart(seconds, tmpPath) {
+	if !runtime.GcDeadWindowStart(seconds, tmpPath, gcInterval) {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprint(w, "gcdeadwindow start refused: a window or gcdeadtrace session is already active (see process stderr)\n")
 		return

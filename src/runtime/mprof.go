@@ -2529,6 +2529,14 @@ var (
 	gcDeadWindowStartTime int64
 	gcDeadWindowLock      mutex
 	gcDeadWindowNote      note // timer goroutine sleep/wakeup
+	gcDeadWindowGCNote    note // periodic-GC goroutine sleep/wakeup
+
+	// gcDeadWindowSavedGCPercent holds the gcpercent value to restore
+	// in GcDeadWindowStop when GcDeadWindowStart disabled the regular
+	// GC triggers (heap pacer and forcegc) for a periodic-GC window
+	// (gcIntervalSeconds > 0). gcDeadWindowGCPercentUnset means Start
+	// did not change it.
+	gcDeadWindowSavedGCPercent int32 = gcDeadWindowGCPercentUnset
 
 	// gcDeadWindowFinalCycle requests one final report from the GC hooks
 	// after GcDeadWindowStop clears the active flag: it holds the GC
@@ -2571,6 +2579,11 @@ var (
 	gcDeadWindowSavedGCTrace int32 = -1
 )
 
+// gcDeadWindowGCPercentUnset is the sentinel for
+// gcDeadWindowSavedGCPercent: any int32 below -1 is outside the valid
+// gcpercent range (>= -1, where -1 itself means "GC disabled").
+const gcDeadWindowGCPercentUnset = -2
+
 // gcDeadWindowReportDue reports whether a GC hook should invoke
 // gcDeadWindowPrint for the cycle that just ended: always while the
 // window is active, and once more for the single cycle that
@@ -2595,6 +2608,14 @@ func gcDeadWindowReportDue() bool {
 // If path is non-empty, reports are appended to that file; otherwise they
 // are written to stderr.
 //
+// gcIntervalSeconds > 0 replaces the regular GC triggers for the
+// window's duration: the heap pacer and the forcegc timer are disabled
+// (via gcpercent = -1, which gates both) and a full GC is forced every
+// gcIntervalSeconds instead, giving evenly spaced report cycles on
+// services whose heap grows too slowly to trigger the pacer. The
+// previous gcpercent is restored by GcDeadWindowStop. gcIntervalSeconds
+// <= 0 keeps the regular GC triggers.
+//
 // Start forces a full GC before returning (clean baseline: pre-window
 // garbage is swept and per-cycle counters restart from zero), and Stop
 // forces another so the final report reflects the complete window.
@@ -2604,7 +2625,7 @@ func gcDeadWindowReportDue() bool {
 // was started; it returns false (after printing a message to stderr) if
 // a window or session is already active. Callers that don't care may
 // simply ignore the result.
-func GcDeadWindowStart(seconds int, path string) bool {
+func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int) bool {
 	lock(&gcDeadWindowLock)
 	if gcDeadWindowActive.Load() != 0 {
 		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: window already active\n")
@@ -2664,11 +2685,30 @@ func GcDeadWindowStart(seconds int, path string) bool {
 	}
 
 	gcDeadWindowActive.Store(1)
-	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ")\n")
+
+	// Disable the regular GC triggers and replace them with a periodic
+	// forced GC. gcpercent < 0 gates both the heap pacer
+	// (gcTriggerHeap) and the forcegc timer (gcTriggerTime, see
+	// gcTrigger.test), so during the window the only cycles are the
+	// baseline/final forced GCs, the periodic ones, and any explicit
+	// runtime.GC calls from the application. Done under
+	// gcDeadWindowLock so Stop cannot interleave between disabling and
+	// recording the value to restore; setGCPercent takes mheap_.lock,
+	// which never nests the other way around (Start/Stop are only
+	// called from user goroutines, not allocator paths).
+	if gcIntervalSeconds > 0 {
+		gcDeadWindowSavedGCPercent = setGCPercent(-1)
+	} else {
+		gcDeadWindowSavedGCPercent = gcDeadWindowGCPercentUnset
+	}
+	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ", gcinterval=", uint64(gcIntervalSeconds), ")\n")
 	unlock(&gcDeadWindowLock)
 
 	if seconds > 0 {
 		go gcDeadWindowTimer(gen, int64(seconds)*1e9)
+	}
+	if gcIntervalSeconds > 0 {
+		go gcDeadWindowGCIntervalTimer(gen, int64(gcIntervalSeconds)*1e9)
 	}
 
 	// Force a full GC as a clean baseline: pre-window garbage is swept,
@@ -2690,6 +2730,23 @@ func gcDeadWindowTimer(gen uint32, ns int64) {
 	}
 }
 
+// gcDeadWindowGCIntervalTimer forces a full GC every ns while the window
+// is active, replacing the heap/time triggers that GcDeadWindowStart
+// disabled for a periodic-GC window. Stop wakes the note early to cancel
+// it; the generation check guards against acting on a stale window.
+func gcDeadWindowGCIntervalTimer(gen uint32, ns int64) {
+	noteclear(&gcDeadWindowGCNote)
+	for {
+		if notetsleepg(&gcDeadWindowGCNote, ns) {
+			return // woken by Stop
+		}
+		if gcDeadWindowActive.Load() == 0 || atomic.Load(&gcDeadWindowGen) != gen {
+			return
+		}
+		GC()
+	}
+}
+
 // GcDeadWindowStop ends the active capture window early: it restores
 // MemProfileRate and forces a full GC so the final report is printed
 // before returning. It is a no-op if no window is active.
@@ -2701,6 +2758,7 @@ func GcDeadWindowStop() {
 	}
 	gcDeadWindowActive.Store(0)
 	notewakeup(&gcDeadWindowNote)
+	notewakeup(&gcDeadWindowGCNote)
 	// Print the live rate before restoring: if it is not 1, some code
 	// clobbered it mid-window and the window's coverage was degraded.
 	print("runtime: gcdeadwindow: MemProfileRate before restore = ", uint64(MemProfileRate), " (saved = ", uint64(gcDeadSavedRate), ")\n")
@@ -2722,6 +2780,13 @@ func GcDeadWindowStop() {
 	if gcDeadWindowSavedGCTrace >= 0 {
 		debug.gctrace = gcDeadWindowSavedGCTrace
 		gcDeadWindowSavedGCTrace = -1
+	}
+
+	// Restore gcpercent only after the forced GC so the whole window
+	// (baseline to final report) runs with the regular triggers off.
+	if gcDeadWindowSavedGCPercent != gcDeadWindowGCPercentUnset {
+		setGCPercent(gcDeadWindowSavedGCPercent)
+		gcDeadWindowSavedGCPercent = gcDeadWindowGCPercentUnset
 	}
 }
 
@@ -3199,6 +3264,27 @@ func gcDeadWindowPrint() {
 	appendUintptr(uintptr(ta))
 	appendStr(" bytes total)\n")
 	gcDeadWindowLastTotalAlloc = ta
+
+	// Heap arena accounting from the GC controller (authoritative and
+	// sampling-independent): heapInUse is bytes in mSpanInUse spans,
+	// heapFree is retained-but-free memory, heapReleased is memory
+	// returned to the OS; the three sum to HeapSys (total mapped).
+	// heapLive is the GC's live-object figure, accurate only once the
+	// previous sweep has completed. A heapInUse far above heapLive
+	// indicates unswept garbage plus free slots in spans (sweep lag).
+	// heapArenas is append-only, so reading its length racily yields
+	// either the old or the new value — fine for a diagnostic line.
+	appendStr("gcdeadwindow:arena: ")
+	appendUintptr(uintptr(len(mheap_.heapArenas)))
+	appendStr(" arenas, inuse ")
+	appendUintptr(uintptr(gcController.heapInUse.load()))
+	appendStr(" bytes, free ")
+	appendUintptr(uintptr(gcController.heapFree.load()))
+	appendStr(" bytes, released ")
+	appendUintptr(uintptr(gcController.heapReleased.load()))
+	appendStr(" bytes, heaplive ")
+	appendUintptr(uintptr(gcController.heapLive.Load()))
+	appendStr(" bytes\n")
 
 	// Alive report first: most critical section.
 	if totalAlive > 0 {

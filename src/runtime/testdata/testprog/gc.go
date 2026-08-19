@@ -45,6 +45,7 @@ func init() {
 	register("GCDeadWindowBasic", GCDeadWindowBasic)
 	register("GCDeadWindowDuration", GCDeadWindowDuration)
 	register("GCDeadWindowSessionMutex", GCDeadWindowSessionMutex)
+	register("GCDeadWindowGCInterval", GCDeadWindowGCInterval)
 }
 
 func GCSys() {
@@ -1291,7 +1292,7 @@ var windowLive [][]byte
 // Expected output: per-GC "gcdeadwindow:alive/alloc/freed" sections tagged
 // with "gcdeadwindow gen=1", and a "window gen=1 ended" message at stop.
 func GCDeadWindowBasic() {
-	runtime.GcDeadWindowStart(0, "")
+	runtime.GcDeadWindowStart(0, "", 0)
 
 	// 4 × 128B that all die (overwritten + nil'd before the final GC).
 	for i := 0; i < 4; i++ {
@@ -1316,7 +1317,7 @@ func GCDeadWindowBasic() {
 // allocating. Expected output: "window gen=1 ended" without an explicit
 // GcDeadWindowStop call.
 func GCDeadWindowDuration() {
-	runtime.GcDeadWindowStart(1, "")
+	runtime.GcDeadWindowStart(1, "", 0)
 
 	start := time.Now()
 	for time.Since(start) < 1500*time.Millisecond {
@@ -1337,13 +1338,40 @@ func GCDeadWindowDuration() {
 func GCDeadWindowSessionMutex() {
 	// Direction 1: active session blocks GcDeadWindowStart.
 	runtime.GcDeadSessionStart(900)
-	runtime.GcDeadWindowStart(0, "") // expect: skipped, session active
+	runtime.GcDeadWindowStart(0, "", 0) // expect: skipped, session active
 	runtime.GcDeadSessionEnd(900)
 
 	// Direction 2: active window blocks GcDeadSessionStart.
-	runtime.GcDeadWindowStart(0, "") // expect: started
-	runtime.GcDeadSessionStart(901)  // expect: skipped, window active
+	runtime.GcDeadWindowStart(0, "", 0) // expect: started
+	runtime.GcDeadSessionStart(901)     // expect: skipped, window active
 	runtime.GcDeadWindowStop()
 
+	fmt.Println("OK")
+}
+
+// GCDeadWindowGCInterval exercises periodic-GC mode: gcIntervalSeconds=1
+// disables the regular GC triggers (gcpercent=-1) for the window and
+// forces a GC every second instead. Expected output: several per-second
+// report blocks within a 3-second window, and gcpercent restored to its
+// pre-window value at stop (verified via debug.SetGCPercent).
+func GCDeadWindowGCInterval() {
+	debug.SetGCPercent(42)
+
+	runtime.GcDeadWindowStart(3, "", 1)
+
+	start := time.Now()
+	for time.Since(start) < 3500*time.Millisecond {
+		windowDeadSink = windowAllocDead()
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The window should have ended automatically; Stop is a no-op then.
+	runtime.GcDeadWindowStop()
+
+	// gcpercent must be back to the pre-window 42.
+	if got := debug.SetGCPercent(100); got != 42 {
+		fmt.Println("gcpercent not restored, got", got)
+		return
+	}
 	fmt.Println("OK")
 }
