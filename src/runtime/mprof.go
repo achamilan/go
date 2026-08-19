@@ -3265,27 +3265,6 @@ func gcDeadWindowPrint() {
 	appendStr(" bytes total)\n")
 	gcDeadWindowLastTotalAlloc = ta
 
-	// Heap arena accounting from the GC controller (authoritative and
-	// sampling-independent): heapInUse is bytes in mSpanInUse spans,
-	// heapFree is retained-but-free memory, heapReleased is memory
-	// returned to the OS; the three sum to HeapSys (total mapped).
-	// heapLive is the GC's live-object figure, accurate only once the
-	// previous sweep has completed. A heapInUse far above heapLive
-	// indicates unswept garbage plus free slots in spans (sweep lag).
-	// heapArenas is append-only, so reading its length racily yields
-	// either the old or the new value — fine for a diagnostic line.
-	appendStr("gcdeadwindow:arena: ")
-	appendUintptr(uintptr(len(mheap_.heapArenas)))
-	appendStr(" arenas, inuse ")
-	appendUintptr(uintptr(gcController.heapInUse.load()))
-	appendStr(" bytes, free ")
-	appendUintptr(uintptr(gcController.heapFree.load()))
-	appendStr(" bytes, released ")
-	appendUintptr(uintptr(gcController.heapReleased.load()))
-	appendStr(" bytes, heaplive ")
-	appendUintptr(uintptr(gcController.heapLive.Load()))
-	appendStr(" bytes\n")
-
 	// Alive report first: most critical section.
 	if totalAlive > 0 {
 		aliveSites := uintptr(0)
