@@ -2924,7 +2924,96 @@ type gcDeadWinSite struct {
 var (
 	gcDeadWinRaw   []gcDeadWinRawEntry
 	gcDeadWinSites []gcDeadWinSite
+
+	// gcDeadWinHash is the Phase 1 merge index: an open-addressing
+	// table (power-of-two size, linear probing) mapping a PC tuple to a
+	// 1-based index into gcDeadWinRaw; 0 means empty. It is cleared at
+	// the start of every print and rebuilt as buckets are scanned, and
+	// reallocated (and rehashed by the caller) when gcDeadWinGrow
+	// doubles the raw table. It replaced an O(n²) linear merge scan.
+	gcDeadWinHash []uint32
+
+	// gcDeadWinSymCache is a process-lifetime direct-mapped cache from
+	// call PC to its resolved (name, file, line). PCs never change
+	// meaning in a running process, so findfunc/funcname/funcline are
+	// paid once per PC instead of once per frame per report cycle.
+	// Collisions evict; a miss just re-resolves.
+	gcDeadWinSymCache []gcDeadWinSym
 )
+
+// gcDeadWinSymCacheSize is the number of slots in gcDeadWinSymCache;
+// must be a power of two and match the shift in gcDeadWinSymbolize.
+const gcDeadWinSymCacheSize = 1 << 14
+
+type gcDeadWinSym struct {
+	pc    uintptr
+	line  int32
+	valid bool
+	name  string
+	file  string
+}
+
+// gcDeadWinSymbolize resolves a call PC to (name, file, line) through
+// gcDeadWinSymCache. valid reports whether the PC maps to a function.
+func gcDeadWinSymbolize(pc uintptr) (name, file string, line int32, valid bool) {
+	h := (uint64(pc) * 0x9E3779B97F4A7C15) >> (64 - 14)
+	e := &gcDeadWinSymCache[h]
+	if e.pc == pc {
+		return e.name, e.file, e.line, e.valid
+	}
+	fi := findfunc(pc)
+	if !fi.valid() {
+		*e = gcDeadWinSym{pc: pc}
+		return "", "", 0, false
+	}
+	name = funcname(fi)
+	file, line = funcline(fi, pc)
+	*e = gcDeadWinSym{pc: pc, line: line, valid: true, name: name, file: file}
+	return name, file, line, true
+}
+
+// gcDeadWinHashPCs hashes a PC tuple for the Phase 1 merge table.
+func gcDeadWinHashPCs(pcs *[gcDeadTraceMaxFrames]uintptr, nframes int) uintptr {
+	h := uint64(1469598103934665603) ^ uint64(nframes)
+	for j := 0; j < nframes; j++ {
+		h = (h ^ uint64(pcs[j])) * 1099511628211
+	}
+	h ^= h >> 32
+	return uintptr(h)
+}
+
+// gcDeadWinHashFind probes the Phase 1 merge table for pcs. On a hit it
+// returns the raw entry index; on a miss it returns -1 and sets *slot
+// to the probe position where the new entry must be registered.
+func gcDeadWinHashFind(raw []gcDeadWinRawEntry, pcs *[gcDeadTraceMaxFrames]uintptr, nframes int, slot *uintptr) int {
+	mask := uintptr(len(gcDeadWinHash) - 1)
+	for p := gcDeadWinHashPCs(pcs, nframes) & mask; ; p = (p + 1) & mask {
+		e := gcDeadWinHash[p]
+		if e == 0 {
+			*slot = p
+			return -1
+		}
+		if r := &raw[e-1]; r.nframes == nframes && r.pcs == *pcs {
+			return int(e - 1)
+		}
+	}
+}
+
+// gcDeadWinHashRehash rebuilds the Phase 1 merge table after
+// gcDeadWinGrow replaced it with a larger zeroed one, re-registering
+// the first n raw entries.
+func gcDeadWinHashRehash(raw []gcDeadWinRawEntry, n int) {
+	mask := uintptr(len(gcDeadWinHash) - 1)
+	for i := 0; i < n; i++ {
+		r := &raw[i]
+		for p := gcDeadWinHashPCs(&r.pcs, r.nframes) & mask; ; p = (p + 1) & mask {
+			if gcDeadWinHash[p] == 0 {
+				gcDeadWinHash[p] = uint32(i + 1)
+				break
+			}
+		}
+	}
+}
 
 // gcDeadWinSitesInitial is the initial capacity of the aggregation slices.
 const gcDeadWinSitesInitial = 1024
@@ -2943,6 +3032,12 @@ func gcDeadWinGrow() {
 	ns := unsafe.Slice((*gcDeadWinSite)(p2), m)
 	copy(ns, gcDeadWinSites)
 	gcDeadWinSites = ns
+
+	// The merge hash grows with the raw table; the caller rebuilds it
+	// with gcDeadWinHashRehash (the new table is zeroed).
+	mh := 2 * len(gcDeadWinHash)
+	p3 := persistentalloc(uintptr(mh)*4, 0, &memstats.other_sys)
+	gcDeadWinHash = unsafe.Slice((*uint32)(p3), mh)
 }
 
 // gcDeadWindowPrint prints the per-GC-cycle gcdeadwindow report: objects
@@ -2967,6 +3062,10 @@ func gcDeadWindowPrint() {
 		gcDeadWinRaw = unsafe.Slice((*gcDeadWinRawEntry)(p), gcDeadWinSitesInitial)
 		p2 := persistentalloc(gcDeadWinSitesInitial*unsafe.Sizeof(gcDeadWinSite{}), 0, &memstats.other_sys)
 		gcDeadWinSites = unsafe.Slice((*gcDeadWinSite)(p2), gcDeadWinSitesInitial)
+		p4 := persistentalloc(2*gcDeadWinSitesInitial*4, 0, &memstats.other_sys)
+		gcDeadWinHash = unsafe.Slice((*uint32)(p4), 2*gcDeadWinSitesInitial)
+		p5 := persistentalloc(gcDeadWinSymCacheSize*unsafe.Sizeof(gcDeadWinSym{}), 0, &memstats.other_sys)
+		gcDeadWinSymCache = unsafe.Slice((*gcDeadWinSym)(p5), gcDeadWinSymCacheSize)
 		if gcDeadBufData == nil {
 			p3 := persistentalloc(gcDeadTraceBufSize, 0, &memstats.other_sys)
 			gcDeadBufData = (*[gcDeadTraceBufSize]byte)(p3)
@@ -2986,6 +3085,9 @@ func gcDeadWindowPrint() {
 	totalFreeBytes := uintptr(0)
 	totalAlive := uintptr(0)
 	totalAliveBytes := uintptr(0)
+
+	// Clear the merge hash for this print.
+	memclrNoHeapPointers(unsafe.Pointer(&gcDeadWinHash[0]), uintptr(len(gcDeadWinHash))*4)
 
 	lock(&profMemActiveLock)
 	for b := (*bucket)(mbuckets.Load()); b != nil; b = b.allnext {
@@ -3018,9 +3120,8 @@ func gcDeadWindowPrint() {
 			if callPC > 1 {
 				callPC--
 			}
-			fi := findfunc(callPC)
-			if fi.valid() {
-				name := funcname(fi)
+			name, _, _, valid := gcDeadWinSymbolize(callPC)
+			if valid {
 				if len(name) >= 8 && name[:8] == "runtime." {
 					continue
 				}
@@ -3036,24 +3137,10 @@ func gcDeadWindowPrint() {
 			nframes = 1
 		}
 
-		// Merge with existing entry by the PC tuple.
-		idx := -1
-		for i := 0; i < rawCount; i++ {
-			if raw[i].nframes != nframes {
-				continue
-			}
-			match := true
-			for j := 0; j < nframes; j++ {
-				if raw[i].pcs[j] != pcs[j] {
-					match = false
-					break
-				}
-			}
-			if match {
-				idx = i
-				break
-			}
-		}
+		// Merge with existing entry by the PC tuple, via the hash table
+		// (O(1) probing; the old linear scan was O(n²) per report).
+		var slot uintptr
+		idx := gcDeadWinHashFind(raw, &pcs, nframes, &slot)
 		if idx >= 0 {
 			raw[idx].allocs += a
 			raw[idx].allocBytes += ab
@@ -3066,6 +3153,9 @@ func gcDeadWindowPrint() {
 				gcDeadWinGrow()
 				raw = gcDeadWinRaw
 				sites = gcDeadWinSites
+				gcDeadWinHashRehash(raw, rawCount)
+				// Re-probe for an insertion slot in the new table.
+				idx = gcDeadWinHashFind(raw, &pcs, nframes, &slot)
 			}
 			raw[rawCount] = gcDeadWinRawEntry{
 				pcs: pcs, nframes: nframes,
@@ -3073,6 +3163,7 @@ func gcDeadWindowPrint() {
 				frees: f, freeBytes: fb,
 				alive: alive, aliveBytes: aliveBytes,
 			}
+			gcDeadWinHash[slot] = uint32(rawCount + 1)
 			rawCount++
 		}
 
@@ -3107,79 +3198,38 @@ func gcDeadWindowPrint() {
 		gcDeadWindowGCTrace()
 	}
 
-	// Phase 2: resolve PCs and merge by the full site key.
-	siteCount := 0
+	// Phase 2: resolve each raw entry's frames (through the
+	// symbolization cache) into its site entry. The mapping is 1:1:
+	// Phase 1 already merged by the full PC tuple, a finer and cheaper
+	// key than the resolved text. Entries whose PCs differ but that
+	// resolve to the same source lines now appear as separate rows with
+	// identical text; the report generator re-aggregates by text anyway.
+	// (The old string-keyed merge was O(rawCount × siteCount) string
+	// comparisons per report, and the old Phase 3 insertion sort was
+	// O(n²) — both removed; the chunked flush made truncation-driven
+	// ordering unnecessary and the report generator re-sorts.)
+	siteCount := rawCount
 	for i := 0; i < rawCount; i++ {
 		r := &raw[i]
-		key := [gcDeadTraceMaxFrames]struct {
-			name string
-			file string
-			line int32
-		}{}
+		s := &sites[i]
+		s.nframes = r.nframes
 		for j := 0; j < r.nframes; j++ {
-			key[j].name = "?"
-			key[j].file = "?"
-			if r.pcs[j] != 0 {
-				fi := findfunc(r.pcs[j])
-				if fi.valid() {
-					key[j].name = funcname(fi)
-					key[j].file, key[j].line = funcline(fi, r.pcs[j])
-				}
+			s.funcs[j].name = "?"
+			s.funcs[j].file = "?"
+			s.funcs[j].line = 0
+			name, file, line, valid := gcDeadWinSymbolize(r.pcs[j])
+			if valid {
+				s.funcs[j].name = name
+				s.funcs[j].file = file
+				s.funcs[j].line = line
 			}
 		}
-
-		idx := -1
-		for j := 0; j < siteCount; j++ {
-			if sites[j].nframes != r.nframes {
-				continue
-			}
-			match := true
-			for k := 0; k < r.nframes; k++ {
-				if sites[j].funcs[k].name != key[k].name ||
-					sites[j].funcs[k].file != key[k].file ||
-					sites[j].funcs[k].line != key[k].line {
-					match = false
-					break
-				}
-			}
-			if match {
-				idx = j
-				break
-			}
-		}
-		if idx >= 0 {
-			sites[idx].allocs += r.allocs
-			sites[idx].allocBytes += r.allocBytes
-			sites[idx].frees += r.frees
-			sites[idx].freeBytes += r.freeBytes
-			sites[idx].alive += r.alive
-			sites[idx].aliveBytes += r.aliveBytes
-		} else {
-			if siteCount == len(sites) {
-				gcDeadWinGrow()
-				raw = gcDeadWinRaw
-				sites = gcDeadWinSites
-				r = &raw[i]
-			}
-			sites[siteCount] = gcDeadWinSite{
-				funcs: key, nframes: r.nframes,
-				allocs: r.allocs, allocBytes: r.allocBytes,
-				frees: r.frees, freeBytes: r.freeBytes,
-				alive: r.alive, aliveBytes: r.aliveBytes,
-			}
-			siteCount++
-		}
-	}
-
-	// Phase 3: sort by alive bytes, descending (insertion sort).
-	for i := 1; i < siteCount; i++ {
-		tmp := sites[i]
-		j := i
-		for j > 0 && sites[j-1].aliveBytes < tmp.aliveBytes {
-			sites[j] = sites[j-1]
-			j--
-		}
-		sites[j] = tmp
+		s.allocs = r.allocs
+		s.allocBytes = r.allocBytes
+		s.frees = r.frees
+		s.freeBytes = r.freeBytes
+		s.alive = r.alive
+		s.aliveBytes = r.aliveBytes
 	}
 
 	// Phase 4: build output into the buffer. The buffer is flushed to the
