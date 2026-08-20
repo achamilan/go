@@ -2577,6 +2577,12 @@ var (
 	// in GcDeadWindowStop when GcDeadWindowStart enabled it for the
 	// report-file tee; -1 means Start did not change it.
 	gcDeadWindowSavedGCTrace int32 = -1
+
+	// gcDeadWindowSampleRate is the MemProfileRate in effect for the
+	// active window: 1 for exact mode, >1 for sampling mode. Kept
+	// separate from MemProfileRate because Stop restores the pre-window
+	// rate before the final report is printed.
+	gcDeadWindowSampleRate int
 )
 
 // gcDeadWindowGCPercentUnset is the sentinel for
@@ -2616,6 +2622,17 @@ func gcDeadWindowReportDue() bool {
 // previous gcpercent is restored by GcDeadWindowStop. gcIntervalSeconds
 // <= 0 keeps the regular GC triggers.
 //
+// sampleRate > 1 enables sampling mode: MemProfileRate is set to
+// sampleRate instead of 1, so an allocation of size S is tracked with
+// probability ~S/sampleRate (the standard Go heap-profile sampling).
+// Per-allocation and per-sweep window overhead drops proportionally —
+// the recommended mode for high-traffic captures. Report counts are
+// raw sampled values (the alloc == freed + alive invariant still holds
+// exactly in the sampled domain) and each report block carries a
+// "gcdeadwindow:rate:" marker line; unbiased estimates scale up by
+// sampleRate (bytes) or ~sampleRate/mean-size (objects). sampleRate
+// <= 1 selects exact mode (every allocation tracked).
+//
 // Start forces a full GC before returning (clean baseline: pre-window
 // garbage is swept and per-cycle counters restart from zero), and Stop
 // forces another so the final report reflects the complete window.
@@ -2625,7 +2642,7 @@ func gcDeadWindowReportDue() bool {
 // was started; it returns false (after printing a message to stderr) if
 // a window or session is already active. Callers that don't care may
 // simply ignore the result.
-func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int) bool {
+func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int, sampleRate int) bool {
 	lock(&gcDeadWindowLock)
 	if gcDeadWindowActive.Load() != 0 {
 		print("runtime: gcdeadwindow: GcDeadWindowStart skipped: window already active\n")
@@ -2673,7 +2690,15 @@ func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int) bool {
 	gcDeadWindowLastTotalAlloc = gcController.totalAlloc.Load()
 
 	gcDeadSavedRate = MemProfileRate
-	MemProfileRate = 1
+	if sampleRate > 1 {
+		MemProfileRate = sampleRate
+	} else {
+		MemProfileRate = 1
+	}
+	// Saved separately from MemProfileRate itself: Stop restores the
+	// pre-window rate before the final forced GC, but the final
+	// report's rate line must still reflect the window's own rate.
+	gcDeadWindowSampleRate = MemProfileRate
 
 	// Enable the GC log so gctrace lines are tee'd into the window
 	// report file alongside the per-GC reports. Restored by Stop.
@@ -2683,6 +2708,13 @@ func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int) bool {
 	} else {
 		gcDeadWindowSavedGCTrace = -1
 	}
+
+	// Clear any wakeup left pending by the previous window's Stop: its
+	// timer goroutines may have exited without consuming it (e.g. a
+	// window with no timers at all, so nobody ever cleared the note),
+	// and notewakeup throws on a double wakeup.
+	noteclear(&gcDeadWindowNote)
+	noteclear(&gcDeadWindowGCNote)
 
 	gcDeadWindowActive.Store(1)
 
@@ -2701,7 +2733,7 @@ func GcDeadWindowStart(seconds int, path string, gcIntervalSeconds int) bool {
 	} else {
 		gcDeadWindowSavedGCPercent = gcDeadWindowGCPercentUnset
 	}
-	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ", gcinterval=", uint64(gcIntervalSeconds), ")\n")
+	print("runtime: gcdeadwindow: window gen=", uint64(gen), " started (seconds=", uint64(seconds), ", path=", path, ", gcinterval=", uint64(gcIntervalSeconds), ", samplerate=", uint64(gcDeadWindowSampleRate), ")\n")
 	unlock(&gcDeadWindowLock)
 
 	if seconds > 0 {
@@ -2759,9 +2791,10 @@ func GcDeadWindowStop() {
 	gcDeadWindowActive.Store(0)
 	notewakeup(&gcDeadWindowNote)
 	notewakeup(&gcDeadWindowGCNote)
-	// Print the live rate before restoring: if it is not 1, some code
-	// clobbered it mid-window and the window's coverage was degraded.
-	print("runtime: gcdeadwindow: MemProfileRate before restore = ", uint64(MemProfileRate), " (saved = ", uint64(gcDeadSavedRate), ")\n")
+	// Print the live rate before restoring: if it differs from the
+	// window's own rate, some code clobbered it mid-window and the
+	// window's coverage was degraded.
+	print("runtime: gcdeadwindow: MemProfileRate before restore = ", uint64(MemProfileRate), " (window rate = ", uint64(gcDeadWindowSampleRate), ", saved = ", uint64(gcDeadSavedRate), ")\n")
 	MemProfileRate = gcDeadSavedRate
 	print("runtime: gcdeadwindow: window gen=", uint64(atomic.Load(&gcDeadWindowGen)), " ended (elapsed ",
 		uint64((nanotime()-gcDeadWindowStartTime)/1e9), "s)\n")
@@ -3314,6 +3347,16 @@ func gcDeadWindowPrint() {
 	appendUintptr(uintptr(ta))
 	appendStr(" bytes total)\n")
 	gcDeadWindowLastTotalAlloc = ta
+
+	// Sampling mode marker: with gcDeadWindowSampleRate > 1 all counts
+	// in this block are raw sampled values; unbiased estimates scale up
+	// by rate (bytes) or ~rate/mean-size (objects). Printed per block
+	// so every report-file fragment is self-describing.
+	if gcDeadWindowSampleRate > 1 {
+		appendStr("gcdeadwindow:rate: ")
+		appendUintptr(uintptr(gcDeadWindowSampleRate))
+		appendStr(" bytes per sample\n")
+	}
 
 	// Alive report first: most critical section.
 	if totalAlive > 0 {

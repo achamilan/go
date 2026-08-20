@@ -359,6 +359,33 @@ func TestGcDeadWindowGCInterval(t *testing.T) {
 	}
 }
 
+func TestGcDeadWindowSampled(t *testing.T) {
+	got := runTestProg(t, "testprog", "GCDeadWindowSampled")
+
+	if !strings.Contains(got, "gcdeadwindow:rate: 4096 bytes per sample") {
+		t.Fatalf("expected sampling rate marker line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "gcdeadwindow:alloc:") {
+		t.Fatalf("expected gcdeadwindow:alloc output, got:\n%s", got)
+	}
+	if !strings.Contains(got, "samplerate=4096") {
+		t.Fatalf("expected samplerate in start message, got:\n%s", got)
+	}
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end (MemProfileRate restore check), got:\n%s", got)
+	}
+}
+
+func TestGcDeadWindowNoteReuse(t *testing.T) {
+	// Two bare windows in a row: regression test for the
+	// "notewakeup - double wakeup" fatal (the first Stop left the note
+	// pending with no timer goroutine to consume it).
+	got := runTestProg(t, "testprog", "GCDeadWindowNoteReuse")
+	if !strings.Contains(got, "OK") {
+		t.Fatalf("expected 'OK' at the end, got:\n%s", got)
+	}
+}
+
 func TestGcDeadTraceSession(t *testing.T) {
 	got := runTestProg(t, "testprog", "GCDeadTraceSession", "GODEBUG=gcdeadtrace=1")
 

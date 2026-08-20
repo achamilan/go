@@ -46,6 +46,8 @@ func init() {
 	register("GCDeadWindowDuration", GCDeadWindowDuration)
 	register("GCDeadWindowSessionMutex", GCDeadWindowSessionMutex)
 	register("GCDeadWindowGCInterval", GCDeadWindowGCInterval)
+	register("GCDeadWindowSampled", GCDeadWindowSampled)
+	register("GCDeadWindowNoteReuse", GCDeadWindowNoteReuse)
 }
 
 func GCSys() {
@@ -1292,7 +1294,7 @@ var windowLive [][]byte
 // Expected output: per-GC "gcdeadwindow:alive/alloc/freed" sections tagged
 // with "gcdeadwindow gen=1", and a "window gen=1 ended" message at stop.
 func GCDeadWindowBasic() {
-	runtime.GcDeadWindowStart(0, "", 0)
+	runtime.GcDeadWindowStart(0, "", 0, 0)
 
 	// 4 × 128B that all die (overwritten + nil'd before the final GC).
 	for i := 0; i < 4; i++ {
@@ -1317,7 +1319,7 @@ func GCDeadWindowBasic() {
 // allocating. Expected output: "window gen=1 ended" without an explicit
 // GcDeadWindowStop call.
 func GCDeadWindowDuration() {
-	runtime.GcDeadWindowStart(1, "", 0)
+	runtime.GcDeadWindowStart(1, "", 0, 0)
 
 	start := time.Now()
 	for time.Since(start) < 1500*time.Millisecond {
@@ -1338,11 +1340,11 @@ func GCDeadWindowDuration() {
 func GCDeadWindowSessionMutex() {
 	// Direction 1: active session blocks GcDeadWindowStart.
 	runtime.GcDeadSessionStart(900)
-	runtime.GcDeadWindowStart(0, "", 0) // expect: skipped, session active
+	runtime.GcDeadWindowStart(0, "", 0, 0) // expect: skipped, session active
 	runtime.GcDeadSessionEnd(900)
 
 	// Direction 2: active window blocks GcDeadSessionStart.
-	runtime.GcDeadWindowStart(0, "", 0) // expect: started
+	runtime.GcDeadWindowStart(0, "", 0, 0) // expect: started
 	runtime.GcDeadSessionStart(901)     // expect: skipped, window active
 	runtime.GcDeadWindowStop()
 
@@ -1357,7 +1359,7 @@ func GCDeadWindowSessionMutex() {
 func GCDeadWindowGCInterval() {
 	debug.SetGCPercent(42)
 
-	runtime.GcDeadWindowStart(3, "", 1)
+	runtime.GcDeadWindowStart(3, "", 1, 0)
 
 	start := time.Now()
 	for time.Since(start) < 3500*time.Millisecond {
@@ -1371,6 +1373,52 @@ func GCDeadWindowGCInterval() {
 	// gcpercent must be back to the pre-window 42.
 	if got := debug.SetGCPercent(100); got != 42 {
 		fmt.Println("gcpercent not restored, got", got)
+		return
+	}
+	fmt.Println("OK")
+}
+
+// GCDeadWindowNoteReuse starts and stops two bare windows in a row
+// (seconds=0, gcIntervalSeconds=0, so no timer goroutines ever run).
+// The first Stop's notewakeup leaves the note pending with nobody to
+// consume it; without the noteclear in Start, the second Stop's
+// notewakeup throws "notewakeup - double wakeup" (fatal).
+func GCDeadWindowNoteReuse() {
+	for i := 0; i < 2; i++ {
+		runtime.GcDeadWindowStart(0, "", 0, 0)
+		windowDeadSink = windowAllocDead()
+		runtime.GC()
+		runtime.GcDeadWindowStop()
+	}
+	fmt.Println("OK")
+}
+
+// GCDeadWindowSampled exercises sampling mode: sampleRate=4096 sets
+// MemProfileRate to 4096 instead of 1, so only ~size/4096 of the
+// allocations are tracked. Expected output: a "gcdeadwindow:rate: 4096
+// bytes per sample" marker line in each report block, and MemProfileRate
+// restored afterwards.
+func GCDeadWindowSampled() {
+	savedRate := runtime.MemProfileRate
+
+	runtime.GcDeadWindowStart(0, "", 0, 4096)
+	if runtime.MemProfileRate != 4096 {
+		fmt.Println("MemProfileRate not set to 4096, got", runtime.MemProfileRate)
+		return
+	}
+
+	// ~200K x 64B allocations: with rate 4096 about 1/64 of them
+	// (~3K) are sampled, so alloc sections must be present but much
+	// smaller than the true count.
+	for i := 0; i < 200000; i++ {
+		windowDeadSink = windowAllocDead()
+	}
+	windowDeadSink = nil
+	runtime.GC()
+
+	runtime.GcDeadWindowStop()
+	if runtime.MemProfileRate != savedRate {
+		fmt.Println("MemProfileRate not restored, got", runtime.MemProfileRate, "want", savedRate)
 		return
 	}
 	fmt.Println("OK")

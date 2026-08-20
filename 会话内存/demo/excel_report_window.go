@@ -55,6 +55,12 @@ type winBlock struct {
 	totalAllocDelta int64
 	hasTotalAlloc   bool
 
+	// sampleRate is the gcdeadwindow:rate line: bytes per sample in
+	// sampling mode; 0/1 means exact mode. In sampling mode all
+	// objs/bytes counts are raw sampled values; unbiased byte
+	// estimates scale up by rate (sampledObjs × rate).
+	sampleRate int64
+
 	hasAlive, hasAlloc, hasFreed bool
 
 	aliveLines []winSite
@@ -63,9 +69,10 @@ type winBlock struct {
 }
 
 type parsedWindow struct {
-	name   string
-	blocks []*winBlock
-	traces map[int]*gcTrace // GC number -> gctrace heap data (from teed "gc N @..." lines)
+	name    string
+	blocks  []*winBlock
+	traces  map[int]*gcTrace // GC number -> gctrace heap data (from teed "gc N @..." lines)
+	sampled bool             // any block in sampling mode (rate > 1)
 }
 
 // gcTrace holds the heap sizes parsed from a gctrace line:
@@ -88,6 +95,7 @@ var (
 	allocSumRe = regexp.MustCompile(`^gcdeadwindow:alloc: (\d+) objs \((\d+) bytes\) allocated this cycle from (\d+) sites`)
 	freedSumRe = regexp.MustCompile(`^gcdeadwindow:freed: (\d+) objs \((\d+) bytes\) freed this cycle from (\d+) sites`)
 	totalAllocRe = regexp.MustCompile(`^gcdeadwindow:totalalloc: (\d+) bytes allocated since last report`)
+	rateRe       = regexp.MustCompile(`^gcdeadwindow:rate: (\d+) bytes per sample`)
 	siteLineRe = regexp.MustCompile(`^  (.+): (\d+) objs, (\d+) bytes$`)
 	frameRe    = regexp.MustCompile(`^(\S+) \(([^)]+)\)`)
 	// gctrace lines teed into the report file by the runtime when the
@@ -189,6 +197,14 @@ func parseWindowFile(path string) (*parsedWindow, error) {
 		if m := totalAllocRe.FindStringSubmatch(line); m != nil {
 			blk.hasTotalAlloc = true
 			blk.totalAllocDelta = atoi64(m[1])
+			section = ""
+			continue
+		}
+		if m := rateRe.FindStringSubmatch(line); m != nil {
+			blk.sampleRate = atoi64(m[1])
+			if blk.sampleRate > 1 {
+				pd.sampled = true
+			}
 			section = ""
 			continue
 		}
@@ -604,7 +620,11 @@ func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 }
 
 func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
-	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 12)}
+	cw := 12
+	if pd.sampled {
+		cw = 15
+	}
+	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, cw)}
 	gens := aggregateGens(pd)
 
 	var totAllocObjs, totAllocBytes, totFreedObjs, totFreedBytes int64
@@ -620,6 +640,9 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("Windows (gen):", fmt.Sprint(len(gens)))
 	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%.2f MB)", totAllocObjs, float64(totAllocBytes)/1048576))
 	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%.2f MB)", totFreedObjs, float64(totFreedBytes)/1048576))
+	if pd.sampled {
+		s.addRow("采样模式:", "rate>1（见 gcdeadwindow:rate 行）——计数为采样原始值；估算字节 ≈ 采样对象数 × rate（Est 列），数据验证在采样域仍精确")
+	}
 	s.addBlank()
 
 	// === Summary === — per-gen aggregates.
@@ -659,9 +682,15 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 
 	// === Per-GC Summary === — one row per report block.
 	s.addRow("=== Per-GC Summary ===")
-	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
+	hdr := []string{"Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
-		"Alive Objs", "Alive MB", "Alive Sites")
+		"Alive Objs", "Alive MB", "Alive Sites"}
+	if pd.sampled {
+		// Estimated whole-traffic volumes: sampledObjs × rate (the
+		// unbiased byte estimator for Poisson sampling).
+		hdr = append(hdr, "Est Alloc MB", "Est Freed MB", "Est Alive MB")
+	}
+	s.addHeaderRow(hdr...)
 	prevAt := -1.0
 	for i, b := range pd.blocks {
 		interval := "-"
@@ -671,10 +700,20 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 			}
 			prevAt = t.atSec
 		}
-		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
+		row := []string{fmt.Sprint(i + 1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
 			fmt.Sprint(b.allocObjs), fmtMB2(b.allocBytes),
 			fmt.Sprint(b.freedObjs), fmtMB2(b.freedBytes),
-			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites))
+			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites)}
+		if pd.sampled {
+			estA, estF, estL := "-", "-", "-"
+			if b.sampleRate > 1 {
+				estA = fmt.Sprintf("%.2f", float64(b.allocObjs*b.sampleRate)/1048576)
+				estF = fmt.Sprintf("%.2f", float64(b.freedObjs*b.sampleRate)/1048576)
+				estL = fmt.Sprintf("%.2f", float64(b.aliveObjs*b.sampleRate)/1048576)
+			}
+			row = append(row, estA, estF, estL)
+		}
+		s.addRow(row...)
 	}
 	return s
 }
@@ -702,6 +741,9 @@ func buildWindowSiteSheets(pd *parsedWindow) []*xlsxSheet {
 		})
 		s.addRow("Mode:", pd.name)
 		s.addRow("Category:", note)
+		if pd.sampled {
+			s.addRow("采样模式:", "计数为采样原始值（缩放因子相同，排序不受影响）；估算字节 ≈ 对象数 × rate")
+		}
 		s.addBlank()
 		s.addHeaderRow("Gen", "Function", "File:Line",
 			"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
@@ -759,6 +801,8 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("", "仅作参考。GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
 	s.addRow("", "freed 差值来源：MB 截断 ±1MB；窗口前旧对象垃圾（大堆服务此项必然很大，仅作参考）；")
 	s.addRow("", "世界重启后输出的相邻周期归属偏移。Verdict 只看 alloc 侧：|差值| ≤ max(2MB, 30%×totalAllocΔ) 为 OK。")
+	s.addRow("", "采样模式（gcdeadwindow:rate 行 rate>1）：窗口 Alloc/Freed MB 列为估算值（采样对象数×rate，")
+	s.addRow("", "无偏估计但含泊松噪声，小样本周期偏差更大）；原始采样计数见主 sheet Per-GC Summary。")
 	s.addBlank()
 
 	if len(pd.traces) == 0 {
@@ -773,9 +817,11 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	// line per GC). Bytes are additive across the two snapshots.
 	type mergedRow struct {
 		gcNum, gen, elapsed    int
+		allocObjs, freedObjs   int64
 		allocBytes, freedBytes int64
 		totalAllocDelta        int64
 		hasTotalAlloc          bool
+		sampleRate             int64
 	}
 	var rows []mergedRow
 	for _, b := range pd.blocks {
@@ -784,10 +830,15 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			continue
 		}
 		if n := len(rows); n > 0 && rows[n-1].gcNum == b.gcNum {
+			rows[n-1].allocObjs += b.allocObjs
+			rows[n-1].freedObjs += b.freedObjs
 			rows[n-1].allocBytes += b.allocBytes
 			rows[n-1].freedBytes += b.freedBytes
 			rows[n-1].totalAllocDelta += b.totalAllocDelta
 			rows[n-1].hasTotalAlloc = rows[n-1].hasTotalAlloc || b.hasTotalAlloc
+			if b.sampleRate > 1 {
+				rows[n-1].sampleRate = b.sampleRate
+			}
 			if b.elapsed > rows[n-1].elapsed {
 				rows[n-1].elapsed = b.elapsed
 			}
@@ -795,8 +846,10 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		}
 		rows = append(rows, mergedRow{
 			gcNum: b.gcNum, gen: b.gen, elapsed: b.elapsed,
+			allocObjs: b.allocObjs, freedObjs: b.freedObjs,
 			allocBytes: b.allocBytes, freedBytes: b.freedBytes,
 			totalAllocDelta: b.totalAllocDelta, hasTotalAlloc: b.hasTotalAlloc,
+			sampleRate: b.sampleRate,
 		})
 	}
 
@@ -830,6 +883,12 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		gcFreedMB := t.heap1 - t.heap2
 		winAllocMB := float64(r.allocBytes) / 1048576
 		winFreedMB := float64(r.freedBytes) / 1048576
+		if r.sampleRate > 1 {
+			// Sampling mode: raw bytes are sampled bytes; the unbiased
+			// whole-traffic estimate is sampledObjs × rate.
+			winAllocMB = float64(r.allocObjs*r.sampleRate) / 1048576
+			winFreedMB = float64(r.freedObjs*r.sampleRate) / 1048576
+		}
 		freedDiff := winFreedMB - float64(gcFreedMB)
 		cumFreedDiff += freedDiff
 		forced := ""

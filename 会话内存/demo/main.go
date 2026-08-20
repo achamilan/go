@@ -664,7 +664,7 @@ func winSiteBurst() []byte { return make([]byte, 16<<10) } // 16 KB, dropped lat
 //	workload runs for ~3s, showing the window ending by itself.
 //
 // Reports are appended to outputPath (no GODEBUG required).
-func runGcDeadWindowDemo(outputPath string, gcInterval int) {
+func runGcDeadWindowDemo(outputPath string, gcInterval int, sampleRate int) {
 	if dir := filepath.Dir(outputPath); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			log.Fatalf("gcdeadwindow: cannot create output dir: %v", err)
@@ -676,8 +676,8 @@ func runGcDeadWindowDemo(outputPath string, gcInterval int) {
 	fmt.Printf("[gcdeadwindow] writing reports to %s\n\n", outputPath)
 
 	// ---- Window gen=1: explicit stop, phased workload ----
-	fmt.Printf("[gen=1] GcDeadWindowStart(0, path, %d) — explicit stop\n", gcInterval)
-	runtime.GcDeadWindowStart(0, outputPath, gcInterval)
+	fmt.Printf("[gen=1] GcDeadWindowStart(0, path, %d, %d) — explicit stop\n", gcInterval, sampleRate)
+	runtime.GcDeadWindowStart(0, outputPath, gcInterval, sampleRate)
 
 	// Phase 1: 2000 dead churn allocs (8MB) + 2000 live allocs (16MB), then GC.
 	for i := 0; i < 2000; i++ {
@@ -717,8 +717,8 @@ func runGcDeadWindowDemo(outputPath string, gcInterval int) {
 	fmt.Println()
 
 	// ---- Window gen=2: auto-stop after 2 seconds ----
-	fmt.Printf("[gen=2] GcDeadWindowStart(2, path, %d) — auto-stop after 2s\n", gcInterval)
-	runtime.GcDeadWindowStart(2, outputPath, gcInterval)
+	fmt.Printf("[gen=2] GcDeadWindowStart(2, path, %d, %d) — auto-stop after 2s\n", gcInterval, sampleRate)
+	runtime.GcDeadWindowStart(2, outputPath, gcInterval, sampleRate)
 	start := time.Now()
 	for time.Since(start) < 3*time.Second {
 		for i := 0; i < 500; i++ { // 2MB churn per iteration
@@ -1178,6 +1178,7 @@ func main() {
 	mode := flag.String("mode", "all", "worker mode: all, loop, mixed, session, fullydead, concurrent, customtypes, reuse, concurrentgrowth, sessionrefoverflow, largeoutput, sessionlifecycle, gcdeadwindow")
 	windowFile := flag.String("windowfile", "output/gcdeadwindow_demo.log", "gcdeadwindow report file (mode=gcdeadwindow)")
 	gcInterval := flag.Int("gcinterval", 0, "gcdeadwindow periodic GC interval in seconds (>0 disables the regular GC triggers; mode=gcdeadwindow)")
+	sampleRate := flag.Int("samplerate", 0, "gcdeadwindow sampling rate in bytes/sample (>1 enables sampling mode; mode=gcdeadwindow)")
 	httpAddr := flag.String("http", "", "pprof HTTP listen address (e.g. :6060); enables /debug/gcdeadwindow/start?seconds=N")
 	flag.Parse()
 
@@ -1216,7 +1217,7 @@ func main() {
 
 	// gcdeadwindow mode is self-contained (global capture, no actors).
 	if *mode == "gcdeadwindow" {
-		runGcDeadWindowDemo(*windowFile, *gcInterval)
+		runGcDeadWindowDemo(*windowFile, *gcInterval, *sampleRate)
 		fmt.Println("Demo finished.")
 		return
 	}

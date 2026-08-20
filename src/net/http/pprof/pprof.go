@@ -148,6 +148,12 @@ func Cmdline(w http.ResponseWriter, r *http.Request) {
 //     and a full GC is forced every gcinterval seconds instead, giving
 //     evenly spaced report cycles. 0 or negative keeps the regular
 //     triggers. The previous gcpercent is restored at stop.
+//   - samplerate: optional integer bytes per sample; when > 1,
+//     allocations are tracked with probability ~size/samplerate (the
+//     standard heap-profile sampling) instead of exactly, cutting the
+//     window's per-allocation overhead proportionally. Report counts
+//     are raw sampled values marked with a "gcdeadwindow:rate:" line.
+//     0 or 1 selects exact mode. Recommended for high-traffic captures.
 //
 // The report is collected in a server-side temporary file that is removed
 // after the response is sent. gctrace lines are interleaved into the
@@ -175,6 +181,16 @@ func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	sampleRate := 0
+	if s := r.URL.Query().Get("samplerate"); s != "" {
+		sampleRate, err = strconv.Atoi(s)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, "invalid samplerate: want an integer (bytes per sample)\n")
+			return
+		}
+	}
+
 	if !gcDeadWindowInFlight.CompareAndSwap(0, 1) {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprint(w, "another /debug/gcdeadwindow/start request is already in flight\n")
@@ -192,7 +208,7 @@ func GcDeadWindowStart(w http.ResponseWriter, r *http.Request) {
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	if !runtime.GcDeadWindowStart(seconds, tmpPath, gcInterval) {
+	if !runtime.GcDeadWindowStart(seconds, tmpPath, gcInterval, sampleRate) {
 		w.WriteHeader(http.StatusConflict)
 		fmt.Fprint(w, "gcdeadwindow start refused: a window or gcdeadtrace session is already active (see process stderr)\n")
 		return
