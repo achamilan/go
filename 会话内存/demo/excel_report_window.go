@@ -108,6 +108,57 @@ func atoi64(s string) int64 {
 	return n
 }
 
+// estPair scales one raw sampled (objs, bytes) counter pair to
+// whole-traffic estimates. Bytes: objs × rate is the unbiased Poisson
+// estimator, but objects with size ≥ rate are always sampled, so for
+// big-object rows raw bytes is the true value and larger — take the
+// max. Objs: estBytes / mean-size (exact for homogeneous sizes).
+func estPair(objs, bytes, rate int64) (int64, int64) {
+	if rate <= 1 || objs == 0 {
+		return objs, bytes
+	}
+	estB := objs * rate
+	if bytes > estB {
+		estB = bytes
+	}
+	estO := objs
+	if bytes > 0 {
+		estO = int64(float64(estB) * float64(objs) / float64(bytes))
+	}
+	return estO, estB
+}
+
+func estSites(in []winSite, rate int64) []winSite {
+	if rate <= 1 {
+		return in
+	}
+	out := make([]winSite, len(in))
+	for i, s := range in {
+		s.objs, s.bytes = estPair(s.objs, s.bytes, rate)
+		out[i] = s
+	}
+	return out
+}
+
+// estimated returns a display copy of pd with every sampled (objs,
+// bytes) counter scaled to whole-traffic estimates. The original must
+// be retained for the 数据验证 section: the alloc == freed + alive
+// invariant holds exactly only in the raw sampled domain.
+func estimated(pd *parsedWindow) *parsedWindow {
+	out := &parsedWindow{name: pd.name, traces: pd.traces, sampled: pd.sampled}
+	for _, b := range pd.blocks {
+		nb := *b
+		nb.allocObjs, nb.allocBytes = estPair(b.allocObjs, b.allocBytes, b.sampleRate)
+		nb.freedObjs, nb.freedBytes = estPair(b.freedObjs, b.freedBytes, b.sampleRate)
+		nb.aliveObjs, nb.aliveBytes = estPair(b.aliveObjs, b.aliveBytes, b.sampleRate)
+		nb.aliveLines = estSites(b.aliveLines, b.sampleRate)
+		nb.allocLines = estSites(b.allocLines, b.sampleRate)
+		nb.freedLines = estSites(b.freedLines, b.sampleRate)
+		out.blocks = append(out.blocks, &nb)
+	}
+	return out
+}
+
 // parseWinSite parses a site detail line:
 // "  func (file:line) < func2 (file:line): N objs, M bytes"
 func parseWinSite(line string) *winSite {
@@ -612,19 +663,23 @@ func buildOverviewSheet(files []*parsedWindow) *xlsxSheet {
 				pab = g.peakAliveBytes
 			}
 		}
-		s.addRow(pd.name, fmt.Sprint(len(gens)), fmt.Sprint(len(pd.blocks)),
+		name := pd.name
+		if pd.sampled {
+			name += " (采样估算)"
+		}
+		s.addRow(name, fmt.Sprint(len(gens)), fmt.Sprint(len(pd.blocks)),
 			fmt.Sprint(ao), fmtMB2(ab), fmt.Sprint(fo), fmtMB2(fb),
 			fmt.Sprint(fao), fmtMB2(fab), fmt.Sprint(pao), fmtMB2(pab))
 	}
 	return s
 }
 
-func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
-	cw := 12
-	if pd.sampled {
-		cw = 15
-	}
-	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, cw)}
+// buildWindowSheet builds the main per-file sheet. pd carries the
+// values to display (whole-traffic estimates for sampled captures);
+// raw is the unscaled parse used only for the 数据验证 section, where
+// alloc == freed + alive holds exactly in the raw sampled domain.
+func buildWindowSheet(pd *parsedWindow, raw *parsedWindow) *xlsxSheet {
+	s := &xlsxSheet{name: pd.name, colWidths: make([]float64, 12)}
 	gens := aggregateGens(pd)
 
 	var totAllocObjs, totAllocBytes, totFreedObjs, totFreedBytes int64
@@ -641,7 +696,8 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%.2f MB)", totAllocObjs, float64(totAllocBytes)/1048576))
 	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%.2f MB)", totFreedObjs, float64(totFreedBytes)/1048576))
 	if pd.sampled {
-		s.addRow("采样模式:", "rate>1（见 gcdeadwindow:rate 行）——计数为采样原始值；估算字节 ≈ 采样对象数 × rate（Est 列），数据验证在采样域仍精确")
+		s.addRow("采样模式:", "数值为估算值（≈真实全量：采样对象数 × rate，必采的大对象站点取原始值）——")
+		s.addRow("", "泊松估计含噪声；数据验证区为采样原始值（alloc == freed + alive 在采样域精确成立）。")
 	}
 	s.addBlank()
 
@@ -663,10 +719,16 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 	// (cycle counters are Xchg-cleared at each report, so Σ alloc sections
 	// equals the final cumulative alloc count; alive = cumAllocs−cumFrees).
 	// Small diffs can remain from racy increments landing mid-report.
-	s.addRow("=== 数据验证 (per gen: alloc == freed + alive) ===")
+	// For sampled captures this section uses the RAW sampled values (raw):
+	// the invariant holds exactly only in the sampled domain.
+	verTitle := "=== 数据验证 (per gen: alloc == freed + alive) ==="
+	if pd.sampled {
+		verTitle = "=== 数据验证（采样原始值，per gen: alloc == freed + alive）==="
+	}
+	s.addRow(verTitle)
 	s.addHeaderRow("Gen", "Σ Alloc Objs", "Σ Freed + Alive Objs", "Diff Objs",
 		"Σ Alloc MB", "Σ Freed + Alive MB", "Diff MB", "Verdict")
-	for _, g := range gens {
+	for _, g := range aggregateGens(raw) {
 		faObjs := g.freedObjs + g.finalAliveObjs
 		faBytes := g.freedBytes + g.finalAliveByte
 		diffObjs := g.allocObjs - faObjs
@@ -682,15 +744,9 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 
 	// === Per-GC Summary === — one row per report block.
 	s.addRow("=== Per-GC Summary ===")
-	hdr := []string{"Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
+	s.addHeaderRow("Report", "GC #", "Gen", "Elapsed (s)", "GC间隔 (s)",
 		"Alloc Objs", "Alloc MB", "Freed Objs", "Freed MB",
-		"Alive Objs", "Alive MB", "Alive Sites"}
-	if pd.sampled {
-		// Estimated whole-traffic volumes: sampledObjs × rate (the
-		// unbiased byte estimator for Poisson sampling).
-		hdr = append(hdr, "Est Alloc MB", "Est Freed MB", "Est Alive MB")
-	}
-	s.addHeaderRow(hdr...)
+		"Alive Objs", "Alive MB", "Alive Sites")
 	prevAt := -1.0
 	for i, b := range pd.blocks {
 		interval := "-"
@@ -700,20 +756,10 @@ func buildWindowSheet(pd *parsedWindow) *xlsxSheet {
 			}
 			prevAt = t.atSec
 		}
-		row := []string{fmt.Sprint(i + 1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
+		s.addRow(fmt.Sprint(i+1), fmt.Sprint(b.gcNum), fmt.Sprint(b.gen), fmt.Sprint(b.elapsed), interval,
 			fmt.Sprint(b.allocObjs), fmtMB2(b.allocBytes),
 			fmt.Sprint(b.freedObjs), fmtMB2(b.freedBytes),
-			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites)}
-		if pd.sampled {
-			estA, estF, estL := "-", "-", "-"
-			if b.sampleRate > 1 {
-				estA = fmt.Sprintf("%.2f", float64(b.allocObjs*b.sampleRate)/1048576)
-				estF = fmt.Sprintf("%.2f", float64(b.freedObjs*b.sampleRate)/1048576)
-				estL = fmt.Sprintf("%.2f", float64(b.aliveObjs*b.sampleRate)/1048576)
-			}
-			row = append(row, estA, estF, estL)
-		}
-		s.addRow(row...)
+			fmt.Sprint(b.aliveObjs), fmtMB2(b.aliveBytes), fmt.Sprint(b.aliveSites))
 	}
 	return s
 }
@@ -742,7 +788,7 @@ func buildWindowSiteSheets(pd *parsedWindow) []*xlsxSheet {
 		s.addRow("Mode:", pd.name)
 		s.addRow("Category:", note)
 		if pd.sampled {
-			s.addRow("采样模式:", "计数为采样原始值（缩放因子相同，排序不受影响）；估算字节 ≈ 对象数 × rate")
+			s.addRow("采样模式:", "数值为估算值（≈真实全量；排序与采样原始值一致）")
 		}
 		s.addBlank()
 		s.addHeaderRow("Gen", "Function", "File:Line",
@@ -801,8 +847,7 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 	s.addRow("", "仅作参考。GC Freed MB = heap1[N] − heap2[N]（本 GC 清扫出的垃圾 ≈ 本周期全进程释放）。")
 	s.addRow("", "freed 差值来源：MB 截断 ±1MB；窗口前旧对象垃圾（大堆服务此项必然很大，仅作参考）；")
 	s.addRow("", "世界重启后输出的相邻周期归属偏移。Verdict 只看 alloc 侧：|差值| ≤ max(2MB, 30%×totalAllocΔ) 为 OK。")
-	s.addRow("", "采样模式（gcdeadwindow:rate 行 rate>1）：窗口 Alloc/Freed MB 列为估算值（采样对象数×rate，")
-	s.addRow("", "无偏估计但含泊松噪声，小样本周期偏差更大）；原始采样计数见主 sheet Per-GC Summary。")
+	s.addRow("", "采样模式：窗口 Alloc/Freed MB 列为估算值（≈真实全量，含泊松噪声，小样本周期偏差更大）。")
 	s.addBlank()
 
 	if len(pd.traces) == 0 {
@@ -814,14 +859,13 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 
 	// Merge consecutive report blocks of the same GC (gcMarkDone hook +
 	// post-sweep hook both print for one GC, but gctrace has a single
-	// line per GC). Bytes are additive across the two snapshots.
+	// line per GC). Bytes are additive across the two snapshots. For
+	// sampled captures pd already carries whole-traffic estimates.
 	type mergedRow struct {
 		gcNum, gen, elapsed    int
-		allocObjs, freedObjs   int64
 		allocBytes, freedBytes int64
 		totalAllocDelta        int64
 		hasTotalAlloc          bool
-		sampleRate             int64
 	}
 	var rows []mergedRow
 	for _, b := range pd.blocks {
@@ -830,15 +874,10 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 			continue
 		}
 		if n := len(rows); n > 0 && rows[n-1].gcNum == b.gcNum {
-			rows[n-1].allocObjs += b.allocObjs
-			rows[n-1].freedObjs += b.freedObjs
 			rows[n-1].allocBytes += b.allocBytes
 			rows[n-1].freedBytes += b.freedBytes
 			rows[n-1].totalAllocDelta += b.totalAllocDelta
 			rows[n-1].hasTotalAlloc = rows[n-1].hasTotalAlloc || b.hasTotalAlloc
-			if b.sampleRate > 1 {
-				rows[n-1].sampleRate = b.sampleRate
-			}
 			if b.elapsed > rows[n-1].elapsed {
 				rows[n-1].elapsed = b.elapsed
 			}
@@ -846,10 +885,8 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		}
 		rows = append(rows, mergedRow{
 			gcNum: b.gcNum, gen: b.gen, elapsed: b.elapsed,
-			allocObjs: b.allocObjs, freedObjs: b.freedObjs,
 			allocBytes: b.allocBytes, freedBytes: b.freedBytes,
 			totalAllocDelta: b.totalAllocDelta, hasTotalAlloc: b.hasTotalAlloc,
-			sampleRate: b.sampleRate,
 		})
 	}
 
@@ -883,12 +920,6 @@ func buildGCCompareSheet(pd *parsedWindow) *xlsxSheet {
 		gcFreedMB := t.heap1 - t.heap2
 		winAllocMB := float64(r.allocBytes) / 1048576
 		winFreedMB := float64(r.freedBytes) / 1048576
-		if r.sampleRate > 1 {
-			// Sampling mode: raw bytes are sampled bytes; the unbiased
-			// whole-traffic estimate is sampledObjs × rate.
-			winAllocMB = float64(r.allocObjs*r.sampleRate) / 1048576
-			winFreedMB = float64(r.freedObjs*r.sampleRate) / 1048576
-		}
 		freedDiff := winFreedMB - float64(gcFreedMB)
 		cumFreedDiff += freedDiff
 		forced := ""
@@ -1010,21 +1041,34 @@ func main() {
 		os.Exit(1)
 	}
 
+	// For sampled captures, all sheets display whole-traffic estimates;
+	// only the 数据验证 section uses the raw sampled parse (the alloc ==
+	// freed + alive invariant holds exactly only in the sampled domain).
+	var dfiles []*parsedWindow
+	for _, pd := range files {
+		dpd := pd
+		if pd.sampled {
+			dpd = estimated(pd)
+		}
+		dfiles = append(dfiles, dpd)
+	}
+
 	builder := xlsxBuilder{}
-	builder.sheets = append(builder.sheets, *buildOverviewSheet(files))
+	builder.sheets = append(builder.sheets, *buildOverviewSheet(dfiles))
 
 	seen := map[string]int{"Overview": 1}
-	for _, pd := range files {
-		main1 := buildWindowSheet(pd)
+	for i, pd := range files {
+		dpd := dfiles[i]
+		main1 := buildWindowSheet(dpd, pd)
 		main1.name = trimSheetName(main1.name, seen)
 		builder.sheets = append(builder.sheets, *main1)
 
-		for _, ss := range buildWindowSiteSheets(pd) {
+		for _, ss := range buildWindowSiteSheets(dpd) {
 			ss.name = trimSheetName(ss.name, seen)
 			builder.sheets = append(builder.sheets, *ss)
 		}
 
-		cmp := buildGCCompareSheet(pd)
+		cmp := buildGCCompareSheet(dpd)
 		cmp.name = trimSheetName(cmp.name, seen)
 		builder.sheets = append(builder.sheets, *cmp)
 	}
