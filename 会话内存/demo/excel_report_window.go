@@ -109,23 +109,19 @@ func atoi64(s string) int64 {
 }
 
 // estPair scales one raw sampled (objs, bytes) counter pair to
-// whole-traffic estimates. Bytes: objs × rate is the unbiased Poisson
-// estimator, but objects with size ≥ rate are always sampled, so for
-// big-object rows raw bytes is the true value and larger — take the
-// max. Objs: estBytes / mean-size (exact for homogeneous sizes).
+// whole-traffic estimates, using the same inverse-probability
+// estimator as the heap profile (runtime/pprof scaleHeapSample):
+// the sampling gate is a Poisson bytes process, so an object of mean
+// size m appears with probability P = 1−e^(−m/rate) and the unbiased
+// scale is 1/P. For m ≪ rate this reduces to objs × rate; for
+// m ≫ rate the scale approaches 1 (raw ≈ true, P ≈ 1).
 func estPair(objs, bytes, rate int64) (int64, int64) {
-	if rate <= 1 || objs == 0 {
+	if rate <= 1 || objs == 0 || bytes == 0 {
 		return objs, bytes
 	}
-	estB := objs * rate
-	if bytes > estB {
-		estB = bytes
-	}
-	estO := objs
-	if bytes > 0 {
-		estO = int64(float64(estB) * float64(objs) / float64(bytes))
-	}
-	return estO, estB
+	avgSize := float64(bytes) / float64(objs)
+	scale := 1 / (1 - math.Exp(-avgSize/float64(rate)))
+	return int64(float64(objs) * scale), int64(float64(bytes) * scale)
 }
 
 func estSites(in []winSite, rate int64) []winSite {
@@ -696,7 +692,7 @@ func buildWindowSheet(pd *parsedWindow, raw *parsedWindow) *xlsxSheet {
 	s.addRow("Total Alloc:", fmt.Sprintf("%d objs (%.2f MB)", totAllocObjs, float64(totAllocBytes)/1048576))
 	s.addRow("Total Freed:", fmt.Sprintf("%d objs (%.2f MB)", totFreedObjs, float64(totFreedBytes)/1048576))
 	if pd.sampled {
-		s.addRow("采样模式:", "数值为估算值（≈真实全量：采样对象数 × rate，必采的大对象站点取原始值）——")
+		s.addRow("采样模式:", "数值为估算值（≈真实全量，与 heap profile 同公式：scale = 1/(1−e^(−平均大小/rate))）——")
 		s.addRow("", "泊松估计含噪声；数据验证区为采样原始值（alloc == freed + alive 在采样域精确成立）。")
 	}
 	s.addBlank()
@@ -818,6 +814,137 @@ func buildWindowSiteSheets(pd *parsedWindow) []*xlsxSheet {
 		mk("Alive", "窗口结束仍有存活的站点，按存活量排序——疑似泄漏/长生命周期", func(a *siteAgg) bool { return a.finalAliveObjs > 0 },
 			func(a *siteAgg) int64 { return a.finalAliveByte }),
 	}
+}
+
+// buildSteadyFreedSheet lists the intersection of allocation sites whose
+// objects are freed in EVERY steady-state GC cycle of each window: sites
+// that churn continuously, cycle after cycle — the strongest pooling /
+// reuse candidates. Steady cycles exclude the first and the last GC that
+// produced any freed data: the first still carries the baseline cycle's
+// sweep-attribution lag (its frees are near zero), and the last is the
+// window-close cycle. Blocks of the same GC (dual hooks) are merged.
+func buildSteadyFreedSheet(pd *parsedWindow) *xlsxSheet {
+	s := &xlsxSheet{name: pd.name + " - SteadyFreed", colWidths: make([]float64, 10)}
+	s.addRow("Mode:", pd.name)
+	s.addRow("Category:", "稳态交集——每个稳态 GC 周期都有释放的站点（持续 churn，池化/复用最高优先级）")
+	if pd.sampled {
+		s.addRow("采样模式:", "数值为估算值（≈真实全量；排序与采样原始值一致）")
+	}
+
+	// Per gen: gcNum -> site text ("fn (loc)") -> objs/bytes freed in
+	// that GC; plus per-gen steady cycle lists.
+	stacks := map[siteKey]string{}
+	byGen := map[int]map[int]map[string]*[2]int64{}
+	steady := map[int][]int{}
+	var genOrder []int
+	for _, b := range pd.blocks {
+		gm := byGen[b.gen]
+		if gm == nil {
+			gm = map[int]map[string]*[2]int64{}
+			byGen[b.gen] = gm
+			genOrder = append(genOrder, b.gen)
+		}
+		cm := gm[b.gcNum]
+		if cm == nil {
+			cm = map[string]*[2]int64{}
+			gm[b.gcNum] = cm
+		}
+		for j := range b.freedLines {
+			fs := &b.freedLines[j]
+			k := siteKey{b.gen, fs.fn, fs.loc}
+			if stacks[k] == "" {
+				stacks[k] = fs.stack
+			}
+			kt := fs.fn + " (" + fs.loc + ")"
+			e := cm[kt]
+			if e == nil {
+				e = &[2]int64{}
+				cm[kt] = e
+			}
+			e[0] += fs.objs
+			e[1] += fs.bytes
+		}
+	}
+	sort.Ints(genOrder)
+	for _, gen := range genOrder {
+		var withFrees []int
+		for gcNum, cm := range byGen[gen] {
+			var tot int64
+			for _, e := range cm {
+				tot += e[0]
+			}
+			if tot > 0 {
+				withFrees = append(withFrees, gcNum)
+			}
+		}
+		sort.Ints(withFrees)
+		st := withFrees
+		if len(withFrees) > 2 {
+			st = withFrees[1 : len(withFrees)-1]
+		}
+		steady[gen] = st
+		s.addRow(fmt.Sprintf("Gen %d 稳态周期:", gen), fmt.Sprintf("%v", st))
+	}
+	s.addBlank()
+
+	type row struct {
+		key      siteKey
+		min, max int64 // per-GC freed objs
+		totB     int64 // total freed bytes across steady GCs
+	}
+	var rows []row
+	for _, gen := range genOrder {
+		st := steady[gen]
+		if len(st) == 0 {
+			continue
+		}
+		present := map[string]int{}
+		for _, gcNum := range st {
+			for kt := range byGen[gen][gcNum] {
+				present[kt]++
+			}
+		}
+		for kt, n := range present {
+			if n != len(st) {
+				continue
+			}
+			fn, loc := kt, ""
+			if i := strings.LastIndex(kt, " ("); i >= 0 {
+				fn, loc = kt[:i], strings.TrimSuffix(kt[i+2:], ")")
+			}
+			r := row{key: siteKey{gen, fn, loc}}
+			for i, gcNum := range st {
+				e := byGen[gen][gcNum][kt]
+				r.totB += e[1]
+				if i == 0 || e[0] < r.min {
+					r.min = e[0]
+				}
+				if e[0] > r.max {
+					r.max = e[0]
+				}
+			}
+			rows = append(rows, r)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].key.gen != rows[j].key.gen {
+			return rows[i].key.gen < rows[j].key.gen
+		}
+		return rows[i].totB > rows[j].totB
+	})
+
+	s.addHeaderRow("Gen", "Function", "File:Line", "覆盖周期", "Min Objs/GC", "Max Objs/GC",
+		"Avg Freed MB/GC", "Total Freed MB", "Full Stack")
+	for _, r := range rows {
+		n := len(steady[r.key.gen])
+		s.addRow(fmt.Sprint(r.key.gen), r.key.fn, r.key.loc,
+			fmt.Sprintf("%d/%d", n, n),
+			fmt.Sprint(r.min), fmt.Sprint(r.max),
+			fmt.Sprintf("%.2f", float64(r.totB)/float64(n)/1048576),
+			fmt.Sprintf("%.2f", float64(r.totB)/1048576),
+			stacks[r.key])
+	}
+	return s
 }
 
 // buildGCCompareSheet compares the window's per-cycle alloc/freed bytes
@@ -1067,6 +1194,10 @@ func main() {
 			ss.name = trimSheetName(ss.name, seen)
 			builder.sheets = append(builder.sheets, *ss)
 		}
+
+		steady := buildSteadyFreedSheet(dpd)
+		steady.name = trimSheetName(steady.name, seen)
+		builder.sheets = append(builder.sheets, *steady)
 
 		cmp := buildGCCompareSheet(dpd)
 		cmp.name = trimSheetName(cmp.name, seen)

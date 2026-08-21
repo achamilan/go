@@ -129,9 +129,10 @@ go build -o demo.exe main.go
 | 泄漏候选排查 | 任意 + 看 Alive sheet | final alive 即 Stop 点真实存活 |
 | 池化/复用优化 | 任意 + 看 FullyDead sheet | 分配后全死的站点是池化候选 |
 
-sampleRate 选取：应远大于典型对象大小（建议 10~100×）。**size ≥ rate 的
-对象必采**，此时估算值（Est 列）会偏低、原始计数更接近真实值。rate=512K
-对 KB 级小对象 churn 是合理默认。
+sampleRate 选取：应远大于典型对象大小（建议 10~100×），估算公式
+（scale = 1/(1−e^(−平均大小/rate))）在小对象区间最准；平均大小接近
+rate 的站点泊松噪声和均值近似误差都会放大。rate=512K 对 KB 级小对象
+churn 是合理默认。
 
 3.3 报表解读
 -------------
@@ -269,16 +270,19 @@ O_APPEND 写。
 
 - `MemProfileRate = sampleRate`：标准 heap profile 泊松采样，S 字节对象以
   ~S/rate 概率进入 mProf_Malloc（窗口计数 + special 都只对被采样对象），
-  分配/sweep 路径开销同比率下降；size ≥ rate 的对象必采。
+  分配/sweep 路径开销同比率下降。
 - **计数保持采样原始值**：采样对象的 alloc 与其 free 同属一个采样宇宙，
   alive = cumAllocs − cumFrees 与 alloc == freed + alive 在采样域精确成立
   （excel 数据验证不受影响）。
 - 窗口 rate 存 `gcDeadWindowSampleRate`：Stop 在最终强制 GC **之前**恢复
   MemProfileRate，最终报告块的 rate 行必须反映窗口自己的 rate。
 - 报告标记：每块头打印 `gcdeadwindow:rate: N bytes per sample`（仅 rate>1）。
-- 估算口径（excel Est 列与 GC对比 窗口列）：字节估计 = 采样对象数 × rate
-  （泊松采样的无偏估计，聚合精确）；对象数估计 ≈ 估算字节 / 平均对象大小。
-  **size ≥ rate 的对象必采，估算值偏低**（此时原始计数更接近真实值）。
+- 估算口径（excel 展示值）：与 heap profile 完全相同的逆概率估计
+  （runtime/pprof scaleHeapSample）：采样是泊松字节流，平均大小 m 的
+  对象被采概率 P = 1−e^(−m/rate)，缩放 scale = 1/P，est = 采样值 ×
+  scale。m ≪ rate 时退化为 采样对象数 × rate；m ≫ rate 时 scale→1
+  （大对象几乎必被采到，原始值即真实值）。均值近似误差：记录/站点内
+  对象大小不均匀时按平均大小代入非线性公式有偏差（上游同样如此）。
 
 5.7 报告生成性能（v9）
 -----------------------
@@ -355,6 +359,7 @@ Sheet 构成：
 | Overview | 各文件汇总（窗口数、报告数、alloc/freed/final alive/peak alive） |
 | `<name>` | 顶部汇总（采样模式有说明行）+ per-gen Summary + 数据验证 + Per-GC Summary（采样模式附 Est 估算列） |
 | `<name> - Alloc/Freed/FullyDead/Alive` | 四个分类站点 sheet（按 (gen, 首帧) 聚合；Alive=泄漏候选，FullyDead=池化候选） |
+| `<name> - SteadyFreed` | 稳态交集：每个稳态 GC 周期（排除首尾）都有释放的站点——持续 churn，池化/复用最高优先级；含 Min/Max Objs per GC、Avg/Total Freed MB |
 | `<name> - GC对比` | 窗口 alloc/freed vs 全进程分配（totalAlloc Δ），见下 |
 
 **GC对比口径**：
@@ -401,7 +406,7 @@ Sheet 构成：
 
 - 与 gcdeadtrace 会话模式互斥；同时只能一个窗口。
 - 精确模式分配路径开销 ~72×（见 5.8），高分配率服务必须改用采样模式；
-  采样模式计数为估计口径（见 5.6 的估算与必采注意事项），小对象可能漏采。
+  采样模式计数为估计口径（见 5.6 的估算注意事项），小对象可能漏采。
 - 窗口 alive 只含窗口期间分配且仍存活的对象，不含窗口前存量；Stop 的最终
   GC 之后遗留对象的释放不再报告（final alive 为 Stop 点真实存活）。
 - gctrace 堆值为 MB 截断整数，亚 MB 场景 GC对比 sheet 数值偏粗；sweep 滞后
